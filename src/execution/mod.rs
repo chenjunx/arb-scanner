@@ -94,14 +94,56 @@ pub async fn open_hedged_position(
         .await?;
     log::info!("open_hedged_position: futures hedge result = {:?}", futures_order);
 
-    let transfer_qty = (filled_qty / Decimal::TWO).trunc_with_scale(8);
+    let (transfer_qty, withdraw) = transfer_half_to_kraken(
+        binance_wallet,
+        kraken_wallet,
+        TransferHalfParams {
+            filled_qty,
+            transfer_asset: params.transfer_asset.clone(),
+            dry_run: false,
+        },
+    )
+    .await?;
+
+    Ok(OpenPositionReport {
+        spot_order,
+        futures_order: Some(futures_order),
+        transfer_qty: Some(transfer_qty),
+        withdraw: Some(withdraw),
+        note: None,
+    })
+}
+
+/// 划转参数：与 [`open_hedged_position`] 内部划转步骤使用完全相同的
+/// `filled_qty / 2` 截断算法，用于"现货已买入、合约已对冲，只从划转步骤
+/// 继续"的场景（见 `main.rs` 里 `open --from-transfer`）。
+#[derive(Debug, Clone)]
+pub struct TransferHalfParams {
+    pub filled_qty: Decimal,
+    /// 划转到 Kraken 的资产代码。
+    pub transfer_asset: String,
+    /// true 时只做链路/额度校验，不真正发起提币，见 `WalletProvider::withdraw`。
+    pub dry_run: bool,
+}
+
+/// 把 `filled_qty` 的一半划转到 Kraken：先精确匹配双边共同链，再取 Kraken 收款
+/// 地址，最后从币安提币。返回实际划转数量和提币结果。
+pub async fn transfer_half_to_kraken(
+    binance_wallet: &dyn WalletProvider,
+    kraken_wallet: &dyn WalletProvider,
+    params: TransferHalfParams,
+) -> anyhow::Result<(Decimal, WithdrawResult)> {
+    let transfer_qty = (params.filled_qty / Decimal::TWO).trunc_with_scale(8);
     if transfer_qty <= Decimal::ZERO {
-        anyhow::bail!("transfer_qty rounds down to zero, aborting transfer (filled_qty={filled_qty})");
+        anyhow::bail!(
+            "transfer_qty rounds down to zero, aborting transfer (filled_qty={})",
+            params.filled_qty
+        );
     }
 
     let network = resolve_transfer_network(binance_wallet, kraken_wallet, &params.transfer_asset).await?;
     log::info!(
-        "open_hedged_position: resolved transfer network for {} -> {network}",
+        "transfer_half_to_kraken: resolved transfer network for {} -> {network}",
         params.transfer_asset
     );
 
@@ -113,18 +155,12 @@ pub async fn open_hedged_position(
             address: deposit_address.address,
             tag: deposit_address.tag,
             amount: transfer_qty,
-            dry_run: false,
+            dry_run: params.dry_run,
         })
         .await?;
-    log::info!("open_hedged_position: withdraw result = {:?}", withdraw);
+    log::info!("transfer_half_to_kraken: withdraw result = {:?}", withdraw);
 
-    Ok(OpenPositionReport {
-        spot_order,
-        futures_order: Some(futures_order),
-        transfer_qty: Some(transfer_qty),
-        withdraw: Some(withdraw),
-        note: None,
-    })
+    Ok((transfer_qty, withdraw))
 }
 
 /// 把 `qty` 向下取整到 `step` 的整数倍；`step<=0` 时原样返回，和
@@ -531,6 +567,109 @@ mod tests {
         assert_eq!(withdraws[0].amount, Decimal::new(6172835, 7));
         assert_eq!(report.withdraw.unwrap().id, "withdraw-BTC");
         assert!(report.note.is_none());
+    }
+
+    #[tokio::test]
+    async fn transfer_half_to_kraken_zero_qty_errors() {
+        let binance_wallet = no_op_wallet("binance");
+        let kraken_wallet = no_op_wallet("kraken");
+
+        let err = transfer_half_to_kraken(
+            &binance_wallet,
+            &kraken_wallet,
+            TransferHalfParams {
+                filled_qty: Decimal::new(1, 9), // 0.000000001，减半截断到 8 位小数后为 0
+                transfer_asset: "BTC".to_string(),
+                dry_run: false,
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.to_string().contains("transfer_qty rounds down to zero"));
+        assert!(binance_wallet.withdraw_calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn transfer_half_to_kraken_dry_run_skips_withdraw_raw() {
+        let binance_wallet = FakeWalletProvider {
+            name: "binance",
+            networks: vec![binance_btc_chain()],
+            deposit_addr: None,
+            withdraw_calls: Arc::new(Mutex::new(Vec::new())),
+        };
+        let kraken_wallet = FakeWalletProvider {
+            name: "kraken",
+            networks: vec![kraken_btc_chain()],
+            deposit_addr: Some(DepositAddress {
+                asset: "BTC".to_string(),
+                network: "BTC".to_string(),
+                address: "kraken-addr".to_string(),
+                tag: None,
+            }),
+            withdraw_calls: Arc::new(Mutex::new(Vec::new())),
+        };
+
+        let (transfer_qty, withdraw) = transfer_half_to_kraken(
+            &binance_wallet,
+            &kraken_wallet,
+            TransferHalfParams {
+                filled_qty: Decimal::new(2, 0),
+                transfer_asset: "BTC".to_string(),
+                dry_run: true,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(transfer_qty, Decimal::ONE);
+        assert_eq!(withdraw.id, "dry-run");
+        // dry_run 由 WalletProvider::withdraw 的默认实现拦截，withdraw_raw 从未被调用，
+        // 但 asset_info/deposit_address 仍是真实调用，走完了完整的链路校验。
+        assert!(binance_wallet.withdraw_calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn transfer_half_to_kraken_happy_path() {
+        let binance_wallet = FakeWalletProvider {
+            name: "binance",
+            networks: vec![binance_btc_chain()],
+            deposit_addr: None,
+            withdraw_calls: Arc::new(Mutex::new(Vec::new())),
+        };
+        let kraken_wallet = FakeWalletProvider {
+            name: "kraken",
+            networks: vec![kraken_btc_chain()],
+            deposit_addr: Some(DepositAddress {
+                asset: "BTC".to_string(),
+                network: "BTC".to_string(),
+                address: "kraken-addr".to_string(),
+                tag: None,
+            }),
+            withdraw_calls: Arc::new(Mutex::new(Vec::new())),
+        };
+
+        let (transfer_qty, withdraw) = transfer_half_to_kraken(
+            &binance_wallet,
+            &kraken_wallet,
+            TransferHalfParams {
+                filled_qty: Decimal::new(1234567, 6), // 1.234567
+                transfer_asset: "BTC".to_string(),
+                dry_run: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        // 1.234567 / 2 = 0.6172835,已经<=8位小数,截断后不变
+        assert_eq!(transfer_qty, Decimal::new(6172835, 7));
+        assert_eq!(withdraw.id, "withdraw-BTC");
+
+        let withdraws = binance_wallet.withdraw_calls.lock().unwrap();
+        assert_eq!(withdraws.len(), 1);
+        assert_eq!(withdraws[0].network, "BTC");
+        assert_eq!(withdraws[0].address, "kraken-addr");
+        assert_eq!(withdraws[0].amount, Decimal::new(6172835, 7));
     }
 
     #[test]

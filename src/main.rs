@@ -153,6 +153,10 @@ async fn main() -> anyhow::Result<()> {
 /// `open` 子命令：手动触发一次"币安现货按 USDT 金额买入 -> 币安 U 本位合约等量
 /// 做空对冲 -> 买入量的一半划转到 Kraken 现货"流程。不接入 engine 主循环，
 /// 也不读取 `config.toml`，参数全部来自命令行。
+///
+/// 加 `--from-transfer` 时跳过前两步，只从"划转一半到 Kraken"这一步继续——
+/// 用于现货买入和合约对冲已经手动/之前跑过完成，只是划转步骤需要重跑的场景，
+/// 此时用 `--filled-qty` 传入原始现货成交量。
 async fn run_open_command(args: &[String]) -> anyhow::Result<()> {
     let mut symbol: Option<Symbol> = None;
     let mut amount: Option<Decimal> = None;
@@ -160,6 +164,8 @@ async fn run_open_command(args: &[String]) -> anyhow::Result<()> {
     let mut testnet = false;
     let mut dry_run = true;
     let mut client_order_id_prefix: Option<String> = None;
+    let mut from_transfer = false;
+    let mut filled_qty: Option<Decimal> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -201,8 +207,52 @@ async fn run_open_command(args: &[String]) -> anyhow::Result<()> {
                 );
                 i += 2;
             }
+            "--from-transfer" => {
+                from_transfer = true;
+                i += 1;
+            }
+            "--filled-qty" => {
+                let v = args.get(i + 1).context("--filled-qty requires a value")?;
+                filled_qty = Some(v.parse().context("--filled-qty must be a valid decimal number")?);
+                i += 2;
+            }
             other => anyhow::bail!("unknown argument '{other}' for 'open' subcommand"),
         }
+    }
+
+    if from_transfer {
+        let filled_qty = filled_qty.context(
+            "--filled-qty is required when --from-transfer is set (this is the original spot buy's filled quantity)",
+        )?;
+        let transfer_asset = asset
+            .or_else(|| symbol.as_ref().map(|s| s.base.to_string()))
+            .context("--asset (or --symbol) is required to determine the transfer asset")?;
+
+        let proxy = net::proxy_from_env();
+        let binance_wallet = BinanceWalletProvider::from_env(Venue::new("binance"), testnet, proxy.as_deref())?;
+        let kraken_wallet = KrakenWalletProvider::from_env(Venue::new("kraken"), proxy.as_deref())?;
+
+        info!(
+            "open --from-transfer: asset={transfer_asset} filled_qty={filled_qty} testnet={testnet} dry_run={dry_run}"
+        );
+        if dry_run {
+            info!("open --from-transfer: dry_run=true (default), pass --live to actually withdraw");
+        }
+
+        let (transfer_qty, withdraw) = execution::transfer_half_to_kraken(
+            &binance_wallet,
+            &kraken_wallet,
+            execution::TransferHalfParams {
+                filled_qty,
+                transfer_asset,
+                dry_run,
+            },
+        )
+        .await?;
+
+        println!("transfer_qty={transfer_qty:?}");
+        println!("withdraw={withdraw:?}");
+        return Ok(());
     }
 
     let symbol = symbol.context("--symbol is required, e.g. --symbol BTC/USDT")?;
