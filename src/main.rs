@@ -3,21 +3,27 @@ use std::time::Duration;
 
 use anyhow::Context;
 use log::info;
+use rust_decimal::Decimal;
 
 use arb_scanner::config::AppConfig;
 use arb_scanner::engine::ArbitrageEngine;
+use arb_scanner::execution;
 use arb_scanner::logging;
 use arb_scanner::market_data::MarketDataSource;
 use arb_scanner::market_data::binance::BinanceSpotSource;
 use arb_scanner::market_data::kraken::KrakenSpotSource;
 use arb_scanner::market_data::mock::{MockSource, MockSymbolConfig};
 use arb_scanner::net;
+use arb_scanner::order::binance::BinanceOrderProvider;
+use arb_scanner::order::binance_futures::BinanceFuturesOrderProvider;
 use arb_scanner::sink::OpportunitySink;
 use arb_scanner::sink::log_sink::LogSink;
 use arb_scanner::strategy::cross_exchange::CrossExchangeStrategy;
 use arb_scanner::strategy::triangular::{LegSide, TriangularLeg, TriangularPath, TriangularStrategy};
 use arb_scanner::strategy::{FeeSchedule, Strategy};
 use arb_scanner::types::{Symbol, Venue};
+use arb_scanner::wallet::binance::BinanceWalletProvider;
+use arb_scanner::wallet::kraken::KrakenWalletProvider;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -27,7 +33,12 @@ async fn main() -> anyhow::Result<()> {
         .install_default()
         .expect("failed to install rustls crypto provider");
 
-    let config_path = std::env::args().nth(1).unwrap_or_else(|| "config.toml".to_string());
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("open") {
+        return run_open_command(&args[2..]).await;
+    }
+
+    let config_path = args.get(1).cloned().unwrap_or_else(|| "config.toml".to_string());
     let config = AppConfig::load(&config_path)
         .with_context(|| format!("failed to load config from {config_path}"))?;
 
@@ -136,5 +147,96 @@ async fn main() -> anyhow::Result<()> {
         let _ = handle.await;
     }
 
+    Ok(())
+}
+
+/// `open` 子命令：手动触发一次"币安现货按 USDT 金额买入 -> 币安 U 本位合约等量
+/// 做空对冲 -> 买入量的一半划转到 Kraken 现货"流程。不接入 engine 主循环，
+/// 也不读取 `config.toml`，参数全部来自命令行。
+async fn run_open_command(args: &[String]) -> anyhow::Result<()> {
+    let mut symbol: Option<Symbol> = None;
+    let mut amount: Option<Decimal> = None;
+    let mut asset: Option<String> = None;
+    let mut testnet = false;
+    let mut dry_run = true;
+    let mut client_order_id_prefix: Option<String> = None;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--symbol" => {
+                let v = args.get(i + 1).context("--symbol requires a value")?;
+                let (base, quote) = v
+                    .split_once('/')
+                    .context("--symbol must be in Base/Quote format, e.g. BTC/USDT")?;
+                symbol = Some(Symbol::new(base, quote));
+                i += 2;
+            }
+            "--amount" => {
+                let v = args.get(i + 1).context("--amount requires a value")?;
+                amount = Some(v.parse().context("--amount must be a valid decimal number")?);
+                i += 2;
+            }
+            "--asset" => {
+                asset = Some(args.get(i + 1).context("--asset requires a value")?.clone());
+                i += 2;
+            }
+            "--testnet" => {
+                testnet = true;
+                i += 1;
+            }
+            "--dry-run" => {
+                dry_run = true;
+                i += 1;
+            }
+            "--live" => {
+                dry_run = false;
+                i += 1;
+            }
+            "--client-order-id-prefix" => {
+                client_order_id_prefix = Some(
+                    args.get(i + 1)
+                        .context("--client-order-id-prefix requires a value")?
+                        .clone(),
+                );
+                i += 2;
+            }
+            other => anyhow::bail!("unknown argument '{other}' for 'open' subcommand"),
+        }
+    }
+
+    let symbol = symbol.context("--symbol is required, e.g. --symbol BTC/USDT")?;
+    let quote_amount = amount.context("--amount is required, e.g. --amount 1000")?;
+    let transfer_asset = asset.unwrap_or_else(|| symbol.base.to_string());
+
+    let proxy = net::proxy_from_env();
+    let spot = BinanceOrderProvider::from_env(Venue::new("binance_spot"), testnet, proxy.as_deref())?;
+    let futures = BinanceFuturesOrderProvider::from_env(Venue::new("binance_futures"), testnet, proxy.as_deref())?;
+    let binance_wallet = BinanceWalletProvider::from_env(Venue::new("binance"), testnet, proxy.as_deref())?;
+    let kraken_wallet = KrakenWalletProvider::from_env(Venue::new("kraken"), proxy.as_deref())?;
+
+    info!(
+        "open: symbol={symbol} amount={quote_amount} transfer_asset={transfer_asset} testnet={testnet} dry_run={dry_run}"
+    );
+    if dry_run {
+        info!("open: dry_run=true (default), pass --live to actually place orders/withdraw");
+    }
+
+    let report = execution::open_hedged_position(
+        &spot,
+        &futures,
+        &binance_wallet,
+        &kraken_wallet,
+        execution::OpenPositionParams {
+            symbol,
+            quote_amount,
+            transfer_asset,
+            client_order_id_prefix,
+            dry_run,
+        },
+    )
+    .await?;
+
+    println!("{report:#?}");
     Ok(())
 }

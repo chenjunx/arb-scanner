@@ -1,8 +1,11 @@
 pub mod config;
 pub mod engine;
+pub mod execution;
 pub mod logging;
 pub mod market_data;
 pub mod net;
+pub mod order;
 pub mod sink;
 pub mod strategy;
 pub mod types;
+pub mod wallet;
