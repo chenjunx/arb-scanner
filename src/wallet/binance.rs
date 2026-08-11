@@ -133,10 +133,15 @@ fn build_query_string(params: &[(String, String)]) -> String {
 }
 
 /// 解析 PKCS8 PEM 文本(过滤 BEGIN/END 行,拼接剩余 base64 并解码),交给
-/// `Ed25519KeyPair::from_pkcs8` 加载私钥。
+/// `Ed25519KeyPair::from_pkcs8_maybe_unchecked` 加载私钥。用 `_maybe_unchecked`
+/// 而不是 `from_pkcs8`：`openssl genpkey -algorithm ed25519`(Binance 官方文档
+/// 推荐的生成方式)默认产出的是不带内嵌公钥的 PKCS8 v1，`from_pkcs8` 严格要求
+/// 带公钥的 v2 格式,遇到 v1 会报 `KeyRejected` 的 "VersionNotSupported"；
+/// `_maybe_unchecked` 同时兼容 v1/v2,v1 时只是跳过"内嵌公钥与私钥一致"的校验。
 fn load_ed25519_key(pem: &str) -> anyhow::Result<Ed25519KeyPair> {
     let der = parse_pem_pkcs8(pem)?;
-    Ed25519KeyPair::from_pkcs8(&der).map_err(|err| anyhow::anyhow!("invalid ed25519 pkcs8 key: {err}"))
+    Ed25519KeyPair::from_pkcs8_maybe_unchecked(&der)
+        .map_err(|err| anyhow::anyhow!("invalid ed25519 pkcs8 key: {err}"))
 }
 
 fn parse_pem_pkcs8(pem: &str) -> anyhow::Result<Vec<u8>> {
