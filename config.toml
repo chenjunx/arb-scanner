@@ -1,0 +1,59 @@
+# arb-scanner 示例配置。
+#
+# 当前 binance/kraken 两个 venue 均接入真实行情(bookTicker / ticker WebSocket)。
+# 如需临时用随机游走假行情跑通链路,把某个 venue 的 source 改回 "mock" 即可。
+
+min_profit_bps = "5"    # 低于该收益(基点)的机会不会被报告
+tick_interval_ms = 500  # mock 数据源的行情推送间隔
+
+# 出网代理不在这里配置,而是读环境变量 ARB_SCANNER_PROXY(格式 "host:port",
+# 如 "127.0.0.1:7890")。本地开发在终端里设一下即可,生产服务器不设置该变量就
+# 天然直连——这样本地代理地址永远不会随配置文件带到生产环境。
+# 例: PowerShell 下 `$env:ARB_SCANNER_PROXY = "127.0.0.1:7890"; cargo run`
+
+[[venues]]
+name = "binance"
+taker_fee_bps = "10"      # 0.10%
+source = "binance_spot"   # 接币安现货真实行情(bookTicker WebSocket)
+
+[[venues]]
+name = "kraken"
+taker_fee_bps = "16"    # 0.16%
+source = "kraken_spot"  # 接 Kraken 现货真实行情(ticker WebSocket v2)
+
+# symbols 用于:
+#   1) 配置 MockSource 在每个 venue 上模拟哪些交易对、初始价格和波动幅度
+#   2) 配置 CrossExchangeStrategy 需要跨 venue 比较哪些交易对
+[[symbols]]
+base = "DOGE"
+quote = "USDT"
+initial_mid = "65000.00"
+volatility = 0.0015
+spread = 0.0008
+
+[[symbols]]
+base = "ADA"
+quote = "USDT"
+initial_mid = "3200.00"
+volatility = 0.002
+spread = 0.001
+
+
+# 三角套利路径：从 1 单位起始货币出发，依次执行三腿，检查是否能获利后回到原货币。
+[[triangular_paths]]
+venue = "binance"
+
+[[triangular_paths.legs]]
+base = "BTC"
+quote = "USDT"
+side = "buy"
+
+[[triangular_paths.legs]]
+base = "ETH"
+quote = "BTC"
+side = "buy"
+
+[[triangular_paths.legs]]
+base = "ETH"
+quote = "USDT"
+side = "sell"
