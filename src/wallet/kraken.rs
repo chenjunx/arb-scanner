@@ -246,15 +246,16 @@ struct KrakenEnvelope<T> {
 /// 解析 Kraken 通用的 `{error: [...], result: ...}` 信封：`error` 非空时视为失败，
 /// 否则把 `result` 反序列化成调用方指定的具体类型。
 fn unwrap_result<T: DeserializeOwned>(text: &str) -> anyhow::Result<T> {
-    let envelope: KrakenEnvelope<serde_json::Value> =
-        serde_json::from_str(text).context("failed to parse kraken response envelope")?;
+    let envelope: KrakenEnvelope<serde_json::Value> = serde_json::from_str(text)
+        .with_context(|| format!("failed to parse kraken response envelope, raw body: {text}"))?;
     if !envelope.error.is_empty() {
         anyhow::bail!("kraken error: {}", envelope.error.join(", "));
     }
     let result = envelope
         .result
         .ok_or_else(|| anyhow::anyhow!("kraken response missing result"))?;
-    serde_json::from_value(result).context("failed to parse kraken result payload")
+    serde_json::from_value(result.clone())
+        .with_context(|| format!("failed to parse kraken result payload, raw result: {result}"))
 }
 
 #[derive(Debug, Deserialize)]

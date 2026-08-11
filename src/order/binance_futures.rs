@@ -251,7 +251,7 @@ struct OrderResponse {
     status: String,
     #[serde(rename = "executedQty")]
     executed_qty: Decimal,
-    #[serde(rename = "avgPrice")]
+    #[serde(rename = "avgPrice", default)]
     avg_price: Decimal,
 }
 
@@ -259,7 +259,8 @@ fn parse_order_response(text: &str) -> anyhow::Result<OrderResult> {
     if let Ok(err) = serde_json::from_str::<ErrorResponse>(text) {
         anyhow::bail!("binance futures error {}: {}", err.code, err.msg);
     }
-    let resp: OrderResponse = serde_json::from_str(text).context("failed to parse binance futures order response")?;
+    let resp: OrderResponse = serde_json::from_str(text)
+        .with_context(|| format!("failed to parse binance futures order response, raw body: {text}"))?;
     let avg_price = (resp.avg_price > Decimal::ZERO).then_some(resp.avg_price);
 
     Ok(OrderResult {

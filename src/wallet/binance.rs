@@ -195,7 +195,8 @@ fn parse_asset_info(text: &str, asset: &str) -> anyhow::Result<AssetInfo> {
     if let Ok(err) = serde_json::from_str::<ErrorResponse>(text) {
         anyhow::bail!("binance error {}: {}", err.code, err.msg);
     }
-    let coins: Vec<CoinConfig> = serde_json::from_str(text).context("failed to parse binance coin config response")?;
+    let coins: Vec<CoinConfig> = serde_json::from_str(text)
+        .with_context(|| format!("failed to parse binance coin config response, raw body: {text}"))?;
     let coin = coins
         .into_iter()
         .find(|c| c.coin.eq_ignore_ascii_case(asset))
@@ -234,8 +235,8 @@ fn parse_deposit_address(text: &str) -> anyhow::Result<DepositAddress> {
     if let Ok(err) = serde_json::from_str::<ErrorResponse>(text) {
         anyhow::bail!("binance error {}: {}", err.code, err.msg);
     }
-    let resp: DepositAddressResponse =
-        serde_json::from_str(text).context("failed to parse binance deposit address response")?;
+    let resp: DepositAddressResponse = serde_json::from_str(text)
+        .with_context(|| format!("failed to parse binance deposit address response, raw body: {text}"))?;
     Ok(DepositAddress {
         asset: resp.coin,
         network: String::new(),
@@ -253,8 +254,8 @@ fn parse_withdraw_result(text: &str) -> anyhow::Result<WithdrawResult> {
     if let Ok(err) = serde_json::from_str::<ErrorResponse>(text) {
         anyhow::bail!("binance error {}: {}", err.code, err.msg);
     }
-    let resp: WithdrawApplyResponse =
-        serde_json::from_str(text).context("failed to parse binance withdraw apply response")?;
+    let resp: WithdrawApplyResponse = serde_json::from_str(text)
+        .with_context(|| format!("failed to parse binance withdraw apply response, raw body: {text}"))?;
     Ok(WithdrawResult { id: resp.id })
 }
 

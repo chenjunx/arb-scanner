@@ -252,7 +252,8 @@ fn parse_order_response(text: &str) -> anyhow::Result<OrderResult> {
     if let Ok(err) = serde_json::from_str::<ErrorResponse>(text) {
         anyhow::bail!("binance error {}: {}", err.code, err.msg);
     }
-    let resp: OrderResponse = serde_json::from_str(text).context("failed to parse binance order response")?;
+    let resp: OrderResponse = serde_json::from_str(text)
+        .with_context(|| format!("failed to parse binance order response, raw body: {text}"))?;
     let avg_price = (resp.executed_qty > Decimal::ZERO).then(|| resp.cummulative_quote_qty / resp.executed_qty);
 
     Ok(OrderResult {
