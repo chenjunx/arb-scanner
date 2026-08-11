@@ -14,8 +14,10 @@ use arb_scanner::market_data::binance::BinanceSpotSource;
 use arb_scanner::market_data::kraken::KrakenSpotSource;
 use arb_scanner::market_data::mock::{MockSource, MockSymbolConfig};
 use arb_scanner::net;
+use arb_scanner::order::OrderProvider;
 use arb_scanner::order::binance::BinanceOrderProvider;
 use arb_scanner::order::binance_futures::BinanceFuturesOrderProvider;
+use arb_scanner::order::kraken::KrakenOrderProvider;
 use arb_scanner::sink::OpportunitySink;
 use arb_scanner::sink::log_sink::LogSink;
 use arb_scanner::strategy::cross_exchange::CrossExchangeStrategy;
@@ -36,6 +38,9 @@ async fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.get(1).map(String::as_str) == Some("open") {
         return run_open_command(&args[2..]).await;
+    }
+    if args.get(1).map(String::as_str) == Some("rotate") {
+        return run_rotate_command(&args[2..]).await;
     }
 
     let config_path = args.get(1).cloned().unwrap_or_else(|| "config.toml".to_string());
@@ -289,4 +294,116 @@ async fn run_open_command(args: &[String]) -> anyhow::Result<()> {
 
     println!("{report:#?}");
     Ok(())
+}
+
+/// `rotate` 子命令：独立于 `open` 的另一种手动操作——库存轮转。在一个交易所
+/// 卖出、另一个交易所买入等量同一资产，两条腿真实市价单并发发起，不涉及链上
+/// 划转。同样不接入 engine 主循环，也不读取 `config.toml`，参数全部来自命令行。
+///
+/// `--testnet` 只影响 binance 一侧：这个代码库里 Kraken 的下单客户端不支持
+/// testnet。
+async fn run_rotate_command(args: &[String]) -> anyhow::Result<()> {
+    let mut symbol: Option<Symbol> = None;
+    let mut qty: Option<Decimal> = None;
+    let mut sell_venue: Option<String> = None;
+    let mut buy_venue: Option<String> = None;
+    let mut testnet = false;
+    let mut dry_run = true;
+    let mut client_order_id_prefix: Option<String> = None;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--symbol" => {
+                let v = args.get(i + 1).context("--symbol requires a value")?;
+                let (base, quote) = v
+                    .split_once('/')
+                    .context("--symbol must be in Base/Quote format, e.g. BTC/USDT")?;
+                symbol = Some(Symbol::new(base, quote));
+                i += 2;
+            }
+            "--qty" => {
+                let v = args.get(i + 1).context("--qty requires a value")?;
+                qty = Some(v.parse().context("--qty must be a valid decimal number")?);
+                i += 2;
+            }
+            "--sell" => {
+                sell_venue = Some(args.get(i + 1).context("--sell requires a value")?.clone());
+                i += 2;
+            }
+            "--buy" => {
+                buy_venue = Some(args.get(i + 1).context("--buy requires a value")?.clone());
+                i += 2;
+            }
+            "--testnet" => {
+                testnet = true;
+                i += 1;
+            }
+            "--dry-run" => {
+                dry_run = true;
+                i += 1;
+            }
+            "--live" => {
+                dry_run = false;
+                i += 1;
+            }
+            "--client-order-id-prefix" => {
+                client_order_id_prefix = Some(
+                    args.get(i + 1)
+                        .context("--client-order-id-prefix requires a value")?
+                        .clone(),
+                );
+                i += 2;
+            }
+            other => anyhow::bail!("unknown argument '{other}' for 'rotate' subcommand"),
+        }
+    }
+
+    let symbol = symbol.context("--symbol is required, e.g. --symbol BTC/USDT")?;
+    let qty = qty.context("--qty is required, e.g. --qty 0.5")?;
+    let sell_venue = sell_venue.context("--sell is required, e.g. --sell binance")?;
+    let buy_venue = buy_venue.context("--buy is required, e.g. --buy kraken")?;
+    if sell_venue == buy_venue {
+        anyhow::bail!("--sell and --buy must be different venues, got '{sell_venue}' for both");
+    }
+
+    let proxy = net::proxy_from_env();
+    let sell_provider = build_order_provider(&sell_venue, testnet, proxy.as_deref())?;
+    let buy_provider = build_order_provider(&buy_venue, testnet, proxy.as_deref())?;
+
+    info!(
+        "rotate: symbol={symbol} qty={qty} sell={sell_venue} buy={buy_venue} testnet={testnet} dry_run={dry_run}"
+    );
+    if dry_run {
+        info!("rotate: dry_run=true (default), pass --live to actually place orders");
+    }
+
+    let report = execution::rotate_inventory(
+        sell_provider.as_ref(),
+        buy_provider.as_ref(),
+        execution::RotateInventoryParams {
+            symbol,
+            qty,
+            client_order_id_prefix,
+            dry_run,
+        },
+    )
+    .await?;
+
+    println!("{report:#?}");
+    Ok(())
+}
+
+/// 把 `"binance"` / `"kraken"` 映射到对应的现货 `OrderProvider`，供 `rotate`
+/// 子命令按名字选择交易所。
+fn build_order_provider(name: &str, testnet: bool, proxy: Option<&str>) -> anyhow::Result<Box<dyn OrderProvider>> {
+    match name {
+        "binance" => Ok(Box::new(BinanceOrderProvider::from_env(
+            Venue::new("binance_spot"),
+            testnet,
+            proxy,
+        )?)),
+        "kraken" => Ok(Box::new(KrakenOrderProvider::from_env(Venue::new("kraken_spot"), proxy)?)),
+        other => anyhow::bail!("unknown venue '{other}' for 'rotate' subcommand, expected 'binance' or 'kraken'"),
+    }
 }

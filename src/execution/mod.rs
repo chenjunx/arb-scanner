@@ -126,6 +126,86 @@ pub struct TransferHalfParams {
     pub dry_run: bool,
 }
 
+/// 库存轮转参数：在 `sell_provider` 卖出、`buy_provider` 买入同等数量的同一
+/// 资产，两条腿真实市价单并发发起。用于在两个交易所之间调整现货库存，比链上
+/// 划转更快。数量统一按基础币指定（而不是像 `open_hedged_position` 现货腿那样
+/// 按计价币金额），因为 Kraken 市价单只支持按基础币数量下单，统一单位才能让
+/// 两条腿共用同一套 `OrderProvider::place_market_order` 校验路径。
+#[derive(Debug, Clone)]
+pub struct RotateInventoryParams {
+    pub symbol: Symbol,
+    pub qty: Decimal,
+    pub client_order_id_prefix: Option<String>,
+    pub dry_run: bool,
+}
+
+/// 库存轮转结果：两条腿都成功才会返回。
+#[derive(Debug, Clone)]
+pub struct RotateInventoryReport {
+    pub sell_order: OrderResult,
+    pub buy_order: OrderResult,
+}
+
+/// 并发向 `sell_provider` 发一笔卖单、向 `buy_provider` 发一笔等量买单。两条腿
+/// 互相独立，不做自动回滚：如果一条腿失败、另一条已经成交，会留下单边仓位，
+/// 返回的错误里会带上已成交那一条腿的完整订单信息，需要人工介入对账。
+pub async fn rotate_inventory(
+    sell_provider: &dyn OrderProvider,
+    buy_provider: &dyn OrderProvider,
+    params: RotateInventoryParams,
+) -> anyhow::Result<RotateInventoryReport> {
+    let sell_req = MarketOrderRequest {
+        symbol: params.symbol.clone(),
+        side: OrderSide::Sell,
+        amount: OrderAmount::Base(params.qty),
+        client_order_id: params.client_order_id_prefix.as_ref().map(|p| format!("{p}-sell")),
+        dry_run: params.dry_run,
+    };
+    let buy_req = MarketOrderRequest {
+        symbol: params.symbol.clone(),
+        side: OrderSide::Buy,
+        amount: OrderAmount::Base(params.qty),
+        client_order_id: params.client_order_id_prefix.as_ref().map(|p| format!("{p}-buy")),
+        dry_run: params.dry_run,
+    };
+
+    let (sell_result, buy_result) = tokio::join!(
+        sell_provider.place_market_order(sell_req),
+        buy_provider.place_market_order(buy_req),
+    );
+
+    match (sell_result, buy_result) {
+        (Ok(sell_order), Ok(buy_order)) => {
+            log::info!("rotate_inventory: sell={:?} buy={:?}", sell_order, buy_order);
+            Ok(RotateInventoryReport { sell_order, buy_order })
+        }
+        (Err(sell_err), Ok(buy_order)) => {
+            log::error!(
+                "rotate_inventory: sell leg failed ({sell_err}), buy leg already filled = {:?} -- manual reconciliation needed",
+                buy_order
+            );
+            Err(sell_err.context(format!(
+                "rotate_inventory: sell leg failed but buy leg already filled (buy_order={buy_order:?}), manual reconciliation needed"
+            )))
+        }
+        (Ok(sell_order), Err(buy_err)) => {
+            log::error!(
+                "rotate_inventory: buy leg failed ({buy_err}), sell leg already filled = {:?} -- manual reconciliation needed",
+                sell_order
+            );
+            Err(buy_err.context(format!(
+                "rotate_inventory: buy leg failed but sell leg already filled (sell_order={sell_order:?}), manual reconciliation needed"
+            )))
+        }
+        (Err(sell_err), Err(buy_err)) => {
+            log::error!("rotate_inventory: both legs failed, sell_err={sell_err}, buy_err={buy_err}");
+            Err(anyhow::anyhow!(
+                "rotate_inventory: both legs failed; sell leg error: {sell_err}; buy leg error: {buy_err}"
+            ))
+        }
+    }
+}
+
 /// 把 `filled_qty` 的一半划转到 Kraken：先精确匹配双边共同链，再取 Kraken 收款
 /// 地址，最后从币安提币。返回实际划转数量和提币结果。
 pub async fn transfer_half_to_kraken(
@@ -751,5 +831,130 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("匹配到多个候选划转网络"));
+    }
+
+    /// `rotate_inventory` 测试替身：固定返回 `market_info`，`fail=true` 时对
+    /// `place_market_order_raw` 报错，并记录每次真实下单（走过 dry_run 之外
+    /// 分支）的调用次数，用于验证并发下单时"一边失败不会让另一边被跳过"。
+    struct FakeRotateProvider {
+        name: &'static str,
+        info: MarketInfo,
+        fail: bool,
+        raw_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl OrderProvider for FakeRotateProvider {
+        fn venue(&self) -> Venue {
+            Venue::new(self.name)
+        }
+        async fn market_info(&self, _symbol: &Symbol) -> anyhow::Result<MarketInfo> {
+            Ok(self.info.clone())
+        }
+        async fn place_market_order_raw(&self, req: &MarketOrderRequest) -> anyhow::Result<OrderResult> {
+            let OrderAmount::Base(quantity) = req.amount else {
+                unreachable!("rotate_inventory only uses OrderAmount::Base")
+            };
+            self.raw_calls.fetch_add(1, Ordering::SeqCst);
+            if self.fail {
+                anyhow::bail!("simulated {} failure", self.name);
+            }
+            Ok(OrderResult {
+                order_id: format!("{}-{}", self.name, req.symbol),
+                status: OrderStatus::Filled,
+                filled_qty: quantity,
+                avg_price: Some(Decimal::ONE),
+            })
+        }
+    }
+
+    fn rotate_info() -> MarketInfo {
+        MarketInfo {
+            symbol: btc_usdt(),
+            qty_step: Decimal::new(1, 3),
+            min_qty: Decimal::new(1, 3),
+        }
+    }
+
+    fn rotate_provider(name: &'static str, fail: bool) -> (FakeRotateProvider, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = FakeRotateProvider {
+            name,
+            info: rotate_info(),
+            fail,
+            raw_calls: calls.clone(),
+        };
+        (provider, calls)
+    }
+
+    fn rotate_params(dry_run: bool) -> RotateInventoryParams {
+        RotateInventoryParams {
+            symbol: btc_usdt(),
+            qty: Decimal::new(1, 1),
+            client_order_id_prefix: Some("test".to_string()),
+            dry_run,
+        }
+    }
+
+    #[tokio::test]
+    async fn rotate_inventory_dry_run_skips_both_raw_calls() {
+        let (sell, sell_calls) = rotate_provider("sell-venue", false);
+        let (buy, buy_calls) = rotate_provider("buy-venue", false);
+
+        let report = rotate_inventory(&sell, &buy, rotate_params(true)).await.unwrap();
+
+        assert_eq!(report.sell_order.order_id, "dry-run");
+        assert_eq!(report.buy_order.order_id, "dry-run");
+        assert_eq!(sell_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(buy_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn rotate_inventory_happy_path_fills_both_legs() {
+        let (sell, sell_calls) = rotate_provider("sell-venue", false);
+        let (buy, buy_calls) = rotate_provider("buy-venue", false);
+
+        let report = rotate_inventory(&sell, &buy, rotate_params(false)).await.unwrap();
+
+        assert_eq!(report.sell_order.order_id, "sell-venue-BTC/USDT");
+        assert_eq!(report.buy_order.order_id, "buy-venue-BTC/USDT");
+        assert_eq!(sell_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(buy_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn rotate_inventory_sell_failure_still_places_buy_leg() {
+        let (sell, _sell_calls) = rotate_provider("sell-venue", true);
+        let (buy, buy_calls) = rotate_provider("buy-venue", false);
+
+        let err = rotate_inventory(&sell, &buy, rotate_params(false)).await.unwrap_err();
+
+        assert!(err.to_string().contains("manual reconciliation needed"));
+        assert!(err.to_string().contains("buy-venue-BTC/USDT"));
+        // 并发下单：卖出腿失败不应该让买入腿被跳过。
+        assert_eq!(buy_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn rotate_inventory_buy_failure_still_places_sell_leg() {
+        let (sell, sell_calls) = rotate_provider("sell-venue", false);
+        let (buy, _buy_calls) = rotate_provider("buy-venue", true);
+
+        let err = rotate_inventory(&sell, &buy, rotate_params(false)).await.unwrap_err();
+
+        assert!(err.to_string().contains("manual reconciliation needed"));
+        assert!(err.to_string().contains("sell-venue-BTC/USDT"));
+        assert_eq!(sell_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn rotate_inventory_both_legs_fail() {
+        let (sell, _sell_calls) = rotate_provider("sell-venue", true);
+        let (buy, _buy_calls) = rotate_provider("buy-venue", true);
+
+        let err = rotate_inventory(&sell, &buy, rotate_params(false)).await.unwrap_err();
+
+        assert!(err.to_string().contains("simulated sell-venue failure"));
+        assert!(err.to_string().contains("simulated buy-venue failure"));
     }
 }
