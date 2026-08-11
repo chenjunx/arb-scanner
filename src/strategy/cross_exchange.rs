@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use log::debug;
 use rust_decimal::Decimal;
 
 use crate::engine::MarketView;
@@ -62,6 +63,17 @@ impl Strategy for CrossExchangeStrategy {
                 let sell_proceeds = sell_quote.bid * self.fee_for(sell_venue).sell_multiplier();
 
                 let profit_bps = (sell_proceeds - buy_cost) / buy_cost * Decimal::from(10_000);
+
+                debug!(
+                    "{sym} spread: buy={bv}@{ba} sell={sv}@{sb} profit_bps={p}",
+                    sym = changed.symbol,
+                    bv = buy_venue,
+                    ba = buy_quote.ask,
+                    sv = sell_venue,
+                    sb = sell_quote.bid,
+                    p = profit_bps
+                );
+
                 if profit_bps < self.min_profit_bps {
                     continue;
                 }
