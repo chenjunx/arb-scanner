@@ -1,5 +1,6 @@
 pub mod config;
 pub mod engine;
+pub mod exchange_info;
 pub mod execution;
 pub mod logging;
 pub mod market_data;
