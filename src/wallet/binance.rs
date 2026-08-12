@@ -13,7 +13,9 @@ use super::types::{AssetInfo, ChainInfo, DepositAddress, WithdrawRequest, Withdr
 
 const MAINNET_HOST: &str = "https://api.binance.com";
 const TESTNET_HOST: &str = "https://testnet.binance.vision";
-const RECV_WINDOW_MS: u64 = 5_000;
+// 与 order::binance/order::binance_futures 保持一致：并发发多条腿请求时
+// 曾因调度延迟导致时间戳超出 recvWindow(被网关报成 -1022 签名错误)，调大留冗余。
+const RECV_WINDOW_MS: u64 = 10_000;
 
 /// 币安钱包(转账层)客户端：读取收款地址/链信息、发起提币。签名用 Ed25519
 /// (币安推荐的非对称签名方式,不是 HMAC-SHA256),私钥以 PKCS8 PEM 文本传入。

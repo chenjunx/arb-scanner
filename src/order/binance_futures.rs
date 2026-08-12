@@ -14,7 +14,9 @@ use super::types::{MarketInfo, MarketOrderRequest, OrderAmount, OrderResult, Ord
 
 const MAINNET_HOST: &str = "https://fapi.binance.com";
 const TESTNET_HOST: &str = "https://testnet.binancefuture.com";
-const RECV_WINDOW_MS: u64 = 5_000;
+// 5000 曾在并发下三条腿一起发请求时因调度延迟触发过一次 -1022(签名无效)，
+// 实际是时间戳超出 recvWindow 但被币安网关报成了签名错误，调大留出冗余。
+const RECV_WINDOW_MS: u64 = 10_000;
 
 /// 币安 USDT-M 永续合约下单(执行层)客户端：查询交易对精度限制、提交市价单。
 /// 签名方式和 `order::binance::BinanceOrderProvider`(现货)一致，用 Ed25519，
