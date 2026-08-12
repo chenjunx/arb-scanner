@@ -73,6 +73,18 @@ impl BinanceWalletProvider {
         let text = resp.text().await.context("failed to read binance wallet response body")?;
         Ok(text)
     }
+
+    /// 一次性拉取全部币种的链信息，供需要批量核对(如 `scan` 子命令算跨所交集)的
+    /// 调用方使用，避免对每个币种各打一次 `/sapi/v1/capital/config/getall`
+    /// (这个接口本来就是一次性返回全量列表，逐币调用属于重复拉取同一份数据)。
+    /// 不放进 `WalletProvider` trait：Kraken 没有对应的批量接口，硬塞进 trait 会
+    /// 给 Kraken 实现一个做不到的方法。
+    pub async fn all_asset_info(&self) -> anyhow::Result<Vec<AssetInfo>> {
+        let text = self
+            .signed_request(reqwest::Method::GET, "/sapi/v1/capital/config/getall", Vec::new())
+            .await?;
+        parse_all_asset_info(&text)
+    }
 }
 
 #[async_trait]
@@ -194,35 +206,43 @@ struct ErrorResponse {
 }
 
 fn parse_asset_info(text: &str, asset: &str) -> anyhow::Result<AssetInfo> {
+    let assets = parse_all_asset_info(text)?;
+    assets
+        .into_iter()
+        .find(|a| a.asset.eq_ignore_ascii_case(asset))
+        .ok_or_else(|| anyhow::anyhow!("asset {asset} not found in binance coin config"))
+}
+
+fn parse_all_asset_info(text: &str) -> anyhow::Result<Vec<AssetInfo>> {
     if let Ok(err) = serde_json::from_str::<ErrorResponse>(text) {
         anyhow::bail!("binance error {}: {}", err.code, err.msg);
     }
     let coins: Vec<CoinConfig> = serde_json::from_str(text)
         .with_context(|| format!("failed to parse binance coin config response, raw body: {text}"))?;
-    let coin = coins
-        .into_iter()
-        .find(|c| c.coin.eq_ignore_ascii_case(asset))
-        .ok_or_else(|| anyhow::anyhow!("asset {asset} not found in binance coin config"))?;
 
-    let networks = coin
-        .network_list
+    Ok(coins
         .into_iter()
-        .map(|n| ChainInfo {
-            network: n.network,
-            name: n.name,
-            deposit_enabled: n.deposit_enable,
-            withdraw_enabled: n.withdraw_enable,
-            withdraw_fee: n.withdraw_fee,
-            withdraw_min: n.withdraw_min,
-            min_confirm: n.min_confirm,
-            contract_address: (!n.contract_address.is_empty()).then_some(n.contract_address),
+        .map(|coin| {
+            let networks = coin
+                .network_list
+                .into_iter()
+                .map(|n| ChainInfo {
+                    network: n.network,
+                    name: n.name,
+                    deposit_enabled: n.deposit_enable,
+                    withdraw_enabled: n.withdraw_enable,
+                    withdraw_fee: n.withdraw_fee,
+                    withdraw_min: n.withdraw_min,
+                    min_confirm: n.min_confirm,
+                    contract_address: (!n.contract_address.is_empty()).then_some(n.contract_address),
+                })
+                .collect();
+            AssetInfo {
+                asset: coin.coin,
+                networks,
+            }
         })
-        .collect();
-
-    Ok(AssetInfo {
-        asset: coin.coin,
-        networks,
-    })
+        .collect())
 }
 
 #[derive(Debug, Deserialize)]

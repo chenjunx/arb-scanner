@@ -6,6 +6,7 @@ pub mod logging;
 pub mod market_data;
 pub mod net;
 pub mod order;
+pub mod scan;
 pub mod sink;
 pub mod strategy;
 pub mod types;

@@ -141,8 +141,12 @@ impl ExchangeInfoProvider for KrakenExchangeInfoProvider {
         parse_trading_fee(&text, symbol)
     }
 
+    /// `assetVersion=1` 让 `base`/`quote` 字段返回展示名(如 `"BTC"`)而不是 Kraken
+    /// 内部资产代码(如 `"XXBT"`)，绝大多数币种展示名已经和币安命名一致。不完全
+    /// 保证对齐的少数情况用 [`kraken_asset_to_standard`] 兜底翻译。
     async fn usdt_spot_symbols(&self) -> anyhow::Result<Vec<Symbol>> {
-        let text = self.public_request("/0/public/AssetPairs", Vec::new()).await?;
+        let params = vec![("assetVersion".to_string(), "1".to_string())];
+        let text = self.public_request("/0/public/AssetPairs", params).await?;
         parse_usdt_spot_symbols(&text)
     }
 
@@ -253,10 +257,27 @@ fn parse_trading_fee(text: &str, symbol: &Symbol) -> anyhow::Result<TradingFee> 
     Ok(TradingFee { maker_bps, taker_bps })
 }
 
+/// 币安是全项目的标准命名权威(见 `wallet::kraken::KRAKEN_METHOD_TO_STANDARD` 对
+/// 链名的同一约定)，这里对应资产 ticker：`assetVersion=1` 的展示名绝大多数已经
+/// 和币安一致，但历史上 Kraken 出现过和主流市场不同的 ticker 选择，留一张最小
+/// 的兜底映射表，查不到的原样透传(转大写)。新增条目前必须用真实 `AssetPairs`
+/// 响应核对拼写，不能凭猜测添加。
+const KRAKEN_ASSET_TO_STANDARD: &[(&str, &str)] = &[];
+
+fn kraken_asset_to_standard(native: &str) -> String {
+    KRAKEN_ASSET_TO_STANDARD
+        .iter()
+        .find(|(n, _)| n.eq_ignore_ascii_case(native))
+        .map(|(_, standard)| standard.to_string())
+        .unwrap_or_else(|| native.to_ascii_uppercase())
+}
+
 #[derive(Debug, Deserialize)]
 struct AssetPairEntry {
     #[serde(default)]
-    wsname: Option<String>,
+    base: Option<String>,
+    #[serde(default)]
+    quote: Option<String>,
     #[serde(default)]
     status: Option<String>,
 }
@@ -266,11 +287,11 @@ fn parse_usdt_spot_symbols(text: &str) -> anyhow::Result<Vec<Symbol>> {
     let mut symbols: Vec<Symbol> = pairs
         .into_values()
         .filter(|p| p.status.as_deref().is_none_or(|s| s == "online"))
-        .filter_map(|p| p.wsname)
-        .filter_map(|wsname| {
-            let (base, quote) = wsname.split_once('/')?;
+        .filter_map(|p| {
+            let base = p.base?;
+            let quote = p.quote?;
             if quote.eq_ignore_ascii_case("USDT") {
-                Some(Symbol::new(base, quote))
+                Some(Symbol::new(kraken_asset_to_standard(&base), "USDT"))
             } else {
                 None
             }
@@ -388,13 +409,18 @@ mod tests {
         let text = r#"{
             "error": [],
             "result": {
-                "XBTUSDT": {"altname": "XBTUSDT", "wsname": "XBT/USDT", "status": "online"},
-                "XXBTZUSD": {"altname": "XXBTZUSD", "wsname": "XBT/USD", "status": "online"},
-                "OLDUSDT": {"altname": "OLDUSDT", "wsname": "OLD/USDT", "status": "delisted"}
+                "BTC/USDT": {"base": "BTC", "quote": "USDT", "status": "online"},
+                "BTC/USD": {"base": "BTC", "quote": "USD", "status": "online"},
+                "OLD/USDT": {"base": "OLD", "quote": "USDT", "status": "delisted"}
             }
         }"#;
         let symbols = parse_usdt_spot_symbols(text).expect("should parse");
-        assert_eq!(symbols, vec![Symbol::new("XBT", "USDT")]);
+        assert_eq!(symbols, vec![Symbol::new("BTC", "USDT")]);
+    }
+
+    #[test]
+    fn kraken_asset_to_standard_passes_through_when_table_empty() {
+        assert_eq!(kraken_asset_to_standard("btc"), "BTC");
     }
 
     #[test]

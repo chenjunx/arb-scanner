@@ -7,6 +7,8 @@ use rust_decimal::Decimal;
 
 use arb_scanner::config::AppConfig;
 use arb_scanner::engine::ArbitrageEngine;
+use arb_scanner::exchange_info::binance::BinanceExchangeInfoProvider;
+use arb_scanner::exchange_info::kraken::KrakenExchangeInfoProvider;
 use arb_scanner::execution;
 use arb_scanner::logging;
 use arb_scanner::market_data::MarketDataSource;
@@ -18,6 +20,7 @@ use arb_scanner::order::OrderProvider;
 use arb_scanner::order::binance::BinanceOrderProvider;
 use arb_scanner::order::binance_futures::BinanceFuturesOrderProvider;
 use arb_scanner::order::kraken::KrakenOrderProvider;
+use arb_scanner::scan;
 use arb_scanner::sink::OpportunitySink;
 use arb_scanner::sink::log_sink::LogSink;
 use arb_scanner::strategy::cross_exchange::CrossExchangeStrategy;
@@ -44,6 +47,9 @@ async fn main() -> anyhow::Result<()> {
     }
     if args.get(1).map(String::as_str) == Some("close") {
         return run_close_command(&args[2..]).await;
+    }
+    if args.get(1).map(String::as_str) == Some("scan") {
+        return run_scan_command(&args[2..]).await;
     }
 
     let config_path = args.get(1).cloned().unwrap_or_else(|| "config.toml".to_string());
@@ -507,6 +513,38 @@ async fn run_close_command(args: &[String]) -> anyhow::Result<()> {
     .await?;
 
     println!("{report:#?}");
+    Ok(())
+}
+
+/// `scan` 子命令：只读地找出币安和 Kraken"有交集"的币种——币安有 USDT 本位永续
+/// 合约、Kraken 有 USDT 现货、且两边钱包信息里至少共享一条可转账的标准链，打印
+/// 每个币种的基本信息，作为后续 `open`/`rotate` 操作前的选币依据。不接入 engine
+/// 主循环，也不读取 `config.toml`。
+async fn run_scan_command(args: &[String]) -> anyhow::Result<()> {
+    let mut testnet = false;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--testnet" => {
+                testnet = true;
+                i += 1;
+            }
+            other => anyhow::bail!("unknown argument '{other}' for 'scan' subcommand"),
+        }
+    }
+
+    let proxy = net::proxy_from_env();
+    let binance_info = BinanceExchangeInfoProvider::from_env(Venue::new("binance"), testnet, proxy.as_deref())?;
+    let kraken_info = KrakenExchangeInfoProvider::from_env(Venue::new("kraken"), proxy.as_deref())?;
+    let binance_wallet = BinanceWalletProvider::from_env(Venue::new("binance"), testnet, proxy.as_deref())?;
+    let kraken_wallet = KrakenWalletProvider::from_env(Venue::new("kraken"), proxy.as_deref())?;
+
+    info!("scan: looking for symbols overlapping between binance (usdt perpetual) and kraken (usdt spot) testnet={testnet}");
+
+    let overlaps = scan::find_overlap(&binance_info, &kraken_info, &binance_wallet, &kraken_wallet).await?;
+    info!("scan: found {} overlapping symbols", overlaps.len());
+    println!("{}", scan::format_overlap_table(&overlaps));
     Ok(())
 }
 
