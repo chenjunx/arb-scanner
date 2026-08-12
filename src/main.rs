@@ -542,9 +542,22 @@ async fn run_scan_command(args: &[String]) -> anyhow::Result<()> {
 
     info!("scan: looking for symbols overlapping between binance (usdt perpetual) and kraken (usdt spot) testnet={testnet}");
 
-    let overlaps = scan::find_overlap(&binance_info, &kraken_info, &binance_wallet, &kraken_wallet).await?;
-    info!("scan: found {} overlapping symbols", overlaps.len());
-    println!("{}", scan::format_overlap_table(&overlaps));
+    let result = scan::find_overlap(&binance_info, &kraken_info, &binance_wallet, &kraken_wallet).await?;
+    info!(
+        "scan: binance_perp_symbols={} kraken_spot_symbols={} overlapping_symbols={}",
+        result.binance_perp_symbols.len(),
+        result.kraken_spot_symbols.len(),
+        result.overlaps.len()
+    );
+
+    println!("== Binance USDT Perpetual Symbols ({}) ==", result.binance_perp_symbols.len());
+    println!("{}", scan::format_symbol_list(&result.binance_perp_symbols));
+    println!();
+    println!("== Kraken USDT Spot Symbols ({}) ==", result.kraken_spot_symbols.len());
+    println!("{}", scan::format_symbol_list(&result.kraken_spot_symbols));
+    println!();
+    println!("== Overlapping Symbols ({}) ==", result.overlaps.len());
+    println!("{}", scan::format_overlap_table(&result.overlaps));
     Ok(())
 }
 
