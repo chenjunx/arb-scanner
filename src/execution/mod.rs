@@ -206,6 +206,150 @@ pub async fn rotate_inventory(
     }
 }
 
+/// 平仓参数：三条腿相互独立，每条腿的数量都可选——`None` 表示不平这条腿(比如
+/// 某个币种从没转过 Kraken，就不用传 `kraken_spot_qty`)。数量统一按基础币指定，
+/// 原因和 [`RotateInventoryParams`] 一样：Kraken 市价单只支持按基础币下单。
+#[derive(Debug, Clone)]
+pub struct ClosePositionParams {
+    pub symbol: Symbol,
+    pub binance_spot_qty: Option<Decimal>,
+    pub kraken_spot_qty: Option<Decimal>,
+    pub futures_qty: Option<Decimal>,
+    pub client_order_id_prefix: Option<String>,
+    pub dry_run: bool,
+}
+
+/// 平仓结果：只有三条 `Result` 都成功才会返回，未请求的腿对应字段为 `None`。
+#[derive(Debug, Clone)]
+pub struct ClosePositionReport {
+    pub binance_spot_order: Option<OrderResult>,
+    pub kraken_spot_order: Option<OrderResult>,
+    pub futures_order: Option<OrderResult>,
+}
+
+/// 并发平掉币安现货、Kraken 现货、币安合约三条腿：现货两条腿是卖出，合约腿是
+/// 买回(对应 [`open_hedged_position`] 里合约腿卖出开空，平仓自然是买回平空)。
+/// 三条腿互相独立、不做自动回滚：任意一条腿失败，其它已经成交的腿不会被撤销，
+/// 返回的错误里会带上三条腿各自的成交/跳过/失败情况，需要人工介入对账。
+pub async fn close_hedged_position(
+    binance_spot: Option<&dyn OrderProvider>,
+    kraken_spot: Option<&dyn OrderProvider>,
+    binance_futures: Option<&dyn OrderProvider>,
+    params: ClosePositionParams,
+) -> anyhow::Result<ClosePositionReport> {
+    for (leg, qty) in [
+        ("binance_spot", params.binance_spot_qty),
+        ("kraken_spot", params.kraken_spot_qty),
+        ("futures", params.futures_qty),
+    ] {
+        if let Some(q) = qty {
+            if q <= Decimal::ZERO {
+                anyhow::bail!("close_hedged_position: {leg} qty must be positive, got {q} (omit the flag to skip this leg)");
+            }
+        }
+    }
+    if params.binance_spot_qty.is_none() && params.kraken_spot_qty.is_none() && params.futures_qty.is_none() {
+        anyhow::bail!(
+            "close_hedged_position: at least one of binance_spot_qty/kraken_spot_qty/futures_qty must be provided"
+        );
+    }
+
+    let (binance_spot_result, kraken_spot_result, futures_result) = tokio::join!(
+        close_leg(
+            binance_spot,
+            &params.symbol,
+            params.binance_spot_qty,
+            OrderSide::Sell,
+            params.client_order_id_prefix.as_ref().map(|p| format!("{p}-close-binance-spot")),
+            params.dry_run,
+            "binance_spot",
+        ),
+        close_leg(
+            kraken_spot,
+            &params.symbol,
+            params.kraken_spot_qty,
+            OrderSide::Sell,
+            params.client_order_id_prefix.as_ref().map(|p| format!("{p}-close-kraken-spot")),
+            params.dry_run,
+            "kraken_spot",
+        ),
+        close_leg(
+            binance_futures,
+            &params.symbol,
+            params.futures_qty,
+            OrderSide::Buy,
+            params.client_order_id_prefix.as_ref().map(|p| format!("{p}-close-futures")),
+            params.dry_run,
+            "futures",
+        ),
+    );
+
+    match (binance_spot_result, kraken_spot_result, futures_result) {
+        (Ok(binance_spot_order), Ok(kraken_spot_order), Ok(futures_order)) => {
+            log::info!(
+                "close_hedged_position: binance_spot={:?} kraken_spot={:?} futures={:?}",
+                binance_spot_order,
+                kraken_spot_order,
+                futures_order
+            );
+            Ok(ClosePositionReport {
+                binance_spot_order,
+                kraken_spot_order,
+                futures_order,
+            })
+        }
+        (binance_spot_result, kraken_spot_result, futures_result) => {
+            let msg = format!(
+                "close_hedged_position: not all legs succeeded, manual reconciliation needed -- {}; {}; {}",
+                describe_leg_result("binance_spot", &binance_spot_result),
+                describe_leg_result("kraken_spot", &kraken_spot_result),
+                describe_leg_result("futures", &futures_result),
+            );
+            log::error!("{msg}");
+            Err(anyhow::anyhow!(msg))
+        }
+    }
+}
+
+/// 单条平仓腿：`qty=None` 直接跳过、不发任何请求；`provider=None` 但 `qty=Some`
+/// 视为调用方配置错误，报错点名是哪条腿。
+async fn close_leg(
+    provider: Option<&dyn OrderProvider>,
+    symbol: &Symbol,
+    qty: Option<Decimal>,
+    side: OrderSide,
+    client_order_id: Option<String>,
+    dry_run: bool,
+    leg_name: &str,
+) -> anyhow::Result<Option<OrderResult>> {
+    let Some(qty) = qty else {
+        return Ok(None);
+    };
+    let Some(provider) = provider else {
+        anyhow::bail!("close_hedged_position: {leg_name} qty {qty} was provided but no provider is configured for this leg");
+    };
+    let order = provider
+        .place_market_order(MarketOrderRequest {
+            symbol: symbol.clone(),
+            side,
+            amount: OrderAmount::Base(qty),
+            client_order_id,
+            dry_run,
+        })
+        .await?;
+    Ok(Some(order))
+}
+
+/// 把一条腿的 `Result<Option<OrderResult>>` 描述成人类可读的一段话，用于拼
+/// `close_hedged_position` 失败时的聚合错误信息。
+fn describe_leg_result(label: &str, result: &anyhow::Result<Option<OrderResult>>) -> String {
+    match result {
+        Ok(Some(order)) => format!("{label} succeeded ({order:?})"),
+        Ok(None) => format!("{label} skipped"),
+        Err(e) => format!("{label} failed ({e})"),
+    }
+}
+
 /// 把 `filled_qty` 的一半划转到 Kraken：先精确匹配双边共同链，再取 Kraken 收款
 /// 地址，最后从币安提币。返回实际划转数量和提币结果。
 pub async fn transfer_half_to_kraken(
@@ -956,5 +1100,276 @@ mod tests {
 
         assert!(err.to_string().contains("simulated sell-venue failure"));
         assert!(err.to_string().contains("simulated buy-venue failure"));
+    }
+
+    /// `close_hedged_position` 测试替身：额外记录 `market_info_calls`，用于区分
+    /// "完全跳过的腿"(两个计数都是0)和"dry-run 试了一下但没真下单的腿"
+    /// (`market_info_calls>0` 但 `raw_calls==0`，因为 `place_market_order` 默认
+    /// 方法在 dry_run 短路之前会先查 `market_info` 做数量校验)。
+    struct FakeCloseProvider {
+        name: &'static str,
+        info: MarketInfo,
+        fail: bool,
+        market_info_calls: Arc<AtomicUsize>,
+        raw_calls: Arc<Mutex<Vec<(OrderSide, Decimal)>>>,
+    }
+
+    #[async_trait]
+    impl OrderProvider for FakeCloseProvider {
+        fn venue(&self) -> Venue {
+            Venue::new(self.name)
+        }
+        async fn market_info(&self, _symbol: &Symbol) -> anyhow::Result<MarketInfo> {
+            self.market_info_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(self.info.clone())
+        }
+        async fn place_market_order_raw(&self, req: &MarketOrderRequest) -> anyhow::Result<OrderResult> {
+            let OrderAmount::Base(quantity) = req.amount else {
+                unreachable!("close_hedged_position only uses OrderAmount::Base")
+            };
+            self.raw_calls.lock().unwrap().push((req.side, quantity));
+            if self.fail {
+                anyhow::bail!("simulated {} failure", self.name);
+            }
+            Ok(OrderResult {
+                order_id: format!("{}-{}", self.name, req.symbol),
+                status: OrderStatus::Filled,
+                filled_qty: quantity,
+                avg_price: Some(Decimal::ONE),
+            })
+        }
+    }
+
+    fn close_info() -> MarketInfo {
+        MarketInfo {
+            symbol: btc_usdt(),
+            qty_step: Decimal::new(1, 3),
+            min_qty: Decimal::new(1, 3),
+        }
+    }
+
+    fn close_provider(name: &'static str, fail: bool) -> (FakeCloseProvider, Arc<AtomicUsize>, Arc<Mutex<Vec<(OrderSide, Decimal)>>>) {
+        let market_info_calls = Arc::new(AtomicUsize::new(0));
+        let raw_calls = Arc::new(Mutex::new(Vec::new()));
+        let provider = FakeCloseProvider {
+            name,
+            info: close_info(),
+            fail,
+            market_info_calls: market_info_calls.clone(),
+            raw_calls: raw_calls.clone(),
+        };
+        (provider, market_info_calls, raw_calls)
+    }
+
+    fn close_params(
+        binance_spot_qty: Option<Decimal>,
+        kraken_spot_qty: Option<Decimal>,
+        futures_qty: Option<Decimal>,
+        dry_run: bool,
+    ) -> ClosePositionParams {
+        ClosePositionParams {
+            symbol: btc_usdt(),
+            binance_spot_qty,
+            kraken_spot_qty,
+            futures_qty,
+            client_order_id_prefix: Some("test".to_string()),
+            dry_run,
+        }
+    }
+
+    #[tokio::test]
+    async fn close_all_three_legs_dry_run_skips_raw_calls() {
+        let (binance_spot, _bs_info_calls, bs_raw) = close_provider("binance-spot", false);
+        let (kraken_spot, _ks_info_calls, ks_raw) = close_provider("kraken-spot", false);
+        let (futures, _f_info_calls, f_raw) = close_provider("futures", false);
+
+        let report = close_hedged_position(
+            Some(&binance_spot),
+            Some(&kraken_spot),
+            Some(&futures),
+            close_params(Some(Decimal::new(1, 1)), Some(Decimal::new(1, 1)), Some(Decimal::new(1, 1)), true),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.binance_spot_order.unwrap().order_id, "dry-run");
+        assert_eq!(report.kraken_spot_order.unwrap().order_id, "dry-run");
+        assert_eq!(report.futures_order.unwrap().order_id, "dry-run");
+        assert!(bs_raw.lock().unwrap().is_empty());
+        assert!(ks_raw.lock().unwrap().is_empty());
+        assert!(f_raw.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn close_happy_path_fills_all_three_legs() {
+        let (binance_spot, _, bs_raw) = close_provider("binance-spot", false);
+        let (kraken_spot, _, ks_raw) = close_provider("kraken-spot", false);
+        let (futures, _, f_raw) = close_provider("futures", false);
+
+        let report = close_hedged_position(
+            Some(&binance_spot),
+            Some(&kraken_spot),
+            Some(&futures),
+            close_params(Some(Decimal::new(1, 1)), Some(Decimal::new(2, 1)), Some(Decimal::new(3, 1)), false),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.binance_spot_order.unwrap().order_id, "binance-spot-BTC/USDT");
+        assert_eq!(report.kraken_spot_order.unwrap().order_id, "kraken-spot-BTC/USDT");
+        assert_eq!(report.futures_order.unwrap().order_id, "futures-BTC/USDT");
+        assert_eq!(bs_raw.lock().unwrap().as_slice(), &[(OrderSide::Sell, Decimal::new(1, 1))]);
+        assert_eq!(ks_raw.lock().unwrap().as_slice(), &[(OrderSide::Sell, Decimal::new(2, 1))]);
+        assert_eq!(f_raw.lock().unwrap().as_slice(), &[(OrderSide::Buy, Decimal::new(3, 1))]);
+    }
+
+    #[tokio::test]
+    async fn close_skips_leg_with_qty_none() {
+        let (binance_spot, bs_info_calls, bs_raw) = close_provider("binance-spot", false);
+        let (kraken_spot, ks_info_calls, ks_raw) = close_provider("kraken-spot", false);
+        let (futures, _f_info_calls, f_raw) = close_provider("futures", false);
+
+        let report = close_hedged_position(
+            Some(&binance_spot),
+            Some(&kraken_spot),
+            Some(&futures),
+            close_params(None, None, Some(Decimal::new(1, 1)), false),
+        )
+        .await
+        .unwrap();
+
+        assert!(report.binance_spot_order.is_none());
+        assert!(report.kraken_spot_order.is_none());
+        assert!(report.futures_order.is_some());
+        assert_eq!(bs_info_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(ks_info_calls.load(Ordering::SeqCst), 0);
+        assert!(bs_raw.lock().unwrap().is_empty());
+        assert!(ks_raw.lock().unwrap().is_empty());
+        assert_eq!(f_raw.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn close_binance_spot_failure_still_places_other_two_legs() {
+        let (binance_spot, _, _) = close_provider("binance-spot", true);
+        let (kraken_spot, _, ks_raw) = close_provider("kraken-spot", false);
+        let (futures, _, f_raw) = close_provider("futures", false);
+
+        let err = close_hedged_position(
+            Some(&binance_spot),
+            Some(&kraken_spot),
+            Some(&futures),
+            close_params(Some(Decimal::new(1, 1)), Some(Decimal::new(1, 1)), Some(Decimal::new(1, 1)), false),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.to_string().contains("manual reconciliation needed"));
+        assert!(err.to_string().contains("binance_spot failed"));
+        assert_eq!(ks_raw.lock().unwrap().len(), 1);
+        assert_eq!(f_raw.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn close_kraken_spot_failure_still_places_other_two_legs() {
+        let (binance_spot, _, bs_raw) = close_provider("binance-spot", false);
+        let (kraken_spot, _, _) = close_provider("kraken-spot", true);
+        let (futures, _, f_raw) = close_provider("futures", false);
+
+        let err = close_hedged_position(
+            Some(&binance_spot),
+            Some(&kraken_spot),
+            Some(&futures),
+            close_params(Some(Decimal::new(1, 1)), Some(Decimal::new(1, 1)), Some(Decimal::new(1, 1)), false),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.to_string().contains("manual reconciliation needed"));
+        assert!(err.to_string().contains("kraken_spot failed"));
+        assert_eq!(bs_raw.lock().unwrap().len(), 1);
+        assert_eq!(f_raw.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn close_futures_failure_still_places_other_two_legs() {
+        let (binance_spot, _, bs_raw) = close_provider("binance-spot", false);
+        let (kraken_spot, _, ks_raw) = close_provider("kraken-spot", false);
+        let (futures, _, _) = close_provider("futures", true);
+
+        let err = close_hedged_position(
+            Some(&binance_spot),
+            Some(&kraken_spot),
+            Some(&futures),
+            close_params(Some(Decimal::new(1, 1)), Some(Decimal::new(1, 1)), Some(Decimal::new(1, 1)), false),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.to_string().contains("manual reconciliation needed"));
+        assert!(err.to_string().contains("futures failed"));
+        assert_eq!(bs_raw.lock().unwrap().len(), 1);
+        assert_eq!(ks_raw.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn close_all_three_legs_fail_combined_error_message() {
+        let (binance_spot, _, _) = close_provider("binance-spot", true);
+        let (kraken_spot, _, _) = close_provider("kraken-spot", true);
+        let (futures, _, _) = close_provider("futures", true);
+
+        let err = close_hedged_position(
+            Some(&binance_spot),
+            Some(&kraken_spot),
+            Some(&futures),
+            close_params(Some(Decimal::new(1, 1)), Some(Decimal::new(1, 1)), Some(Decimal::new(1, 1)), false),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.to_string().contains("simulated binance-spot failure"));
+        assert!(err.to_string().contains("simulated kraken-spot failure"));
+        assert!(err.to_string().contains("simulated futures failure"));
+    }
+
+    #[tokio::test]
+    async fn close_validation_error_when_qty_is_non_positive() {
+        let (binance_spot, bs_info_calls, bs_raw) = close_provider("binance-spot", false);
+
+        let err = close_hedged_position(
+            Some(&binance_spot),
+            None,
+            None,
+            close_params(Some(Decimal::ZERO), None, None, false),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.to_string().contains("binance_spot qty must be positive"));
+        assert_eq!(bs_info_calls.load(Ordering::SeqCst), 0);
+        assert!(bs_raw.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn close_validation_error_when_no_leg_requested() {
+        let err = close_hedged_position(None, None, None, close_params(None, None, None, false))
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("at least one of"));
+    }
+
+    #[tokio::test]
+    async fn close_qty_provided_without_matching_provider_errors() {
+        let err = close_hedged_position(
+            None,
+            None,
+            None,
+            close_params(Some(Decimal::new(1, 1)), None, None, false),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.to_string().contains("binance_spot"));
+        assert!(err.to_string().contains("no provider is configured"));
     }
 }

@@ -42,6 +42,9 @@ async fn main() -> anyhow::Result<()> {
     if args.get(1).map(String::as_str) == Some("rotate") {
         return run_rotate_command(&args[2..]).await;
     }
+    if args.get(1).map(String::as_str) == Some("close") {
+        return run_close_command(&args[2..]).await;
+    }
 
     let config_path = args.get(1).cloned().unwrap_or_else(|| "config.toml".to_string());
     let config = AppConfig::load(&config_path)
@@ -384,6 +387,119 @@ async fn run_rotate_command(args: &[String]) -> anyhow::Result<()> {
         execution::RotateInventoryParams {
             symbol,
             qty,
+            client_order_id_prefix,
+            dry_run,
+        },
+    )
+    .await?;
+
+    println!("{report:#?}");
+    Ok(())
+}
+
+/// `close` 子命令：平掉币安现货、Kraken 现货、币安合约三条腿，互相独立、可以
+/// 只传其中一部分。每条腿的数量都要在命令行里显式指定——这个代码库里没有余额
+/// /持仓查询接口，没法自动算出"全部"是多少，需要调用方自己核对仓位后传入。
+/// 同样不接入 engine 主循环，也不读取 `config.toml`。
+///
+/// 只有对应 `--xxx-qty` 被传入时才会构造那个交易所的 provider，所以只平币安
+/// 一侧时不需要配置 Kraken 的 API key。
+async fn run_close_command(args: &[String]) -> anyhow::Result<()> {
+    let mut symbol: Option<Symbol> = None;
+    let mut binance_spot_qty: Option<Decimal> = None;
+    let mut kraken_spot_qty: Option<Decimal> = None;
+    let mut futures_qty: Option<Decimal> = None;
+    let mut testnet = false;
+    let mut dry_run = true;
+    let mut client_order_id_prefix: Option<String> = None;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--symbol" => {
+                let v = args.get(i + 1).context("--symbol requires a value")?;
+                let (base, quote) = v
+                    .split_once('/')
+                    .context("--symbol must be in Base/Quote format, e.g. BTC/USDT")?;
+                symbol = Some(Symbol::new(base, quote));
+                i += 2;
+            }
+            "--binance-spot-qty" => {
+                let v = args.get(i + 1).context("--binance-spot-qty requires a value")?;
+                binance_spot_qty = Some(v.parse().context("--binance-spot-qty must be a valid decimal number")?);
+                i += 2;
+            }
+            "--kraken-spot-qty" => {
+                let v = args.get(i + 1).context("--kraken-spot-qty requires a value")?;
+                kraken_spot_qty = Some(v.parse().context("--kraken-spot-qty must be a valid decimal number")?);
+                i += 2;
+            }
+            "--futures-qty" => {
+                let v = args.get(i + 1).context("--futures-qty requires a value")?;
+                futures_qty = Some(v.parse().context("--futures-qty must be a valid decimal number")?);
+                i += 2;
+            }
+            "--testnet" => {
+                testnet = true;
+                i += 1;
+            }
+            "--dry-run" => {
+                dry_run = true;
+                i += 1;
+            }
+            "--live" => {
+                dry_run = false;
+                i += 1;
+            }
+            "--client-order-id-prefix" => {
+                client_order_id_prefix = Some(
+                    args.get(i + 1)
+                        .context("--client-order-id-prefix requires a value")?
+                        .clone(),
+                );
+                i += 2;
+            }
+            other => anyhow::bail!("unknown argument '{other}' for 'close' subcommand"),
+        }
+    }
+
+    let symbol = symbol.context("--symbol is required, e.g. --symbol BTC/USDT")?;
+    if binance_spot_qty.is_none() && kraken_spot_qty.is_none() && futures_qty.is_none() {
+        anyhow::bail!(
+            "at least one of --binance-spot-qty / --kraken-spot-qty / --futures-qty is required"
+        );
+    }
+
+    let proxy = net::proxy_from_env();
+    let binance_spot = binance_spot_qty
+        .is_some()
+        .then(|| BinanceOrderProvider::from_env(Venue::new("binance_spot"), testnet, proxy.as_deref()))
+        .transpose()?;
+    let kraken_spot = kraken_spot_qty
+        .is_some()
+        .then(|| KrakenOrderProvider::from_env(Venue::new("kraken_spot"), proxy.as_deref()))
+        .transpose()?;
+    let binance_futures = futures_qty
+        .is_some()
+        .then(|| BinanceFuturesOrderProvider::from_env(Venue::new("binance_futures"), testnet, proxy.as_deref()))
+        .transpose()?;
+
+    info!(
+        "close: symbol={symbol} binance_spot_qty={binance_spot_qty:?} kraken_spot_qty={kraken_spot_qty:?} futures_qty={futures_qty:?} testnet={testnet} dry_run={dry_run}"
+    );
+    if dry_run {
+        info!("close: dry_run=true (default), pass --live to actually place orders");
+    }
+
+    let report = execution::close_hedged_position(
+        binance_spot.as_ref().map(|p| p as &dyn OrderProvider),
+        kraken_spot.as_ref().map(|p| p as &dyn OrderProvider),
+        binance_futures.as_ref().map(|p| p as &dyn OrderProvider),
+        execution::ClosePositionParams {
+            symbol,
+            binance_spot_qty,
+            kraken_spot_qty,
+            futures_qty,
             client_order_id_prefix,
             dry_run,
         },
