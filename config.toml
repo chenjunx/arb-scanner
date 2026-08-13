@@ -15,6 +15,7 @@ tick_interval_ms = 500  # mock 数据源的行情推送间隔
 name = "binance"
 taker_fee_bps = "10"      # 0.10%
 source = "binance_spot"   # 接币安现货真实行情(bookTicker WebSocket)
+fee_discount = "0.75"     # monitor 子命令按 taker 费率打 7.5 折(如 BNB 抵扣)计算实际成本
 
 [[venues]]
 name = "kraken"

@@ -37,6 +37,22 @@ impl CrossExchangeStrategy {
     }
 }
 
+/// 给定买/卖两侧的价格和各自手续费，返回扣费后的价差(基点)。买价 <= 0 时返回
+/// `None`(报价还没来)。`on_update` 和 `monitor` 子命令的 periodic 模式共用这份算法。
+pub fn compute_profit_bps(
+    buy_ask: Decimal,
+    buy_fee: FeeSchedule,
+    sell_bid: Decimal,
+    sell_fee: FeeSchedule,
+) -> Option<Decimal> {
+    if buy_ask <= Decimal::ZERO {
+        return None;
+    }
+    let buy_cost = buy_ask * buy_fee.buy_multiplier();
+    let sell_proceeds = sell_bid * sell_fee.sell_multiplier();
+    Some((sell_proceeds - buy_cost) / buy_cost * Decimal::from(10_000))
+}
+
 impl Strategy for CrossExchangeStrategy {
     fn name(&self) -> &str {
         "cross_exchange"
@@ -54,15 +70,19 @@ impl Strategy for CrossExchangeStrategy {
             if buy_quote.ask <= Decimal::ZERO {
                 continue;
             }
-            let buy_cost = buy_quote.ask * self.fee_for(buy_venue).buy_multiplier();
+            let buy_fee = self.fee_for(buy_venue);
+            let buy_cost = buy_quote.ask * buy_fee.buy_multiplier();
 
             for (sell_venue, sell_quote) in &quotes {
                 if buy_venue == sell_venue {
                     continue;
                 }
-                let sell_proceeds = sell_quote.bid * self.fee_for(sell_venue).sell_multiplier();
+                let sell_fee = self.fee_for(sell_venue);
+                let sell_proceeds = sell_quote.bid * sell_fee.sell_multiplier();
 
-                let profit_bps = (sell_proceeds - buy_cost) / buy_cost * Decimal::from(10_000);
+                let Some(profit_bps) = compute_profit_bps(buy_quote.ask, buy_fee, sell_quote.bid, sell_fee) else {
+                    continue;
+                };
 
                 debug!(
                     "{sym} spread: buy={bv}@{ba} sell={sv}@{sb} profit_bps={p}",

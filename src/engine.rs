@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use dashmap::DashMap;
 use tokio::sync::mpsc;
 
@@ -35,7 +37,7 @@ impl<'a> MarketView<'a> {
 /// 套利引擎：消费行情事件，维护最新快照缓存，驱动所有注册的策略，
 /// 并将产出的套利机会分发给所有注册的 sink。
 pub struct ArbitrageEngine {
-    cache: DashMap<(Venue, Symbol), Quote>,
+    cache: Arc<DashMap<(Venue, Symbol), Quote>>,
     strategies: Vec<Box<dyn Strategy>>,
     sinks: Vec<Box<dyn OpportunitySink>>,
 }
@@ -43,10 +45,17 @@ pub struct ArbitrageEngine {
 impl ArbitrageEngine {
     pub fn new(strategies: Vec<Box<dyn Strategy>>, sinks: Vec<Box<dyn OpportunitySink>>) -> Self {
         Self {
-            cache: DashMap::new(),
+            cache: Arc::new(DashMap::new()),
             strategies,
             sinks,
         }
+    }
+
+    /// 拿到行情缓存的共享句柄，供 `run()` 事件循环之外的代码(如 `monitor` 子命令的
+    /// periodic 定时任务)主动读取当前快照。必须在 `run(self, rx)` 之前调用，因为
+    /// `run` 会按值消费 `self`。
+    pub fn shared_cache(&self) -> Arc<DashMap<(Venue, Symbol), Quote>> {
+        self.cache.clone()
     }
 
     pub async fn run(self, mut rx: mpsc::Receiver<MarketEvent>) {

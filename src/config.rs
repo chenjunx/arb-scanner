@@ -28,6 +28,10 @@ pub struct VenueConfig {
     /// 仅当 source = "binance_spot" 时生效,是否连接币安测试网。
     #[serde(default)]
     pub testnet: bool,
+    /// 手续费折扣乘数(如 "0.75" 表示打 7.5 折),默认 1(不打折)。用于
+    /// `monitor` 子命令按折后价计算实际成本(如 BNB 抵扣手续费)。
+    #[serde(default = "default_fee_discount")]
+    pub fee_discount: Decimal,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -59,6 +63,10 @@ fn default_source() -> String {
     "mock".to_string()
 }
 
+fn default_fee_discount() -> Decimal {
+    Decimal::ONE
+}
+
 fn default_min_profit_bps() -> Decimal {
     Decimal::from(5)
 }
@@ -81,6 +89,44 @@ impl AppConfig {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("failed to read config file: {}", path.display()))?;
         toml::from_str(&text).context("failed to parse config toml")
+    }
+}
+
+/// 只关心 `[[venues]]` 的宽松包装，用来在不要求 `symbols` 等字段存在的前提下
+/// 从 `config.toml` 里单独读某个 venue 的配置(如 `fee_discount`)。字段之外的
+/// 其余 TOML 内容会被 serde 自动忽略。
+#[derive(Debug, Deserialize, Default)]
+struct VenuesConfigFile {
+    #[serde(default)]
+    venues: Vec<VenueConfig>,
+}
+
+impl VenueConfig {
+    /// 读取 `path` 里 `[[venues]]` 中名为 `venue_name`(大小写不敏感)的
+    /// `fee_discount`。文件不存在、解析失败、或找不到该 venue 时，均回退到
+    /// 默认值 1(不打折)，不返回 `Err`，和 [`ScanConfig::load_blacklist`] 同样
+    /// 的兜底原则。
+    pub fn load_fee_discount(path: impl AsRef<Path>, venue_name: &str) -> Decimal {
+        let path = path.as_ref();
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(_) => return default_fee_discount(),
+        };
+        match toml::from_str::<VenuesConfigFile>(&text) {
+            Ok(file) => file
+                .venues
+                .into_iter()
+                .find(|v| v.name.eq_ignore_ascii_case(venue_name))
+                .map(|v| v.fee_discount)
+                .unwrap_or_else(default_fee_discount),
+            Err(err) => {
+                log::warn!(
+                    "config: failed to parse '{}' for venue '{venue_name}' fee_discount, falling back to 1: {err:#}",
+                    path.display()
+                );
+                default_fee_discount()
+            }
+        }
     }
 }
 

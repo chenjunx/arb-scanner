@@ -7,7 +7,7 @@ use futures_util::stream;
 use log::info;
 use rust_decimal::Decimal;
 
-use arb_scanner::config::{AppConfig, ScanConfig};
+use arb_scanner::config::{AppConfig, ScanConfig, VenueConfig};
 use arb_scanner::engine::ArbitrageEngine;
 use arb_scanner::exchange_info::ExchangeInfoProvider;
 use arb_scanner::exchange_info::binance::BinanceExchangeInfoProvider;
@@ -27,7 +27,7 @@ use arb_scanner::order::kraken::KrakenOrderProvider;
 use arb_scanner::scan;
 use arb_scanner::sink::OpportunitySink;
 use arb_scanner::sink::log_sink::LogSink;
-use arb_scanner::strategy::cross_exchange::CrossExchangeStrategy;
+use arb_scanner::strategy::cross_exchange::{CrossExchangeStrategy, compute_profit_bps};
 use arb_scanner::strategy::triangular::{LegSide, TriangularLeg, TriangularPath, TriangularStrategy};
 use arb_scanner::strategy::{FeeSchedule, Strategy};
 use arb_scanner::types::{Symbol, Venue};
@@ -583,17 +583,38 @@ async fn run_scan_command(args: &[String]) -> anyhow::Result<()> {
 /// 和 `scan/mod.rs` 里 `KRAKEN_WALLET_CONCURRENCY` 同样的考虑。
 const FEE_QUERY_CONCURRENCY: usize = 4;
 
-/// `monitor` 子命令：复用 `scan::find_overlap` 筛出的币安/Kraken 交集币种，接入现成的
-/// 行情源 + `CrossExchangeStrategy` + `LogSink` 管线，持续监控两边现货价差。每个币的
-/// 手续费用 [`ExchangeInfoProvider::spot_trading_fee`] 查询两边真实账户 taker 费率(而
-/// 不是固定值)，扣费后价差只要 >= `--min-profit-bps`(默认 0，即扣费后为正)就打印。
+/// `monitor` 命令的两种运行模式，通过 `--mode` 互斥选择。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MonitorMode {
+    /// 事件驱动，只在扣费后价差 >= `--min-profit-bps` 时打印(默认，historic 行为)。
+    PositiveOnly,
+    /// 定时器驱动，每隔 `--periodic-interval-secs` 打印一次所有监控币种的双向价差，
+    /// 不管正负，只额外标注是否达到 `--min-profit-bps` 阈值。
+    Periodic,
+}
+
+/// `monitor` 子命令：复用 `scan::find_overlap` 筛出的币安/Kraken 交集币种，持续监控
+/// 两边现货价差。每个币的手续费用 [`ExchangeInfoProvider::spot_trading_fee`] 查询两边
+/// 真实账户 taker 费率(而不是固定值)，币安这边再乘上 `config.toml` `[[venues]]` 里
+/// 币安条目的 `fee_discount` 折扣(如 BNB 抵扣手续费，默认 1 不打折，见
+/// [`VenueConfig::load_fee_discount`])，Kraken 不打折。
 ///
-/// `CrossExchangeStrategy` 的手续费 map 不区分 symbol，因此给每个币单独构造一个只监控
-/// 该币、只装这个币真实手续费的 `CrossExchangeStrategy` 实例，而不是像默认主流程那样
-/// 所有 symbol 共享一份手续费配置。不接入 `config.toml` 驱动的默认主循环。
+/// `--mode`(默认 `positive-only`)控制打印方式:
+/// - `positive-only`:接入现成的 `CrossExchangeStrategy` + `LogSink` 管线，只在扣费后
+///   价差 >= `--min-profit-bps`(默认 0，即扣费后为正)时打印。
+/// - `periodic`:不注册任何 `Strategy`/`Sink`，改为在独立的定时任务里，每隔
+///   `--periodic-interval-secs`(默认 5)读一次引擎的行情缓存快照，为每个监控币打印
+///   双向价差(不管正负)，并标注 `profitable` 是否达到 `--min-profit-bps` 阈值。
+///
+/// `positive-only` 模式下 `CrossExchangeStrategy` 的手续费 map 不区分 symbol，因此给
+/// 每个币单独构造一个只监控该币、只装这个币真实手续费的 `CrossExchangeStrategy` 实例，
+/// 而不是像默认主流程那样所有 symbol 共享一份手续费配置。不接入 `config.toml` 驱动的
+/// 默认主循环。
 async fn run_monitor_command(args: &[String]) -> anyhow::Result<()> {
     let mut testnet = false;
     let mut min_profit_bps = Decimal::ZERO;
+    let mut mode = MonitorMode::PositiveOnly;
+    let mut periodic_interval_secs: u64 = 5;
 
     let mut i = 0;
     while i < args.len() {
@@ -607,6 +628,23 @@ async fn run_monitor_command(args: &[String]) -> anyhow::Result<()> {
                 min_profit_bps = v.parse().context("--min-profit-bps must be a valid decimal number")?;
                 i += 2;
             }
+            "--mode" => {
+                let v = args.get(i + 1).context("--mode requires a value")?;
+                mode = match v.as_str() {
+                    "positive-only" => MonitorMode::PositiveOnly,
+                    "periodic" => MonitorMode::Periodic,
+                    other => anyhow::bail!(
+                        "invalid value '{other}' for --mode, expected 'positive-only' or 'periodic'"
+                    ),
+                };
+                i += 2;
+            }
+            "--periodic-interval-secs" => {
+                let v = args.get(i + 1).context("--periodic-interval-secs requires a value")?;
+                periodic_interval_secs =
+                    v.parse().context("--periodic-interval-secs must be a valid non-negative integer")?;
+                i += 2;
+            }
             other => anyhow::bail!("unknown argument '{other}' for 'monitor' subcommand"),
         }
     }
@@ -618,8 +656,9 @@ async fn run_monitor_command(args: &[String]) -> anyhow::Result<()> {
     let kraken_wallet = KrakenWalletProvider::from_env(Venue::new("kraken"), proxy.as_deref())?;
 
     let blacklist = ScanConfig::load_blacklist("config.toml");
+    let binance_fee_discount = VenueConfig::load_fee_discount("config.toml", "binance");
     info!(
-        "monitor: looking for symbols overlapping between binance (usdt perpetual) and kraken (usdt spot) testnet={testnet} blacklist={blacklist:?}"
+        "monitor: looking for symbols overlapping between binance (usdt perpetual) and kraken (usdt spot) testnet={testnet} blacklist={blacklist:?} binance_fee_discount={binance_fee_discount}"
     );
     let scan_result =
         scan::find_overlap(&binance_info, &kraken_info, &binance_wallet, &kraken_wallet, &blacklist).await?;
@@ -651,23 +690,23 @@ async fn run_monitor_command(args: &[String]) -> anyhow::Result<()> {
             .await;
 
     let mut symbols = Vec::new();
-    let mut strategies: Vec<Box<dyn Strategy>> = Vec::new();
+    let mut coin_fees: Vec<(String, Symbol, HashMap<Venue, FeeSchedule>)> = Vec::new();
     let mut monitored_summary = Vec::new();
     let mut skipped = Vec::new();
     for (coin, symbol, result) in fee_results {
         match result {
             Ok((binance_fee, kraken_fee)) => {
+                let binance_effective_bps = binance_fee.taker_bps * binance_fee_discount;
                 let fees: HashMap<Venue, FeeSchedule> = HashMap::from([
-                    (Venue::new("binance"), FeeSchedule::new(binance_fee.taker_bps)),
+                    (Venue::new("binance"), FeeSchedule::new(binance_effective_bps)),
                     (Venue::new("kraken"), FeeSchedule::new(kraken_fee.taker_bps)),
                 ]);
                 monitored_summary.push(format!(
-                    "{coin:<10}  binance_taker_bps={}  kraken_taker_bps={}",
+                    "{coin:<10}  binance_taker_bps={} x{binance_fee_discount}={binance_effective_bps}  kraken_taker_bps={}",
                     binance_fee.taker_bps, kraken_fee.taker_bps
                 ));
-                strategies.push(Box::new(CrossExchangeStrategy::new(vec![symbol.clone()], fees, min_profit_bps))
-                    as Box<dyn Strategy>);
-                symbols.push(symbol);
+                symbols.push(symbol.clone());
+                coin_fees.push((coin, symbol, fees));
             }
             Err(err) => {
                 let reason = format!("failed to fetch trading fee: {err:#}");
@@ -683,7 +722,7 @@ async fn run_monitor_command(args: &[String]) -> anyhow::Result<()> {
     }
 
     monitored_summary.sort();
-    println!("== Monitoring {} Symbols (min_profit_bps={min_profit_bps}) ==", symbols.len());
+    println!("== Monitoring {} Symbols (mode={mode:?} min_profit_bps={min_profit_bps}) ==", symbols.len());
     println!("{}", monitored_summary.join("\n"));
     if !skipped.is_empty() {
         skipped.sort();
@@ -706,9 +745,63 @@ async fn run_monitor_command(args: &[String]) -> anyhow::Result<()> {
     source_handles.push(kraken_source.spawn(tx.clone()));
     drop(tx);
 
-    let sinks: Vec<Box<dyn OpportunitySink>> = vec![Box::new(LogSink)];
-    info!("monitor: engine starting");
+    let (strategies, sinks): (Vec<Box<dyn Strategy>>, Vec<Box<dyn OpportunitySink>>) = match mode {
+        MonitorMode::PositiveOnly => {
+            let strategies = coin_fees
+                .iter()
+                .map(|(_, symbol, fees)| {
+                    Box::new(CrossExchangeStrategy::new(vec![symbol.clone()], fees.clone(), min_profit_bps))
+                        as Box<dyn Strategy>
+                })
+                .collect();
+            (strategies, vec![Box::new(LogSink) as Box<dyn OpportunitySink>])
+        }
+        MonitorMode::Periodic => (Vec::new(), Vec::new()),
+    };
+
     let engine = ArbitrageEngine::new(strategies, sinks);
+    if mode == MonitorMode::Periodic {
+        let shared_cache = engine.shared_cache();
+        let periodic_coins = coin_fees;
+        let binance_venue = Venue::new("binance");
+        let kraken_venue = Venue::new("kraken");
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(periodic_interval_secs));
+            loop {
+                ticker.tick().await;
+                for (coin, symbol, fees) in &periodic_coins {
+                    let Some(binance_quote) =
+                        shared_cache.get(&(binance_venue.clone(), symbol.clone())).map(|e| *e.value())
+                    else {
+                        continue;
+                    };
+                    let Some(kraken_quote) =
+                        shared_cache.get(&(kraken_venue.clone(), symbol.clone())).map(|e| *e.value())
+                    else {
+                        continue;
+                    };
+                    let binance_fee = fees.get(&binance_venue).copied().unwrap_or(FeeSchedule::new(0));
+                    let kraken_fee = fees.get(&kraken_venue).copied().unwrap_or(FeeSchedule::new(0));
+
+                    for (buy_label, buy_quote, buy_fee, sell_label, sell_quote, sell_fee) in [
+                        ("binance", binance_quote, binance_fee, "kraken", kraken_quote, kraken_fee),
+                        ("kraken", kraken_quote, kraken_fee, "binance", binance_quote, binance_fee),
+                    ] {
+                        let Some(profit_bps) = compute_profit_bps(buy_quote.ask, buy_fee, sell_quote.bid, sell_fee)
+                        else {
+                            continue;
+                        };
+                        let profitable = profit_bps >= min_profit_bps;
+                        log::info!(
+                            "[periodic] {coin:<10} buy={buy_label:<7} sell={sell_label:<7} profit_bps={profit_bps:>10} profitable={profitable}"
+                        );
+                    }
+                }
+            }
+        });
+    }
+
+    info!("monitor: engine starting");
     engine.run(rx).await;
 
     for handle in source_handles {
