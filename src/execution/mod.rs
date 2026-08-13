@@ -481,6 +481,8 @@ mod tests {
                 status: OrderStatus::Filled,
                 filled_qty: self.filled_qty,
                 avg_price: Some(Decimal::ONE),
+                fee: None,
+                fee_asset: None,
             })
         }
     }
@@ -514,6 +516,8 @@ mod tests {
                 status: OrderStatus::Filled,
                 filled_qty: quantity,
                 avg_price: Some(Decimal::ONE),
+                fee: None,
+                fee_asset: None,
             })
         }
     }
@@ -1008,6 +1012,8 @@ mod tests {
                 status: OrderStatus::Filled,
                 filled_qty: quantity,
                 avg_price: Some(Decimal::ONE),
+                fee: None,
+                fee_asset: None,
             })
         }
     }
@@ -1136,6 +1142,8 @@ mod tests {
                 status: OrderStatus::Filled,
                 filled_qty: quantity,
                 avg_price: Some(Decimal::ONE),
+                fee: None,
+                fee_asset: None,
             })
         }
     }

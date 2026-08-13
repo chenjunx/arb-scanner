@@ -55,6 +55,8 @@ pub trait OrderProvider: Send + Sync {
                 status: OrderStatus::New,
                 filled_qty: Decimal::ZERO,
                 avg_price: None,
+                fee: None,
+                fee_asset: None,
             });
         }
         self.place_market_order_raw(&req).await
@@ -98,6 +100,8 @@ mod tests {
                         status: OrderStatus::Filled,
                         filled_qty: quantity,
                         avg_price: Some(Decimal::ONE),
+                        fee: None,
+                        fee_asset: None,
                     })
                 }
                 OrderAmount::Quote(quote_amount) => {
@@ -110,6 +114,8 @@ mod tests {
                         status: OrderStatus::Filled,
                         filled_qty: quote_amount / Decimal::new(2, 0),
                         avg_price: Some(Decimal::new(2, 0)),
+                        fee: None,
+                        fee_asset: None,
                     })
                 }
             }

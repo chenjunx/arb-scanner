@@ -56,6 +56,10 @@ pub struct OrderResult {
     pub status: OrderStatus,
     pub filled_qty: Decimal,
     pub avg_price: Option<Decimal>,
+    /// 交易所真实返还的手续费，拿不到时为 None (如 Kraken REST AddOrder 本身
+    /// 不同步返回成交信息、Binance 合约缺私有流)，由 Portfolio 退化为估算。
+    pub fee: Option<Decimal>,
+    pub fee_asset: Option<String>,
 }
 
 /// 某个交易对的下单精度/最小下单量限制，用于下单前校验。

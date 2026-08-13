@@ -272,6 +272,10 @@ fn parse_order_response(text: &str) -> anyhow::Result<OrderResult> {
         status: map_status(&resp.status),
         filled_qty: resp.executed_qty,
         avg_price,
+        // 合约下单响应(RESULT)不带手续费信息，也没有对应的私有流可补，
+        // 由 Portfolio 按 FeeConfig 估算兜底。
+        fee: None,
+        fee_asset: None,
     })
 }
 
