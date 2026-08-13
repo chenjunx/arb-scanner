@@ -57,6 +57,21 @@ pub struct ScanResult {
     /// 两边都有挂牌、但在求交集过程中被跳过的候选币种(钱包信息查询失败/两边
     /// 都没有共同链等)，附带原因，按币名排序。
     pub skipped: Vec<SkippedCandidate>,
+    /// 两边都有挂牌、但命中黑名单被提前剔除的候选币种(未发起任何钱包/手续费
+    /// 查询)，按币名排序。
+    pub blacklisted: Vec<String>,
+}
+
+/// 按黑名单(大小写不敏感)把候选币种拆成"保留"和"被剔除"两组，剔除的那组只
+/// 保留币名(已排序)。放在任何钱包 API 调用之前调用，保证命中黑名单的币种
+/// 完全不产生网络请求。
+fn partition_blacklisted(candidates: Vec<Candidate>, blacklist: &[String]) -> (Vec<Candidate>, Vec<String>) {
+    let blacklist_set: HashSet<String> = blacklist.iter().map(|c| c.to_ascii_uppercase()).collect();
+    let (kept, removed): (Vec<Candidate>, Vec<Candidate>) =
+        candidates.into_iter().partition(|c| !blacklist_set.contains(&c.coin));
+    let mut blacklisted: Vec<String> = removed.into_iter().map(|c| c.coin).collect();
+    blacklisted.sort();
+    (kept, blacklisted)
 }
 
 /// 从币安现货/永续配对列表和 Kraken USDT 现货列表算出候选币种。用币安现货
@@ -113,18 +128,20 @@ pub async fn find_overlap(
     kraken_info: &dyn ExchangeInfoProvider,
     binance_wallet: &BinanceWalletProvider,
     kraken_wallet: &KrakenWalletProvider,
+    blacklist: &[String],
 ) -> anyhow::Result<ScanResult> {
     let (binance_pairs, kraken_spot) =
         tokio::try_join!(binance_info.spot_perpetual_pairs(), kraken_info.usdt_spot_symbols())?;
     let mut binance_hedgeable_spot: Vec<Symbol> = binance_pairs.iter().map(|p| p.spot_symbol.clone()).collect();
     binance_hedgeable_spot.sort_by(|a, b| a.to_string().cmp(&b.to_string()));
 
-    let candidates = build_candidates(&binance_pairs, &kraken_spot);
+    let (candidates, blacklisted) = partition_blacklisted(build_candidates(&binance_pairs, &kraken_spot), blacklist);
     log::info!(
-        "scan: binance_spot_perp_pairs={} kraken_spot_symbols={} candidates={}",
+        "scan: binance_spot_perp_pairs={} kraken_spot_symbols={} candidates={} blacklisted={}",
         binance_pairs.len(),
         kraken_spot.len(),
-        candidates.len()
+        candidates.len(),
+        blacklisted.len()
     );
     if candidates.is_empty() {
         return Ok(ScanResult {
@@ -132,6 +149,7 @@ pub async fn find_overlap(
             kraken_spot_symbols: kraken_spot,
             overlaps: Vec::new(),
             skipped: Vec::new(),
+            blacklisted,
         });
     }
 
@@ -200,6 +218,7 @@ pub async fn find_overlap(
         kraken_spot_symbols: kraken_spot,
         overlaps,
         skipped,
+        blacklisted,
     })
 }
 
@@ -279,6 +298,14 @@ pub fn format_skipped_list(skipped: &[SkippedCandidate]) -> String {
         .join("\n")
 }
 
+/// 把黑名单剔除的币名列表拼成一行，供 `scan`/`monitor` 打印。
+pub fn format_blacklisted_list(coins: &[String]) -> String {
+    if coins.is_empty() {
+        return "(none)".to_string();
+    }
+    coins.join(", ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -321,6 +348,32 @@ mod tests {
         let binance_pairs = vec![pair("SOL", "SOL")];
         let kraken_spot = vec![Symbol::new("ADA", "USDT")];
         assert!(build_candidates(&binance_pairs, &kraken_spot).is_empty());
+    }
+
+    fn candidate(coin: &str) -> Candidate {
+        Candidate {
+            coin: coin.to_string(),
+            binance_symbol: Symbol::new(coin, "USDT"),
+            kraken_symbol: Symbol::new(coin, "USDT"),
+        }
+    }
+
+    #[test]
+    fn partition_blacklisted_removes_matching_coins_case_insensitively() {
+        let candidates = vec![candidate("BTC"), candidate("ADA"), candidate("ETH")];
+        let blacklist = vec!["btc".to_string(), "ETH".to_string()];
+        let (kept, blacklisted) = partition_blacklisted(candidates, &blacklist);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].coin, "ADA");
+        assert_eq!(blacklisted, vec!["BTC".to_string(), "ETH".to_string()]);
+    }
+
+    #[test]
+    fn partition_blacklisted_keeps_everything_when_blacklist_empty() {
+        let candidates = vec![candidate("BTC"), candidate("ADA")];
+        let (kept, blacklisted) = partition_blacklisted(candidates, &[]);
+        assert_eq!(kept.len(), 2);
+        assert!(blacklisted.is_empty());
     }
 
     fn chain(network: &str) -> crate::wallet::types::ChainInfo {

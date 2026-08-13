@@ -7,7 +7,7 @@ use futures_util::stream;
 use log::info;
 use rust_decimal::Decimal;
 
-use arb_scanner::config::AppConfig;
+use arb_scanner::config::{AppConfig, ScanConfig};
 use arb_scanner::engine::ArbitrageEngine;
 use arb_scanner::exchange_info::ExchangeInfoProvider;
 use arb_scanner::exchange_info::binance::BinanceExchangeInfoProvider;
@@ -547,15 +547,19 @@ async fn run_scan_command(args: &[String]) -> anyhow::Result<()> {
     let binance_wallet = BinanceWalletProvider::from_env(Venue::new("binance"), testnet, proxy.as_deref())?;
     let kraken_wallet = KrakenWalletProvider::from_env(Venue::new("kraken"), proxy.as_deref())?;
 
-    info!("scan: looking for symbols overlapping between binance (usdt perpetual) and kraken (usdt spot) testnet={testnet}");
-
-    let result = scan::find_overlap(&binance_info, &kraken_info, &binance_wallet, &kraken_wallet).await?;
+    let blacklist = ScanConfig::load_blacklist("config.toml");
     info!(
-        "scan: binance_spot_symbols={} kraken_spot_symbols={} overlapping_symbols={} skipped={}",
+        "scan: looking for symbols overlapping between binance (usdt perpetual) and kraken (usdt spot) testnet={testnet} blacklist={blacklist:?}"
+    );
+
+    let result = scan::find_overlap(&binance_info, &kraken_info, &binance_wallet, &kraken_wallet, &blacklist).await?;
+    info!(
+        "scan: binance_spot_symbols={} kraken_spot_symbols={} overlapping_symbols={} skipped={} blacklisted={}",
         result.binance_spot_symbols.len(),
         result.kraken_spot_symbols.len(),
         result.overlaps.len(),
-        result.skipped.len()
+        result.skipped.len(),
+        result.blacklisted.len()
     );
 
     println!("== Binance USDT Spot Symbols With Perp Hedge ({}) ==", result.binance_spot_symbols.len());
@@ -569,6 +573,9 @@ async fn run_scan_command(args: &[String]) -> anyhow::Result<()> {
     println!();
     println!("== Skipped Candidates ({}) ==", result.skipped.len());
     println!("{}", scan::format_skipped_list(&result.skipped));
+    println!();
+    println!("== Blacklisted Coins (excluded, not queried) ({}) ==", result.blacklisted.len());
+    println!("{}", scan::format_blacklisted_list(&result.blacklisted));
     Ok(())
 }
 
@@ -610,8 +617,17 @@ async fn run_monitor_command(args: &[String]) -> anyhow::Result<()> {
     let binance_wallet = BinanceWalletProvider::from_env(Venue::new("binance"), testnet, proxy.as_deref())?;
     let kraken_wallet = KrakenWalletProvider::from_env(Venue::new("kraken"), proxy.as_deref())?;
 
-    info!("monitor: looking for symbols overlapping between binance (usdt perpetual) and kraken (usdt spot) testnet={testnet}");
-    let scan_result = scan::find_overlap(&binance_info, &kraken_info, &binance_wallet, &kraken_wallet).await?;
+    let blacklist = ScanConfig::load_blacklist("config.toml");
+    info!(
+        "monitor: looking for symbols overlapping between binance (usdt perpetual) and kraken (usdt spot) testnet={testnet} blacklist={blacklist:?}"
+    );
+    let scan_result =
+        scan::find_overlap(&binance_info, &kraken_info, &binance_wallet, &kraken_wallet, &blacklist).await?;
+    info!(
+        "monitor: blacklisted={} ({})",
+        scan_result.blacklisted.len(),
+        scan::format_blacklisted_list(&scan_result.blacklisted)
+    );
     if scan_result.overlaps.is_empty() {
         println!("no overlapping symbols found, nothing to monitor");
         return Ok(());

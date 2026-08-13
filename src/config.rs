@@ -83,3 +83,55 @@ impl AppConfig {
         toml::from_str(&text).context("failed to parse config toml")
     }
 }
+
+/// `scan`/`monitor` 子命令的黑名单配置。和 [`AppConfig`] 独立，不要求
+/// `venues`/`symbols` 等字段存在，因为这两个子命令本身不接入 `config.toml`
+/// 驱动的默认主流程，只是顺带复用同一个配置文件里的 `[scan]` 段。
+#[derive(Debug, Deserialize, Clone)]
+pub struct ScanConfig {
+    #[serde(default = "default_blacklist")]
+    pub blacklist: Vec<String>,
+}
+
+impl Default for ScanConfig {
+    fn default() -> Self {
+        ScanConfig { blacklist: default_blacklist() }
+    }
+}
+
+fn default_blacklist() -> Vec<String> {
+    ["BTC", "ETH", "SOL", "USDC", "XRP"].into_iter().map(String::from).collect()
+}
+
+/// 只关心 `[scan]` 段的宽松包装，用来在不要求 `venues`/`symbols` 等字段存在的
+/// 前提下从 `config.toml` 里单独读黑名单。字段之外的其余 TOML 内容
+/// (`venues`/`symbols`/...) 会被 serde 自动忽略。
+#[derive(Debug, Deserialize, Default)]
+struct ScanConfigFile {
+    #[serde(default)]
+    scan: ScanConfig,
+}
+
+impl ScanConfig {
+    /// 读取 `path` 里的 `[scan].blacklist`。文件不存在、无法解析、或没有
+    /// `[scan]` 段/`blacklist` 字段时，均回退到默认黑名单
+    /// (BTC/ETH/SOL/USDC/XRP)，不返回 `Err` —— 黑名单是 `scan`/`monitor` 的
+    /// 安全兜底，不应该因为配置文件缺失就完全不生效。
+    pub fn load_blacklist(path: impl AsRef<Path>) -> Vec<String> {
+        let path = path.as_ref();
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(_) => return default_blacklist(),
+        };
+        match toml::from_str::<ScanConfigFile>(&text) {
+            Ok(file) => file.scan.blacklist,
+            Err(err) => {
+                log::warn!(
+                    "config: failed to parse '{}' for [scan] blacklist, falling back to defaults: {err:#}",
+                    path.display()
+                );
+                default_blacklist()
+            }
+        }
+    }
+}

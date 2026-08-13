@@ -57,3 +57,8 @@ side = "buy"
 base = "ETH"
 quote = "USDT"
 side = "sell"
+
+# scan / monitor 子命令的黑名单：标准币名(以币安现货 base 为准)，命中的币不参与
+# 两边交易所的交集匹配 —— 不查钱包信息、不监控行情、不计算价差。
+[scan]
+blacklist = ["BTC", "ETH", "SOL", "USDC", "XRP"]
