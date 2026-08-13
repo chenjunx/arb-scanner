@@ -100,7 +100,7 @@ const KRAKEN_METHOD_TO_STANDARD: &[(&str, &str)] = &[
     ("Tezos", "XTZ"),
     ("The Open Network", "TON"),
     ("VeChain", "VET"),
-    ("XRP", "XRP"),
+    ("RIPPLE XRP", "XRP"),
     ("Zcash", "ZEC"),
 ];
 

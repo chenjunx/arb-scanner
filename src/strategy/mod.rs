@@ -4,6 +4,7 @@ pub mod triangular;
 use rust_decimal::Decimal;
 
 use crate::engine::MarketView;
+use crate::order_manager::types::OrderEvent;
 use crate::types::{MarketEvent, Symbol, Venue};
 
 /// 某个 venue 的手续费配置，用于在计算套利收益时扣除成本。
@@ -57,4 +58,10 @@ pub struct Opportunity {
 pub trait Strategy: Send + Sync {
     fn name(&self) -> &str;
     fn on_update(&self, view: &MarketView, changed: &MarketEvent) -> Vec<Opportunity>;
+
+    /// 订单事件回调：策略可实现此方法接收订单成交/拒绝等事件。
+    /// 默认空实现，策略可选择性实现以跟踪订单状态。
+    fn on_order_event(&self, _event: &OrderEvent) {
+        // 默认空实现
+    }
 }
