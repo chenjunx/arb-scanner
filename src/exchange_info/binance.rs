@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use anyhow::Context;
 use async_trait::async_trait;
 use base64::Engine;
@@ -10,7 +12,7 @@ use crate::market_data::now_ms;
 use crate::types::{Symbol, Venue};
 
 use super::ExchangeInfoProvider;
-use super::types::TradingFee;
+use super::types::{SpotPerpPair, TradingFee};
 
 const SPOT_MAINNET_HOST: &str = "https://api.binance.com";
 const SPOT_TESTNET_HOST: &str = "https://testnet.binance.vision";
@@ -95,6 +97,15 @@ impl BinanceExchangeInfoProvider {
 
     fn binance_symbol(symbol: &Symbol) -> String {
         format!("{}{}", symbol.base, symbol.quote).to_ascii_uppercase()
+    }
+
+    /// 维护币安现货/USDT 本位永续的可对冲映射：拉取两边当前可交易的 USDT
+    /// 交易对列表，按 base 配对(处理永续侧的"合约乘数"前缀，见
+    /// [`strip_contract_multiplier`])。这条换算规则是币安专属的，不放进
+    /// `ExchangeInfoProvider` trait。
+    pub async fn spot_perpetual_pairs(&self) -> anyhow::Result<Vec<SpotPerpPair>> {
+        let (spot, perp) = tokio::try_join!(self.usdt_spot_symbols(), self.usdt_perpetual_symbols())?;
+        Ok(build_spot_perp_pairs(&spot, &perp))
     }
 }
 
@@ -289,6 +300,57 @@ fn parse_usdt_perpetual_symbols(text: &str) -> anyhow::Result<Vec<Symbol>> {
         .collect())
 }
 
+/// 按 base 把现货和永续列表配成对：优先精确匹配(覆盖 "1INCH" 这类本身就以
+/// 数字开头的真实 ticker，两边 base 完全一致，不会走到剥离前缀那一步)；精确
+/// 匹配不上时，尝试剥离永续 base 开头的"合约乘数"前缀(见
+/// [`strip_contract_multiplier`])再匹配一次。两边都没有 base 交集的永续
+/// 品种直接跳过。
+fn build_spot_perp_pairs(spot: &[Symbol], perp: &[Symbol]) -> Vec<SpotPerpPair> {
+    let spot_by_base: HashMap<String, &Symbol> = spot.iter().map(|s| (s.base.to_ascii_uppercase(), s)).collect();
+
+    let mut pairs: Vec<SpotPerpPair> = perp
+        .iter()
+        .filter_map(|p| {
+            let perp_base = p.base.to_ascii_uppercase();
+            if let Some(spot_symbol) = spot_by_base.get(&perp_base) {
+                return Some(SpotPerpPair {
+                    spot_symbol: (*spot_symbol).clone(),
+                    perp_symbol: p.clone(),
+                    contract_multiplier: 1,
+                });
+            }
+            let (multiplier, core_base) = strip_contract_multiplier(&perp_base)?;
+            let spot_symbol = spot_by_base.get(&core_base)?;
+            Some(SpotPerpPair {
+                spot_symbol: (*spot_symbol).clone(),
+                perp_symbol: p.clone(),
+                contract_multiplier: multiplier,
+            })
+        })
+        .collect();
+
+    pairs.sort_by(|a, b| a.spot_symbol.to_string().cmp(&b.spot_symbol.to_string()));
+    pairs
+}
+
+/// 剥离币安永续合约 base 开头的"合约乘数"前缀，如 `"1000PEPE"` ->
+/// `(1000, "PEPE")`。只认形如 "1" 后面跟若干个 "0" 的前缀(10/100/1000/10000/
+/// 1000000...)，这是币安目前实际在用的换算倍数(`1000PEPEUSDT`/
+/// `1000SHIBUSDT`/`1000000BABYDOGEUSDT` 等)。要求前缀至少 2 位数字，避免把
+/// 单个数字开头的真实 ticker 误判成带乘数。
+fn strip_contract_multiplier(perp_base: &str) -> Option<(u64, String)> {
+    let digit_len = perp_base.chars().take_while(|c| c.is_ascii_digit()).count();
+    if digit_len < 2 {
+        return None;
+    }
+    let (digits, core) = perp_base.split_at(digit_len);
+    if core.is_empty() || !digits.starts_with('1') || !digits[1..].chars().all(|c| c == '0') {
+        return None;
+    }
+    let multiplier: u64 = digits.parse().ok()?;
+    Some((multiplier, core.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -397,5 +459,46 @@ mod tests {
         let text = r#"{"code":-2015,"msg":"Invalid API-key, IP, or permissions for action."}"#;
         let err = parse_usdt_spot_symbols(text).unwrap_err();
         assert!(err.to_string().contains("-2015"));
+    }
+
+    #[test]
+    fn strip_contract_multiplier_recognizes_power_of_ten_prefixes() {
+        assert_eq!(strip_contract_multiplier("1000PEPE"), Some((1000, "PEPE".to_string())));
+        assert_eq!(strip_contract_multiplier("1000000BABYDOGE"), Some((1_000_000, "BABYDOGE".to_string())));
+    }
+
+    #[test]
+    fn strip_contract_multiplier_rejects_non_power_of_ten_and_short_prefixes() {
+        assert_eq!(strip_contract_multiplier("1INCH"), None);
+        assert_eq!(strip_contract_multiplier("25BTC"), None);
+        assert_eq!(strip_contract_multiplier("1000"), None);
+    }
+
+    #[test]
+    fn build_spot_perp_pairs_matches_exact_base_with_multiplier_one() {
+        let spot = vec![Symbol::new("BTC", "USDT"), Symbol::new("1INCH", "USDT")];
+        let perp = vec![Symbol::new("BTC", "USDT"), Symbol::new("1INCH", "USDT")];
+        let pairs = build_spot_perp_pairs(&spot, &perp);
+        assert_eq!(pairs.len(), 2);
+        assert!(pairs.iter().all(|p| p.contract_multiplier == 1));
+        assert!(pairs.iter().any(|p| p.spot_symbol == Symbol::new("1INCH", "USDT")));
+    }
+
+    #[test]
+    fn build_spot_perp_pairs_matches_multiplier_prefixed_perp_symbols() {
+        let spot = vec![Symbol::new("PEPE", "USDT")];
+        let perp = vec![Symbol::new("1000PEPE", "USDT")];
+        let pairs = build_spot_perp_pairs(&spot, &perp);
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].spot_symbol, Symbol::new("PEPE", "USDT"));
+        assert_eq!(pairs[0].perp_symbol, Symbol::new("1000PEPE", "USDT"));
+        assert_eq!(pairs[0].contract_multiplier, 1000);
+    }
+
+    #[test]
+    fn build_spot_perp_pairs_skips_perp_symbols_without_matching_spot() {
+        let spot = vec![Symbol::new("BTC", "USDT")];
+        let perp = vec![Symbol::new("ETH", "USDT"), Symbol::new("1000RATS", "USDT")];
+        assert!(build_spot_perp_pairs(&spot, &perp).is_empty());
     }
 }
