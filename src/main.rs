@@ -2,13 +2,17 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use anyhow::Context;
+use futures_util::StreamExt;
+use futures_util::stream;
 use log::info;
 use rust_decimal::Decimal;
 
 use arb_scanner::config::AppConfig;
 use arb_scanner::engine::ArbitrageEngine;
+use arb_scanner::exchange_info::ExchangeInfoProvider;
 use arb_scanner::exchange_info::binance::BinanceExchangeInfoProvider;
 use arb_scanner::exchange_info::kraken::KrakenExchangeInfoProvider;
+use arb_scanner::exchange_info::types::TradingFee;
 use arb_scanner::execution;
 use arb_scanner::logging;
 use arb_scanner::market_data::MarketDataSource;
@@ -50,6 +54,9 @@ async fn main() -> anyhow::Result<()> {
     }
     if args.get(1).map(String::as_str) == Some("scan") {
         return run_scan_command(&args[2..]).await;
+    }
+    if args.get(1).map(String::as_str) == Some("monitor") {
+        return run_monitor_command(&args[2..]).await;
     }
 
     let config_path = args.get(1).cloned().unwrap_or_else(|| "config.toml".to_string());
@@ -562,6 +569,136 @@ async fn run_scan_command(args: &[String]) -> anyhow::Result<()> {
     println!();
     println!("== Skipped Candidates ({}) ==", result.skipped.len());
     println!("{}", scan::format_skipped_list(&result.skipped));
+    Ok(())
+}
+
+/// `spot_trading_fee` 查询并发上限，避免对候选币逐个查询手续费时触发限流，
+/// 和 `scan/mod.rs` 里 `KRAKEN_WALLET_CONCURRENCY` 同样的考虑。
+const FEE_QUERY_CONCURRENCY: usize = 4;
+
+/// `monitor` 子命令：复用 `scan::find_overlap` 筛出的币安/Kraken 交集币种，接入现成的
+/// 行情源 + `CrossExchangeStrategy` + `LogSink` 管线，持续监控两边现货价差。每个币的
+/// 手续费用 [`ExchangeInfoProvider::spot_trading_fee`] 查询两边真实账户 taker 费率(而
+/// 不是固定值)，扣费后价差只要 >= `--min-profit-bps`(默认 0，即扣费后为正)就打印。
+///
+/// `CrossExchangeStrategy` 的手续费 map 不区分 symbol，因此给每个币单独构造一个只监控
+/// 该币、只装这个币真实手续费的 `CrossExchangeStrategy` 实例，而不是像默认主流程那样
+/// 所有 symbol 共享一份手续费配置。不接入 `config.toml` 驱动的默认主循环。
+async fn run_monitor_command(args: &[String]) -> anyhow::Result<()> {
+    let mut testnet = false;
+    let mut min_profit_bps = Decimal::ZERO;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--testnet" => {
+                testnet = true;
+                i += 1;
+            }
+            "--min-profit-bps" => {
+                let v = args.get(i + 1).context("--min-profit-bps requires a value")?;
+                min_profit_bps = v.parse().context("--min-profit-bps must be a valid decimal number")?;
+                i += 2;
+            }
+            other => anyhow::bail!("unknown argument '{other}' for 'monitor' subcommand"),
+        }
+    }
+
+    let proxy = net::proxy_from_env();
+    let binance_info = BinanceExchangeInfoProvider::from_env(Venue::new("binance"), testnet, proxy.as_deref())?;
+    let kraken_info = KrakenExchangeInfoProvider::from_env(Venue::new("kraken"), proxy.as_deref())?;
+    let binance_wallet = BinanceWalletProvider::from_env(Venue::new("binance"), testnet, proxy.as_deref())?;
+    let kraken_wallet = KrakenWalletProvider::from_env(Venue::new("kraken"), proxy.as_deref())?;
+
+    info!("monitor: looking for symbols overlapping between binance (usdt perpetual) and kraken (usdt spot) testnet={testnet}");
+    let scan_result = scan::find_overlap(&binance_info, &kraken_info, &binance_wallet, &kraken_wallet).await?;
+    if scan_result.overlaps.is_empty() {
+        println!("no overlapping symbols found, nothing to monitor");
+        return Ok(());
+    }
+
+    info!("monitor: querying real taker fees for {} candidate symbols", scan_result.overlaps.len());
+    let binance_info_ref = &binance_info;
+    let kraken_info_ref = &kraken_info;
+    let fee_results: Vec<(String, Symbol, anyhow::Result<(TradingFee, TradingFee)>)> =
+        stream::iter(scan_result.overlaps)
+            .map(|overlap| async move {
+                let binance_symbol = Symbol::new(overlap.coin.clone(), "USDT");
+                let result = tokio::try_join!(
+                    binance_info_ref.spot_trading_fee(&binance_symbol),
+                    kraken_info_ref.spot_trading_fee(&overlap.kraken_spot_symbol)
+                );
+                (overlap.coin, binance_symbol, result)
+            })
+            .buffer_unordered(FEE_QUERY_CONCURRENCY)
+            .collect()
+            .await;
+
+    let mut symbols = Vec::new();
+    let mut strategies: Vec<Box<dyn Strategy>> = Vec::new();
+    let mut monitored_summary = Vec::new();
+    let mut skipped = Vec::new();
+    for (coin, symbol, result) in fee_results {
+        match result {
+            Ok((binance_fee, kraken_fee)) => {
+                let fees: HashMap<Venue, FeeSchedule> = HashMap::from([
+                    (Venue::new("binance"), FeeSchedule::new(binance_fee.taker_bps)),
+                    (Venue::new("kraken"), FeeSchedule::new(kraken_fee.taker_bps)),
+                ]);
+                monitored_summary.push(format!(
+                    "{coin:<10}  binance_taker_bps={}  kraken_taker_bps={}",
+                    binance_fee.taker_bps, kraken_fee.taker_bps
+                ));
+                strategies.push(Box::new(CrossExchangeStrategy::new(vec![symbol.clone()], fees, min_profit_bps))
+                    as Box<dyn Strategy>);
+                symbols.push(symbol);
+            }
+            Err(err) => {
+                let reason = format!("failed to fetch trading fee: {err:#}");
+                log::warn!("monitor: {coin} {reason}, skipping");
+                skipped.push(format!("{coin:<10}  {reason}"));
+            }
+        }
+    }
+
+    if symbols.is_empty() {
+        println!("failed to fetch trading fees for every candidate symbol, nothing to monitor");
+        return Ok(());
+    }
+
+    monitored_summary.sort();
+    println!("== Monitoring {} Symbols (min_profit_bps={min_profit_bps}) ==", symbols.len());
+    println!("{}", monitored_summary.join("\n"));
+    if !skipped.is_empty() {
+        skipped.sort();
+        println!();
+        println!("== Skipped ({}) ==", skipped.len());
+        println!("{}", skipped.join("\n"));
+    }
+
+    let (tx, rx) = tokio::sync::mpsc::channel(1024);
+    let mut source_handles = Vec::new();
+    let binance_source: Box<dyn MarketDataSource> = Box::new(BinanceSpotSource::new(
+        Venue::new("binance"),
+        symbols.clone(),
+        testnet,
+        proxy.clone(),
+    ));
+    source_handles.push(binance_source.spawn(tx.clone()));
+    let kraken_source: Box<dyn MarketDataSource> =
+        Box::new(KrakenSpotSource::new(Venue::new("kraken"), symbols.clone(), proxy.clone()));
+    source_handles.push(kraken_source.spawn(tx.clone()));
+    drop(tx);
+
+    let sinks: Vec<Box<dyn OpportunitySink>> = vec![Box::new(LogSink)];
+    info!("monitor: engine starting");
+    let engine = ArbitrageEngine::new(strategies, sinks);
+    engine.run(rx).await;
+
+    for handle in source_handles {
+        let _ = handle.await;
+    }
+
     Ok(())
 }
 
