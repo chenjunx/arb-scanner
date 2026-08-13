@@ -23,6 +23,21 @@ const HOST: &str = "https://api.kraken.com";
 const KRAKEN_METHOD_TO_STANDARD: &[(&str, &str)] = &[
     ("Bitcoin", "BTC"),
     ("Ethereum", "ETH"),
+    // Kraken 把 ETH 主网存款方式改名成了 "Ether (Hex)"（不再是 "Ethereum"）。
+    // 其余链名不用在这里逐条列 "ETH - <chain> (Unified)" 变体——
+    // `native_to_standard` 会先剥掉 Kraken 现在给很多资产套上的
+    // "<TICKER> - <链名>" 前缀和 "(Unified)" 后缀外壳，剩下的链名再来这张表
+    // 精确匹配，所以下面已有的 "Optimism"/"Base"/"Arbitrum One" 等条目会
+    // 自动覆盖 "ETH - Optimism (Unified)" 这类变体，不用重复添加。
+    ("Ether (Hex)", "ETH"),
+    ("zkSync Era", "ZKSYNCERA"),
+    ("Sonic", "SONIC"),
+    ("Berachain", "BERA"),
+    // 下面两条格式和 "<TICKER> - <链名>" 外壳不一样，剥壳逻辑套不上，只能
+    // 按完整原始字符串精确收录(均已用真实 `DepositMethods` 输出核对过)。
+    ("S (Sonic)", "SONIC"),
+    ("USDC (SPL)", "SOL"),
+    ("Stellar XLM", "XLM"),
     ("Tron", "TRX"),
     ("Solana", "SOL"),
     ("BNB Smart Chain (BEP20)", "BSC"),
@@ -89,13 +104,28 @@ const KRAKEN_METHOD_TO_STANDARD: &[(&str, &str)] = &[
     ("Zcash", "ZEC"),
 ];
 
-/// Kraken 原生方式名 -> 标准链名，大小写不敏感；查不到就原样透传。
+/// Kraken 近期把不少资产的存款方式名套上了 "<TICKER> - <链名>" 前缀和/或
+/// "(Unified)" 后缀的壳(如 "APE - Ethereum (Unified)"、"VET - VeChain")，链名
+/// 本体通常和老格式(如 "Ethereum"、"VeChain")一致。剥掉这层壳(剥不出规律的
+/// 原样返回)，交给调用方再去表里精确匹配——这是按已用真实数据核对过的固定
+/// 结构做剥离，不是子串/关键词模糊匹配，所以不会重蹈 "Bitcoin" 子串误中
+/// "Bitcoin Lightning" 的老问题。
+fn strip_unified_wrapper(native: &str) -> &str {
+    let without_ticker_prefix = native.split_once(" - ").map(|(_, chain)| chain).unwrap_or(native);
+    without_ticker_prefix.strip_suffix(" (Unified)").unwrap_or(without_ticker_prefix)
+}
+
+/// Kraken 原生方式名 -> 标准链名，大小写不敏感；先按完整原始字符串精确匹配，
+/// 找不到再剥掉 [`strip_unified_wrapper`] 描述的外壳重试一次；两轮都查不到就
+/// 原样透传。
 fn native_to_standard(native: &str) -> String {
-    KRAKEN_METHOD_TO_STANDARD
-        .iter()
-        .find(|(n, _)| n.eq_ignore_ascii_case(native))
-        .map(|(_, standard)| standard.to_string())
-        .unwrap_or_else(|| native.to_string())
+    let lookup = |name: &str| {
+        KRAKEN_METHOD_TO_STANDARD
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, standard)| standard.to_string())
+    };
+    lookup(native).or_else(|| lookup(strip_unified_wrapper(native))).unwrap_or_else(|| native.to_string())
 }
 
 /// 标准链名 -> Kraken 原生方式名，大小写不敏感；查不到就原样透传(视为调用方
@@ -384,8 +414,36 @@ mod tests {
     }
 
     #[test]
+    fn native_to_standard_maps_unified_eth_methods() {
+        assert_eq!(native_to_standard("Ether (Hex)"), "ETH");
+        assert_eq!(native_to_standard("ETH - Optimism (Unified)"), "OPTIMISM");
+        assert_eq!(native_to_standard("ETH - Base (Unified)"), "BASE");
+        assert_eq!(native_to_standard("ETH - Arbitrum One (Unified)"), "ARBITRUM");
+        assert_eq!(native_to_standard("zkSync Era"), "ZKSYNCERA");
+    }
+
+    #[test]
+    fn native_to_standard_strips_ticker_prefix_and_unified_suffix_for_other_assets() {
+        assert_eq!(native_to_standard("APE - Ethereum (Unified)"), "ETH");
+        assert_eq!(native_to_standard("LINK - Ethereum (Unified)"), "ETH");
+        assert_eq!(native_to_standard("PENGU - Solana"), "SOL");
+        assert_eq!(native_to_standard("VET - VeChain"), "VET");
+        assert_eq!(native_to_standard("BNB - BNB Chain"), "BSC");
+    }
+
+    #[test]
+    fn native_to_standard_maps_non_standard_wrapper_formats_exactly() {
+        assert_eq!(native_to_standard("S (Sonic)"), "SONIC");
+        assert_eq!(native_to_standard("USDC (SPL)"), "SOL");
+        assert_eq!(native_to_standard("USDC - Stellar XLM"), "XLM");
+    }
+
+    #[test]
     fn native_to_standard_passes_through_unknown_methods() {
         assert_eq!(native_to_standard("Bitcoin Lightning"), "Bitcoin Lightning");
+        // Polkadot relay chain 与 Asset Hub 的对应关系有歧义，不在表里，保持
+        // 原样透传，而不是猜一个标准链名。
+        assert_eq!(native_to_standard("Polkadot"), "Polkadot");
     }
 
     #[test]
