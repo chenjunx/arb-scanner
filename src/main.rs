@@ -544,10 +544,11 @@ async fn run_scan_command(args: &[String]) -> anyhow::Result<()> {
 
     let result = scan::find_overlap(&binance_info, &kraken_info, &binance_wallet, &kraken_wallet).await?;
     info!(
-        "scan: binance_spot_symbols={} kraken_spot_symbols={} overlapping_symbols={}",
+        "scan: binance_spot_symbols={} kraken_spot_symbols={} overlapping_symbols={} skipped={}",
         result.binance_spot_symbols.len(),
         result.kraken_spot_symbols.len(),
-        result.overlaps.len()
+        result.overlaps.len(),
+        result.skipped.len()
     );
 
     println!("== Binance USDT Spot Symbols With Perp Hedge ({}) ==", result.binance_spot_symbols.len());
@@ -558,6 +559,9 @@ async fn run_scan_command(args: &[String]) -> anyhow::Result<()> {
     println!();
     println!("== Overlapping Symbols ({}) ==", result.overlaps.len());
     println!("{}", scan::format_overlap_table(&result.overlaps));
+    println!();
+    println!("== Skipped Candidates ({}) ==", result.skipped.len());
+    println!("{}", scan::format_skipped_list(&result.skipped));
     Ok(())
 }
 

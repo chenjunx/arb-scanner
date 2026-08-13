@@ -35,6 +35,15 @@ pub struct SymbolOverlap {
     pub common_chains: Vec<String>,
 }
 
+/// 一个候选币种在求交集过程中被跳过的原因，供 `scan` 打印，避免只能靠
+/// `log::warn!`(默认写到 stderr，容易在终端截图/复制粘贴时被漏掉)才能定位
+/// "两边都有这个币种，为什么最终没出现在交集表里"这类问题。
+#[derive(Debug, Clone, PartialEq)]
+pub struct SkippedCandidate {
+    pub coin: String,
+    pub reason: String,
+}
+
 /// `find_overlap` 的完整结果：除了最终的交集表，也带上两边各自的完整币种列表
 /// (`scan` 打印时要展示"币安都有哪些能用永续对冲的现货币"/"Kraken 都有哪些
 /// USDT 现货"，避免调用方为了拿这两份列表再多发一次网络请求)。
@@ -45,6 +54,9 @@ pub struct ScanResult {
     pub binance_spot_symbols: Vec<Symbol>,
     pub kraken_spot_symbols: Vec<Symbol>,
     pub overlaps: Vec<SymbolOverlap>,
+    /// 两边都有挂牌、但在求交集过程中被跳过的候选币种(钱包信息查询失败/两边
+    /// 都没有共同链等)，附带原因，按币名排序。
+    pub skipped: Vec<SkippedCandidate>,
 }
 
 /// 从币安现货/永续配对列表和 Kraken USDT 现货列表算出候选币种。用币安现货
@@ -119,6 +131,7 @@ pub async fn find_overlap(
             binance_spot_symbols: binance_hedgeable_spot,
             kraken_spot_symbols: kraken_spot,
             overlaps: Vec::new(),
+            skipped: Vec::new(),
         });
     }
 
@@ -139,21 +152,37 @@ pub async fn find_overlap(
         .await;
 
     let mut overlaps = Vec::new();
+    let mut skipped = Vec::new();
     for (candidate, kraken_asset) in kraken_results {
         let Some(binance_asset) = binance_assets.get(&candidate.coin) else {
-            log::warn!("scan: {} not found in binance wallet asset list, skipping", candidate.coin);
+            let reason = "not found in binance wallet asset list".to_string();
+            log::warn!("scan: {} {reason}, skipping", candidate.coin);
+            skipped.push(SkippedCandidate { coin: candidate.coin, reason });
             continue;
         };
         let kraken_asset = match kraken_asset {
             Ok(info) => info,
             Err(err) => {
-                log::warn!("scan: failed to fetch kraken wallet asset info for {}: {err:#}", candidate.coin);
+                let reason = format!("failed to fetch kraken wallet asset info: {err:#}");
+                log::warn!("scan: {} {reason}", candidate.coin);
+                skipped.push(SkippedCandidate { coin: candidate.coin, reason });
                 continue;
             }
         };
 
         let chains = common_chains(binance_asset, &kraken_asset);
         if chains.is_empty() {
+            let binance_chains: Vec<String> =
+                binance_asset.networks.iter().map(|n| n.network.to_ascii_uppercase()).collect();
+            let kraken_chains: Vec<String> =
+                kraken_asset.networks.iter().map(|n| n.network.to_ascii_uppercase()).collect();
+            let reason = format!(
+                "no common chain, binance=[{}] kraken=[{}]",
+                binance_chains.join(","),
+                kraken_chains.join(",")
+            );
+            log::warn!("scan: {} {reason}", candidate.coin);
+            skipped.push(SkippedCandidate { coin: candidate.coin, reason });
             continue;
         }
         overlaps.push(SymbolOverlap {
@@ -165,10 +194,12 @@ pub async fn find_overlap(
     }
 
     overlaps.sort_by(|a, b| a.coin.cmp(&b.coin));
+    skipped.sort_by(|a, b| a.coin.cmp(&b.coin));
     Ok(ScanResult {
         binance_spot_symbols: binance_hedgeable_spot,
         kraken_spot_symbols: kraken_spot,
         overlaps,
+        skipped,
     })
 }
 
@@ -232,6 +263,20 @@ pub fn format_overlap_table(rows: &[SymbolOverlap]) -> String {
     }
     out.pop();
     out
+}
+
+/// 把跳过原因列表拼成一行一条的文本，供 `scan` 打印，解释"两边都挂牌但没
+/// 进最终交集表"的候选币种具体卡在哪一步。
+pub fn format_skipped_list(skipped: &[SkippedCandidate]) -> String {
+    if skipped.is_empty() {
+        return "(none)".to_string();
+    }
+    let coin_width = skipped.iter().map(|s| s.coin.len()).max().unwrap_or(4).max(4);
+    skipped
+        .iter()
+        .map(|s| format!("{:<coin_width$}  {}", s.coin, s.reason))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[cfg(test)]
@@ -339,6 +384,22 @@ mod tests {
         assert!(first_line.starts_with("BTC/USDT"));
         assert!(list.contains("ETH/USDT"));
         assert!(list.contains("SOL/USDT"));
+    }
+
+    #[test]
+    fn format_skipped_list_handles_empty_input() {
+        assert_eq!(format_skipped_list(&[]), "(none)");
+    }
+
+    #[test]
+    fn format_skipped_list_includes_coin_and_reason() {
+        let skipped = vec![SkippedCandidate {
+            coin: "ETH".to_string(),
+            reason: "no common chain, binance=[ETH] kraken=[]".to_string(),
+        }];
+        let list = format_skipped_list(&skipped);
+        assert!(list.contains("ETH"));
+        assert!(list.contains("no common chain"));
     }
 
     #[test]
