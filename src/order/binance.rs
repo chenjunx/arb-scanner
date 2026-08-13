@@ -65,6 +65,7 @@ impl BinanceOrderProvider {
         let signature = sign_ed25519(&self.key_pair, &query);
         let url = format!("{}{}?{}&signature={}", self.host, path, query, signature);
 
+        crate::ratelimit::throttle(self.host).await;
         let resp = self
             .http
             .request(method, &url)
@@ -80,6 +81,7 @@ impl BinanceOrderProvider {
     async fn public_request(&self, path: &str, params: Vec<(String, String)>) -> anyhow::Result<String> {
         let query = build_query_string(&params);
         let url = format!("{}{}?{}", self.host, path, query);
+        crate::ratelimit::throttle(self.host).await;
         let resp = self
             .http
             .get(&url)

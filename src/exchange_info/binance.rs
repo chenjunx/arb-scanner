@@ -68,6 +68,7 @@ impl BinanceExchangeInfoProvider {
         let signature = sign_ed25519(&self.key_pair, &query);
         let url = format!("{host}{path}?{query}&signature={signature}");
 
+        crate::ratelimit::throttle(host).await;
         let resp = self
             .http
             .get(&url)
@@ -86,6 +87,7 @@ impl BinanceExchangeInfoProvider {
         } else {
             format!("{host}{path}?{query}")
         };
+        crate::ratelimit::throttle(host).await;
         let resp = self
             .http
             .get(&url)

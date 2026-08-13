@@ -179,6 +179,7 @@ impl KrakenWalletProvider {
         let post_data = build_post_data(&nonce, &params);
         let signature = sign_kraken(&self.api_secret, path, &nonce, &post_data)?;
 
+        crate::ratelimit::throttle(HOST).await;
         let resp = self
             .http
             .post(format!("{HOST}{path}"))

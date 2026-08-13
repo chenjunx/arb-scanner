@@ -59,6 +59,7 @@ impl KrakenExchangeInfoProvider {
         let post_data = build_post_data(&nonce, &params);
         let signature = sign_kraken(&self.api_secret, path, &nonce, &post_data)?;
 
+        crate::ratelimit::throttle(SPOT_HOST).await;
         let resp = self
             .http
             .post(format!("{SPOT_HOST}{path}"))
@@ -84,6 +85,7 @@ impl KrakenExchangeInfoProvider {
         } else {
             format!("{SPOT_HOST}{path}?{query}")
         };
+        crate::ratelimit::throttle(SPOT_HOST).await;
         let resp = self
             .http
             .get(url)
@@ -96,6 +98,7 @@ impl KrakenExchangeInfoProvider {
     /// 不需要签名的 Futures 公开接口请求(futures host，和 spot host 不同域名)，
     /// 用于查询永续合约交易对列表。
     async fn public_futures_request(&self, path: &str) -> anyhow::Result<String> {
+        crate::ratelimit::throttle(FUTURES_HOST).await;
         let resp = self
             .http
             .get(format!("{FUTURES_HOST}{path}"))

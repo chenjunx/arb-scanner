@@ -63,6 +63,7 @@ impl BinanceWalletProvider {
         let signature = sign_ed25519(&self.key_pair, &query);
         let url = format!("{}{}?{}&signature={}", self.host, path, query, signature);
 
+        crate::ratelimit::throttle(self.host).await;
         let resp = self
             .http
             .request(method, &url)

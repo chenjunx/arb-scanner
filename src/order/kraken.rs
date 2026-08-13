@@ -57,6 +57,7 @@ impl KrakenOrderProvider {
         let post_data = build_post_data(&nonce, &params);
         let signature = sign_kraken(&self.api_secret, path, &nonce, &post_data)?;
 
+        crate::ratelimit::throttle(HOST).await;
         let resp = self
             .http
             .post(format!("{HOST}{path}"))
@@ -77,6 +78,7 @@ impl KrakenOrderProvider {
             .map(|(k, v)| format!("{k}={v}"))
             .collect::<Vec<_>>()
             .join("&");
+        crate::ratelimit::throttle(HOST).await;
         let resp = self
             .http
             .get(format!("{HOST}{path}?{query}"))
