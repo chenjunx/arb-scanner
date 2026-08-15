@@ -11,7 +11,6 @@ use rust_decimal::Decimal;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
@@ -334,9 +333,11 @@ impl OrderStreamSource for KrakenPrivateOrderStream {
         self.venue.clone()
     }
 
-    fn spawn(self: Box<Self>, tx: mpsc::Sender<ExchangeOrderUpdate>) -> JoinHandle<()> {
-        tokio::spawn(async move {
+    fn spawn(self: Box<Self>, tx: mpsc::Sender<ExchangeOrderUpdate>) -> crate::order_manager::stream::StreamHandle {
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let join = tokio::spawn(async move {
             let mut backoff = MIN_BACKOFF;
+            let mut ready_tx = Some(ready_tx);
 
             loop {
                 let token = match self.fetch_token().await {
@@ -366,6 +367,9 @@ impl OrderStreamSource for KrakenPrivateOrderStream {
                 };
                 debug!("kraken private order stream connected for venue={}", self.venue);
                 backoff = MIN_BACKOFF;
+                if let Some(ready_tx) = ready_tx.take() {
+                    let _ = ready_tx.send(());
+                }
 
                 while let Some(msg) = ws.next().await {
                     let msg = match msg {
@@ -390,7 +394,8 @@ impl OrderStreamSource for KrakenPrivateOrderStream {
                 tokio::time::sleep(backoff).await;
                 backoff = (backoff * 2).min(MAX_BACKOFF);
             }
-        })
+        });
+        crate::order_manager::stream::StreamHandle { join, ready: ready_rx }
     }
 }
 

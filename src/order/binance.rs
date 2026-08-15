@@ -11,7 +11,6 @@ use ring::signature::Ed25519KeyPair;
 use rust_decimal::Decimal;
 use serde::Deserialize;
 use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
@@ -404,9 +403,11 @@ impl OrderStreamSource for BinanceUserDataStream {
         self.venue.clone()
     }
 
-    fn spawn(self: Box<Self>, tx: mpsc::Sender<ExchangeOrderUpdate>) -> JoinHandle<()> {
-        tokio::spawn(async move {
+    fn spawn(self: Box<Self>, tx: mpsc::Sender<ExchangeOrderUpdate>) -> crate::order_manager::stream::StreamHandle {
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let join = tokio::spawn(async move {
             let mut backoff = MIN_BACKOFF;
+            let mut ready_tx = Some(ready_tx);
 
             loop {
                 let mut ws = match self.connect().await {
@@ -442,6 +443,9 @@ impl OrderStreamSource for BinanceUserDataStream {
                 }
                 debug!("binance user data stream connected and subscribed for venue={}", self.venue);
                 backoff = MIN_BACKOFF;
+                if let Some(ready_tx) = ready_tx.take() {
+                    let _ = ready_tx.send(());
+                }
 
                 loop {
                     let msg = match ws.next().await {
@@ -477,7 +481,8 @@ impl OrderStreamSource for BinanceUserDataStream {
                 tokio::time::sleep(backoff).await;
                 backoff = (backoff * 2).min(MAX_BACKOFF);
             }
-        })
+        });
+        crate::order_manager::stream::StreamHandle { join, ready: ready_rx }
     }
 }
 

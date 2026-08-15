@@ -411,9 +411,21 @@ async fn run_open_command(args: &[String]) -> anyhow::Result<()> {
         .context("failed to start binance spot user data stream")?;
     let futures_stream = BinanceFuturesUserDataStream::from_env(futures_venue.clone(), testnet, proxy.as_deref())
         .context("failed to start binance futures user data stream")?;
-    let spot_stream_handle = Box::new(spot_stream).spawn(update_tx.clone());
-    let futures_stream_handle = Box::new(futures_stream).spawn(update_tx.clone());
+    let spot_handle = Box::new(spot_stream).spawn(update_tx.clone());
+    let futures_handle = Box::new(futures_stream).spawn(update_tx.clone());
     drop(update_tx);
+
+    // 等两条私有流真正建连+鉴权/订阅完成，再开始下单——否则市价单可能在
+    // WS 就绪前就已成交，导致 executionReport 被永久错过（WS API 不重放）。
+    const STREAM_READY_TIMEOUT: Duration = Duration::from_secs(20);
+    tokio::time::timeout(STREAM_READY_TIMEOUT, spot_handle.ready)
+        .await
+        .context("等待现货私有 WS 就绪超时")?
+        .context("现货私有 WS 未能就绪就退出了(检查 API Key/网络)")?;
+    tokio::time::timeout(STREAM_READY_TIMEOUT, futures_handle.ready)
+        .await
+        .context("等待合约私有 WS 就绪超时")?
+        .context("合约私有 WS 未能就绪就退出了(检查 API Key/网络)")?;
 
     let forward_handle = {
         let order_manager = order_manager.clone();
@@ -443,8 +455,8 @@ async fn run_open_command(args: &[String]) -> anyhow::Result<()> {
     )
     .await;
 
-    spot_stream_handle.abort();
-    futures_stream_handle.abort();
+    spot_handle.join.abort();
+    futures_handle.join.abort();
     forward_handle.abort();
 
     let report = live_result?;

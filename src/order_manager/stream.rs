@@ -1,5 +1,5 @@
 use rust_decimal::Decimal;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::order::types::OrderStatus;
@@ -32,9 +32,18 @@ pub struct ExchangeOrderUpdate {
 ///
 /// 和 `market_data::MarketDataSource` 同构：接入新交易所只需新增一个实现该
 /// trait 的类型，在组装 `OrderManager` 的地方注册即可。
+/// `spawn` 返回的句柄：`join` 用于 abort/等待任务结束，`ready` 在流首次
+/// 连接+鉴权/订阅成功后 resolve 一次(断线重连不会重复发送)，供调用方在
+/// 下单前先等私有流真正就绪——避免市价单成交速度快于 WS 建连速度，导致
+/// 成交推送在订阅生效前就被交易所发出而永久错过。
+pub struct StreamHandle {
+    pub join: JoinHandle<()>,
+    pub ready: oneshot::Receiver<()>,
+}
+
 pub trait OrderStreamSource: Send + 'static {
     fn venue(&self) -> Venue;
 
     /// 消费 self 并在后台任务中运行，持续向 tx 推送订单更新。
-    fn spawn(self: Box<Self>, tx: mpsc::Sender<ExchangeOrderUpdate>) -> JoinHandle<()>;
+    fn spawn(self: Box<Self>, tx: mpsc::Sender<ExchangeOrderUpdate>) -> StreamHandle;
 }
