@@ -84,7 +84,7 @@ impl BinanceFuturesOrderProvider {
         params.push(("recvWindow".to_string(), RECV_WINDOW_MS.to_string()));
         let query = build_query_string(&params);
         let signature = sign_ed25519(&self.key_pair, &query);
-        let url = format!("{}{}?{}&signature={}", self.host, path, query, signature);
+        let url = format!("{}{}?{}&signature={}", self.host, path, query, percent_encode(&signature));
 
         crate::ratelimit::throttle(self.host).await;
         let resp = self
@@ -337,13 +337,29 @@ fn build_http_client(proxy: Option<&str>) -> anyhow::Result<reqwest::Client> {
     builder.build().context("failed to build binance futures http client")
 }
 
-/// 按插入顺序拼接 `k=v&k=v...`，签名必须覆盖和实际发送完全一致的 query string。
+/// 按插入顺序拼接 `k=v&k=v...`(value 做 percent-encode，签名必须覆盖和实际
+/// 发送完全一致的 query string——base64 编码的 `signature` 本身也要在拼进
+/// URL 时 percent-encode，否则其中的 `+` 会被币安网关当 query string 里的
+/// 空格解析，导致签名校验失败(`-1022`)，实测已复现)。
 fn build_query_string(params: &[(String, String)]) -> String {
     params
         .iter()
-        .map(|(k, v)| format!("{k}={v}"))
+        .map(|(k, v)| format!("{k}={}", percent_encode(v)))
         .collect::<Vec<_>>()
         .join("&")
+}
+
+/// 只保留 RFC 3986 unreserved 字符，其余一律 `%XX` 转义——用于 query string
+/// 里可能出现 `+`/`/`/`=` 等保留字符的字段(尤其是 base64 编码的签名)。
+fn percent_encode(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for byte in input.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(byte as char),
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
 }
 
 /// 解析 PKCS8 PEM 文本(过滤 BEGIN/END 行,拼接剩余 base64 并解码),交给
@@ -637,6 +653,12 @@ mod tests {
             ("side".to_string(), "BUY".to_string()),
         ];
         assert_eq!(build_query_string(&params), "symbol=BTCUSDT&side=BUY");
+    }
+
+    #[test]
+    fn build_query_string_percent_encodes_reserved_characters_in_values() {
+        let params = vec![("signature".to_string(), "a+b/c=d".to_string())];
+        assert_eq!(build_query_string(&params), "signature=a%2Bb%2Fc%3Dd");
     }
 
     #[test]

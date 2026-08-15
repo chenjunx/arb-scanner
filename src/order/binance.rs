@@ -82,7 +82,7 @@ impl BinanceOrderProvider {
         params.push(("recvWindow".to_string(), RECV_WINDOW_MS.to_string()));
         let query = build_query_string(&params);
         let signature = sign_ed25519(&self.key_pair, &query);
-        let url = format!("{}{}?{}&signature={}", self.host, path, query, signature);
+        let url = format!("{}{}?{}&signature={}", self.host, path, query, percent_encode(&signature));
 
         crate::ratelimit::throttle(self.host).await;
         let resp = self
@@ -154,11 +154,14 @@ fn build_http_client(proxy: Option<&str>) -> anyhow::Result<reqwest::Client> {
     builder.build().context("failed to build binance http client")
 }
 
-/// 按插入顺序拼接 `k=v&k=v...`，签名必须覆盖和实际发送完全一致的 query string。
+/// 按插入顺序拼接 `k=v&k=v...`(value 做 percent-encode，签名必须覆盖和实际
+/// 发送完全一致的 query string——base64 编码的 `signature` 本身也要在拼进
+/// URL 时percent-encode，否则其中的 `+` 会被币安网关当 query string 里的
+/// 空格解析，导致签名校验失败(`-1022`)，实测已复现)。
 fn build_query_string(params: &[(String, String)]) -> String {
     params
         .iter()
-        .map(|(k, v)| format!("{k}={v}"))
+        .map(|(k, v)| format!("{k}={}", percent_encode(v)))
         .collect::<Vec<_>>()
         .join("&")
 }
@@ -662,6 +665,12 @@ mod tests {
             ("side".to_string(), "BUY".to_string()),
         ];
         assert_eq!(build_query_string(&params), "symbol=BTCUSDT&side=BUY");
+    }
+
+    #[test]
+    fn build_query_string_percent_encodes_reserved_characters_in_values() {
+        let params = vec![("signature".to_string(), "a+b/c=d".to_string())];
+        assert_eq!(build_query_string(&params), "signature=a%2Bb%2Fc%3Dd");
     }
 
     #[test]
