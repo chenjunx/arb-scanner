@@ -20,7 +20,7 @@ use crate::order_manager::stream::{ExchangeOrderUpdate, OrderStreamSource};
 use crate::types::{Symbol, Venue};
 
 use super::OrderProvider;
-use super::types::{MarketInfo, MarketOrderRequest, OrderAmount, OrderResult, OrderSide, OrderStatus};
+use super::types::{MarketOrderRequest, OrderAmount, OrderResult, OrderSide, OrderStatus};
 
 const HOST: &str = "https://api.kraken.com";
 const WS_HOST: &str = "ws-auth.kraken.com";
@@ -68,23 +68,6 @@ impl KrakenOrderProvider {
         kraken_private_request(&self.http, &self.api_key, &self.api_secret, path, params).await
     }
 
-    /// 不需要签名的公开接口请求，用于查询交易对精度限制。
-    async fn public_request(&self, path: &str, params: Vec<(String, String)>) -> anyhow::Result<String> {
-        let query = params
-            .iter()
-            .map(|(k, v)| format!("{k}={v}"))
-            .collect::<Vec<_>>()
-            .join("&");
-        crate::ratelimit::throttle(HOST).await;
-        let resp = self
-            .http
-            .get(format!("{HOST}{path}?{query}"))
-            .send()
-            .await
-            .context("kraken public request failed")?;
-        resp.text().await.context("failed to read kraken public response body")
-    }
-
     fn kraken_pair(symbol: &Symbol) -> String {
         format!("{}{}", symbol.base, symbol.quote).to_ascii_uppercase()
     }
@@ -94,12 +77,6 @@ impl KrakenOrderProvider {
 impl OrderProvider for KrakenOrderProvider {
     fn venue(&self) -> Venue {
         self.venue.clone()
-    }
-
-    async fn market_info(&self, symbol: &Symbol) -> anyhow::Result<MarketInfo> {
-        let params = vec![("pair".to_string(), Self::kraken_pair(symbol))];
-        let text = self.public_request("/0/public/AssetPairs", params).await?;
-        parse_market_info(&text, symbol)
     }
 
     async fn place_market_order_raw(&self, req: &MarketOrderRequest) -> anyhow::Result<OrderResult> {
@@ -212,35 +189,6 @@ fn unwrap_result<T: DeserializeOwned>(text: &str) -> anyhow::Result<T> {
         .ok_or_else(|| anyhow::anyhow!("kraken response missing result"))?;
     serde_json::from_value(result.clone())
         .with_context(|| format!("failed to parse kraken result payload, raw result: {result}"))
-}
-
-#[derive(Debug, Deserialize)]
-struct AssetPairInfo {
-    #[serde(default)]
-    ordermin: Option<String>,
-    lot_decimals: u32,
-}
-
-/// `AssetPairs?pair=<X>` 只返回一个 pair，但返回的 key 是交易所内部代码
-/// (如 "XXBTZUSD")而不是请求里传的 altname，所以取 `result` 里唯一的那个值。
-fn parse_market_info(text: &str, symbol: &Symbol) -> anyhow::Result<MarketInfo> {
-    let pairs: HashMap<String, AssetPairInfo> = unwrap_result(text)?;
-    let info = pairs
-        .into_values()
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("kraken AssetPairs returned no pair for {symbol}"))?;
-
-    let qty_step = Decimal::new(1, info.lot_decimals);
-    let min_qty = info
-        .ordermin
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(Decimal::ZERO);
-
-    Ok(MarketInfo {
-        symbol: symbol.clone(),
-        qty_step,
-        min_qty,
-    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -547,46 +495,6 @@ mod tests {
     fn maps_side_to_kraken_string() {
         assert_eq!(map_side(OrderSide::Buy), "buy");
         assert_eq!(map_side(OrderSide::Sell), "sell");
-    }
-
-    #[test]
-    fn parses_market_info_from_asset_pairs() {
-        let text = r#"{
-            "error": [],
-            "result": {
-                "XXBTZUSD": {
-                    "altname": "XBTUSD",
-                    "wsname": "XBT/USD",
-                    "lot_decimals": 8,
-                    "ordermin": "0.0001"
-                }
-            }
-        }"#;
-        let symbol = Symbol::new("XBT", "USD");
-        let info = parse_market_info(text, &symbol).expect("should parse");
-        assert_eq!(info.qty_step, Decimal::new(1, 8));
-        assert_eq!(info.min_qty, "0.0001".parse().unwrap());
-    }
-
-    #[test]
-    fn parse_market_info_defaults_min_qty_when_missing() {
-        let text = r#"{
-            "error": [],
-            "result": {
-                "XETHZUSD": {"altname": "ETHUSD", "wsname": "ETH/USD", "lot_decimals": 6}
-            }
-        }"#;
-        let symbol = Symbol::new("ETH", "USD");
-        let info = parse_market_info(text, &symbol).expect("should parse");
-        assert_eq!(info.min_qty, Decimal::ZERO);
-    }
-
-    #[test]
-    fn parse_market_info_surfaces_error_response() {
-        let text = r#"{"error": ["EQuery:Unknown asset pair"], "result": null}"#;
-        let symbol = Symbol::new("XBT", "USD");
-        let err = parse_market_info(text, &symbol).unwrap_err();
-        assert!(err.to_string().contains("Unknown asset pair"));
     }
 
     #[test]

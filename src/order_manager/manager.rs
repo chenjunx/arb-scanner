@@ -364,7 +364,7 @@ fn current_timestamp_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::order::types::{MarketInfo, OrderAmount, OrderResult, OrderSide, OrderStatus};
+    use crate::order::types::{OrderAmount, OrderResult, OrderSide, OrderStatus};
     use crate::order::OrderProvider;
     use crate::order_manager::execution::ExchangeAdapter;
     use crate::order_manager::risk::RiskLimits;
@@ -386,14 +386,6 @@ mod tests {
     impl OrderProvider for FakeOrderProvider {
         fn venue(&self) -> Venue {
             self.venue.clone()
-        }
-
-        async fn market_info(&self, _symbol: &Symbol) -> anyhow::Result<MarketInfo> {
-            Ok(MarketInfo {
-                symbol: Symbol::new("BTC", "USDT"),
-                qty_step: Decimal::new(1, 3),
-                min_qty: Decimal::new(1, 3),
-            })
         }
 
         async fn place_market_order_raw(

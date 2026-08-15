@@ -12,7 +12,7 @@ use crate::market_data::now_ms;
 use crate::types::{Symbol, Venue};
 
 use super::ExchangeInfoProvider;
-use super::types::TradingFee;
+use super::types::{MarketPrecision, QtyPrecision, TradingFee};
 
 const SPOT_HOST: &str = "https://api.kraken.com";
 const FUTURES_HOST: &str = "https://futures.kraken.com";
@@ -160,6 +160,21 @@ impl ExchangeInfoProvider for KrakenExchangeInfoProvider {
         let text = self.public_futures_request("/derivatives/api/v3/instruments").await?;
         parse_usdt_perpetual_symbols(&text)
     }
+
+    /// 复用 [`Self::usdt_spot_symbols`] 已经在打的同一个 `AssetPairs` 端点。
+    /// Kraken 没有 MARKET_LOT_SIZE/LOT_SIZE 那种下单方式区分，`market`/`limit`
+    /// 两份精度填相同值。
+    async fn spot_market_precisions(&self) -> anyhow::Result<Vec<MarketPrecision>> {
+        let params = vec![("assetVersion".to_string(), "1".to_string())];
+        let text = self.public_request("/0/public/AssetPairs", params).await?;
+        parse_spot_market_precisions(&text)
+    }
+
+    /// Kraken 当前没有可下单的 USDT 永续，参照 [`Self::usdt_perpetual_symbols`]
+    /// 的既有约定返回空 Vec，不是 bug。
+    async fn perpetual_market_precisions(&self) -> anyhow::Result<Vec<MarketPrecision>> {
+        Ok(Vec::new())
+    }
 }
 
 fn build_http_client(proxy: Option<&str>) -> anyhow::Result<reqwest::Client> {
@@ -283,6 +298,12 @@ struct AssetPairEntry {
     quote: Option<String>,
     #[serde(default)]
     status: Option<String>,
+    #[serde(default)]
+    pair_decimals: Option<u32>,
+    #[serde(default)]
+    lot_decimals: Option<u32>,
+    #[serde(default)]
+    ordermin: Option<String>,
 }
 
 fn parse_usdt_spot_symbols(text: &str) -> anyhow::Result<Vec<Symbol>> {
@@ -303,6 +324,36 @@ fn parse_usdt_spot_symbols(text: &str) -> anyhow::Result<Vec<Symbol>> {
     symbols.sort_by(|a, b| a.to_string().cmp(&b.to_string()));
     symbols.dedup();
     Ok(symbols)
+}
+
+/// Kraken 没有市价/限价分开的精度规则，`market == limit`。`lot_decimals`/
+/// `pair_decimals` 缺失时代表这个 pair 没有可用的精度信息，跳过而不是拿一个
+/// 猜测值凑数。`ordermin` 缺失时按 0 处理，和 `order/kraken.rs::parse_market_info`
+/// 现有行为一致。
+fn parse_spot_market_precisions(text: &str) -> anyhow::Result<Vec<MarketPrecision>> {
+    let pairs: HashMap<String, AssetPairEntry> = unwrap_result(text)?;
+    Ok(pairs
+        .into_values()
+        .filter(|p| p.status.as_deref().is_none_or(|s| s == "online"))
+        .filter_map(|p| {
+            let base = p.base?;
+            let quote = p.quote?;
+            if !quote.eq_ignore_ascii_case("USDT") {
+                return None;
+            }
+            let lot_decimals = p.lot_decimals?;
+            let qty_step = Decimal::new(1, lot_decimals);
+            let min_qty = p.ordermin.and_then(|v| v.parse().ok()).unwrap_or(Decimal::ZERO);
+            let price_tick = p.pair_decimals.map(|d| Decimal::new(1, d)).unwrap_or(Decimal::ZERO);
+            let qty_precision = QtyPrecision { qty_step, min_qty };
+            Some(MarketPrecision {
+                symbol: Symbol::new(kraken_asset_to_standard(&base), "USDT"),
+                market: qty_precision,
+                limit: qty_precision,
+                price_tick,
+            })
+        })
+        .collect())
 }
 
 #[derive(Debug, Deserialize)]
@@ -445,6 +496,48 @@ mod tests {
         }"#;
         let symbols = parse_usdt_perpetual_symbols(text).expect("should parse");
         assert_eq!(symbols, vec![Symbol::new("XBT", "USDT")]);
+    }
+
+    #[test]
+    fn parse_spot_market_precisions_reads_lot_and_pair_decimals() {
+        let text = r#"{
+            "error": [],
+            "result": {
+                "BTC/USDT": {"base": "BTC", "quote": "USDT", "status": "online", "pair_decimals": 1, "lot_decimals": 8, "ordermin": "0.00005"}
+            }
+        }"#;
+        let precisions = parse_spot_market_precisions(text).expect("should parse");
+        assert_eq!(precisions.len(), 1);
+        let info = &precisions[0];
+        assert_eq!(info.symbol, Symbol::new("BTC", "USDT"));
+        assert_eq!(info.market, info.limit);
+        assert_eq!(info.market.qty_step, Decimal::new(1, 8));
+        assert_eq!(info.market.min_qty, "0.00005".parse().unwrap());
+        assert_eq!(info.price_tick, Decimal::new(1, 1));
+    }
+
+    #[test]
+    fn parse_spot_market_precisions_defaults_min_qty_to_zero_when_missing() {
+        let text = r#"{
+            "error": [],
+            "result": {
+                "BTC/USDT": {"base": "BTC", "quote": "USDT", "status": "online", "pair_decimals": 1, "lot_decimals": 8}
+            }
+        }"#;
+        let precisions = parse_spot_market_precisions(text).expect("should parse");
+        assert_eq!(precisions[0].market.min_qty, Decimal::ZERO);
+    }
+
+    #[test]
+    fn parse_spot_market_precisions_skips_pairs_missing_lot_decimals() {
+        let text = r#"{
+            "error": [],
+            "result": {
+                "BTC/USDT": {"base": "BTC", "quote": "USDT", "status": "online", "pair_decimals": 1}
+            }
+        }"#;
+        let precisions = parse_spot_market_precisions(text).expect("should parse");
+        assert!(precisions.is_empty());
     }
 
     #[test]

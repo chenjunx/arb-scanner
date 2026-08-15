@@ -1,11 +1,14 @@
 pub mod binance;
+pub mod cache;
 pub mod kraken;
 pub mod types;
 
 use async_trait::async_trait;
 
 use crate::types::{Symbol, Venue};
-use types::TradingFee;
+use types::{MarketPrecision, TradingFee};
+
+pub use cache::PrecisionCache;
 
 /// 交易所"基础信息"扩展点：查询账户实际交易手续费率、列出当前可交易的
 /// USDT 计价现货/USDT 本位永续合约交易对。和 `wallet::WalletProvider`、
@@ -29,4 +32,12 @@ pub trait ExchangeInfoProvider: Send + Sync {
 
     /// 列出该交易所全部 USDT 本位、当前可交易的永续合约交易对。
     async fn usdt_perpetual_symbols(&self) -> anyhow::Result<Vec<Symbol>>;
+
+    /// 一次性拉取全部现货 USDT 交易对的下单精度(市价/限价步进、最小下单量、
+    /// 价格 tick)，供 [`PrecisionCache`] 在启动时加载进内存。
+    async fn spot_market_precisions(&self) -> anyhow::Result<Vec<MarketPrecision>>;
+
+    /// 同上，USDT 本位永续合约。Kraken 当前没有可下单的 USDT 永续(参照
+    /// `usdt_perpetual_symbols` 的既有约定)，返回空 Vec，不是 bug。
+    async fn perpetual_market_precisions(&self) -> anyhow::Result<Vec<MarketPrecision>>;
 }

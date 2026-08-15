@@ -5,6 +5,8 @@ use anyhow::Context;
 use rust_decimal::Decimal;
 use tokio::sync::mpsc;
 
+use crate::exchange_info::types::PrecisionKind;
+use crate::exchange_info::PrecisionCache;
 use crate::order::types::{MarketOrderRequest, OrderAmount, OrderResult, OrderSide};
 use crate::order::OrderProvider;
 use crate::order_manager::types::{OrderEvent, OrderId, OrderRequest};
@@ -90,6 +92,7 @@ pub async fn open_hedged_position_live(
     kraken_wallet: &dyn WalletProvider,
     order_manager: &OrderManager,
     event_rx: &mut mpsc::Receiver<OrderEvent>,
+    futures_precision: &PrecisionCache,
     params: OpenPositionParams,
 ) -> anyhow::Result<OpenPositionReport> {
     let spot_request = OrderRequest {
@@ -128,15 +131,9 @@ pub async fn open_hedged_position_live(
         fee_asset: None,
     };
 
-    let futures_info = futures.market_info(&params.symbol).await?;
-    let futures_qty = floor_to_step(filled_qty, futures_info.qty_step);
-    if futures_qty < futures_info.min_qty {
-        anyhow::bail!(
-            "hedge quantity {futures_qty} below futures min_qty {} for {}",
-            futures_info.min_qty,
-            params.symbol
-        );
-    }
+    let futures_qty = futures_precision
+        .round_qty(&params.symbol, PrecisionKind::Market, filled_qty)
+        .context("failed to round futures hedge quantity to exchange precision")?;
     if futures_qty != filled_qty {
         log::warn!(
             "open_hedged_position_live: futures qty_step rounding, spot filled {filled_qty}, hedging {futures_qty}, residual {}",
@@ -521,16 +518,6 @@ pub async fn transfer_half_to_kraken(
     Ok((transfer_qty, withdraw))
 }
 
-/// 把 `qty` 向下取整到 `step` 的整数倍；`step<=0` 时原样返回，和
-/// `order::OrderProvider::place_market_order` 里 `qty_step>0` 才校验的边界
-/// 处理保持一致。
-fn floor_to_step(qty: Decimal, step: Decimal) -> Decimal {
-    if step <= Decimal::ZERO {
-        return qty;
-    }
-    (qty / step).trunc() * step
-}
-
 /// 自动匹配币安可提币网络和 Kraken 可充值网络：两边的 `AssetInfo.networks`
 /// 都已经是标准链名(以币安 `network` 代码为准，Kraken 一侧的原生名称翻译
 /// 见 `wallet::kraken`)，这里只需要按 `network` 字段精确求交集。必须恰好
@@ -584,7 +571,8 @@ mod tests {
 
     use dashmap::DashMap;
 
-    use crate::order::types::{MarketInfo, OrderStatus};
+    use crate::exchange_info::types::{MarketPrecision, QtyPrecision};
+    use crate::order::types::OrderStatus;
     use crate::order_manager::store::InMemoryOrderStore;
     use crate::order_manager::types::Order;
     use crate::order_manager::{ExchangeAdapter, ExchangeOrderUpdate, ExecutionEngine, RiskEngine, RiskLimits};
@@ -607,9 +595,6 @@ mod tests {
         fn venue(&self) -> Venue {
             Venue::new("fake-spot")
         }
-        async fn market_info(&self, _symbol: &Symbol) -> anyhow::Result<MarketInfo> {
-            unreachable!("spot leg never queries market_info")
-        }
         async fn place_market_order_raw(&self, req: &MarketOrderRequest) -> anyhow::Result<OrderResult> {
             let OrderAmount::Quote(_) = req.amount else {
                 unreachable!("spot leg only uses OrderAmount::Quote")
@@ -629,10 +614,9 @@ mod tests {
         }
     }
 
-    /// 合约测试替身：固定返回 `market_info`，并记录每次真实下单的数量，用于验证
-    /// `floor_to_step` 取整结果和"未被调用"两类断言。
+    /// 合约测试替身：记录每次真实下单的数量，用于验证 `PrecisionCache::round_qty`
+    /// 取整结果和"未被调用"两类断言。
     struct FakeFuturesProvider {
-        info: MarketInfo,
         fail: bool,
         raw_calls: Arc<Mutex<Vec<Decimal>>>,
     }
@@ -641,9 +625,6 @@ mod tests {
     impl OrderProvider for FakeFuturesProvider {
         fn venue(&self) -> Venue {
             Venue::new("fake-futures")
-        }
-        async fn market_info(&self, _symbol: &Symbol) -> anyhow::Result<MarketInfo> {
-            Ok(self.info.clone())
         }
         async fn place_market_order_raw(&self, req: &MarketOrderRequest) -> anyhow::Result<OrderResult> {
             let OrderAmount::Base(quantity) = req.amount else {
@@ -705,12 +686,17 @@ mod tests {
         Symbol::new("BTC", "USDT")
     }
 
-    fn futures_info(qty_step: &str, min_qty: &str) -> MarketInfo {
-        MarketInfo {
-            symbol: btc_usdt(),
+    fn futures_precision_cache(qty_step: &str, min_qty: &str) -> PrecisionCache {
+        let precision = QtyPrecision {
             qty_step: qty_step.parse().unwrap(),
             min_qty: min_qty.parse().unwrap(),
-        }
+        };
+        PrecisionCache::from_precisions(vec![MarketPrecision {
+            symbol: btc_usdt(),
+            market: precision,
+            limit: precision,
+            price_tick: Decimal::ZERO,
+        }])
     }
 
     fn binance_btc_chain() -> ChainInfo {
@@ -891,10 +877,10 @@ mod tests {
         });
         let futures_calls = Arc::new(Mutex::new(Vec::new()));
         let futures_arc: Arc<dyn OrderProvider> = Arc::new(FakeFuturesProvider {
-            info: futures_info("0.001", "0.001"),
             fail: false,
             raw_calls: futures_calls.clone(),
         });
+        let futures_precision = futures_precision_cache("0.001", "0.001");
         let binance_wallet = no_op_wallet("binance");
         let kraken_wallet = no_op_wallet("kraken");
 
@@ -912,6 +898,7 @@ mod tests {
             &kraken_wallet,
             order_manager.as_ref(),
             &mut event_rx,
+            &futures_precision,
             params(Decimal::new(100, 0), false),
         )
         .await
@@ -932,10 +919,10 @@ mod tests {
         });
         let futures_calls = Arc::new(Mutex::new(Vec::new()));
         let futures_arc: Arc<dyn OrderProvider> = Arc::new(FakeFuturesProvider {
-            info: futures_info("0.001", "0.001"),
             fail: false,
             raw_calls: futures_calls.clone(),
         });
+        let futures_precision = futures_precision_cache("0.001", "0.001");
         let binance_wallet = no_op_wallet("binance");
         let kraken_wallet = no_op_wallet("kraken");
 
@@ -950,6 +937,7 @@ mod tests {
             &kraken_wallet,
             order_manager.as_ref(),
             &mut event_rx,
+            &futures_precision,
             params(Decimal::new(100, 0), false),
         )
         .await
@@ -969,10 +957,10 @@ mod tests {
             quote_raw_calls: Arc::new(AtomicUsize::new(0)),
         });
         let futures_arc: Arc<dyn OrderProvider> = Arc::new(FakeFuturesProvider {
-            info: futures_info("0.001", "0.001"),
             fail: true,
             raw_calls: Arc::new(Mutex::new(Vec::new())),
         });
+        let futures_precision = futures_precision_cache("0.001", "0.001");
         let binance_wallet = no_op_wallet("binance");
         let kraken_wallet = no_op_wallet("kraken");
 
@@ -990,6 +978,7 @@ mod tests {
             &kraken_wallet,
             order_manager.as_ref(),
             &mut event_rx,
+            &futures_precision,
             params(Decimal::new(100, 0), false),
         )
         .await
@@ -1010,10 +999,10 @@ mod tests {
         });
         let futures_calls = Arc::new(Mutex::new(Vec::new()));
         let futures_arc: Arc<dyn OrderProvider> = Arc::new(FakeFuturesProvider {
-            info: futures_info("0.001", "0.001"),
             fail: false,
             raw_calls: futures_calls.clone(),
         });
+        let futures_precision = futures_precision_cache("0.001", "0.001");
         let binance_wallet = no_op_wallet("binance");
         let kraken_wallet = no_op_wallet("kraken");
 
@@ -1031,13 +1020,14 @@ mod tests {
             &kraken_wallet,
             order_manager.as_ref(),
             &mut event_rx,
+            &futures_precision,
             params(Decimal::new(100, 0), false),
         )
         .await
         .unwrap_err();
         driver.await.unwrap();
 
-        assert!(err.to_string().contains("below futures min_qty"));
+        assert!(format!("{err:#}").contains("below min_qty"));
         assert!(futures_calls.lock().unwrap().is_empty());
     }
 
@@ -1051,10 +1041,10 @@ mod tests {
         });
         let futures_calls = Arc::new(Mutex::new(Vec::new()));
         let futures_arc: Arc<dyn OrderProvider> = Arc::new(FakeFuturesProvider {
-            info: futures_info("0.01", "0.01"),
             fail: false,
             raw_calls: futures_calls.clone(),
         });
+        let futures_precision = futures_precision_cache("0.01", "0.01");
         let binance_wallet = FakeWalletProvider {
             name: "binance",
             networks: vec![binance_btc_chain()],
@@ -1093,6 +1083,7 @@ mod tests {
             &kraken_wallet,
             order_manager.as_ref(),
             &mut event_rx,
+            &futures_precision,
             p,
         )
         .await
@@ -1219,17 +1210,6 @@ mod tests {
         assert_eq!(withdraws[0].amount, Decimal::new(6172835, 7));
     }
 
-    #[test]
-    fn floor_to_step_rounds_down_to_multiple() {
-        assert_eq!(floor_to_step(Decimal::new(12345, 4), Decimal::new(1, 2)), Decimal::new(123, 2));
-    }
-
-    #[test]
-    fn floor_to_step_passes_through_when_step_non_positive() {
-        let qty = Decimal::new(12345, 4);
-        assert_eq!(floor_to_step(qty, Decimal::ZERO), qty);
-    }
-
     #[tokio::test]
     async fn resolve_transfer_network_unique_match() {
         let binance_wallet = FakeWalletProvider {
@@ -1300,12 +1280,11 @@ mod tests {
         assert!(err.to_string().contains("匹配到多个候选划转网络"));
     }
 
-    /// `rotate_inventory` 测试替身：固定返回 `market_info`，`fail=true` 时对
-    /// `place_market_order_raw` 报错，并记录每次真实下单（走过 dry_run 之外
-    /// 分支）的调用次数，用于验证并发下单时"一边失败不会让另一边被跳过"。
+    /// `rotate_inventory` 测试替身：`fail=true` 时对 `place_market_order_raw`
+    /// 报错，并记录每次真实下单（走过 dry_run 之外分支）的调用次数，用于验证
+    /// 并发下单时"一边失败不会让另一边被跳过"。
     struct FakeRotateProvider {
         name: &'static str,
-        info: MarketInfo,
         fail: bool,
         raw_calls: Arc<AtomicUsize>,
     }
@@ -1314,9 +1293,6 @@ mod tests {
     impl OrderProvider for FakeRotateProvider {
         fn venue(&self) -> Venue {
             Venue::new(self.name)
-        }
-        async fn market_info(&self, _symbol: &Symbol) -> anyhow::Result<MarketInfo> {
-            Ok(self.info.clone())
         }
         async fn place_market_order_raw(&self, req: &MarketOrderRequest) -> anyhow::Result<OrderResult> {
             let OrderAmount::Base(quantity) = req.amount else {
@@ -1337,19 +1313,10 @@ mod tests {
         }
     }
 
-    fn rotate_info() -> MarketInfo {
-        MarketInfo {
-            symbol: btc_usdt(),
-            qty_step: Decimal::new(1, 3),
-            min_qty: Decimal::new(1, 3),
-        }
-    }
-
     fn rotate_provider(name: &'static str, fail: bool) -> (FakeRotateProvider, Arc<AtomicUsize>) {
         let calls = Arc::new(AtomicUsize::new(0));
         let provider = FakeRotateProvider {
             name,
-            info: rotate_info(),
             fail,
             raw_calls: calls.clone(),
         };
@@ -1427,15 +1394,11 @@ mod tests {
         assert!(err.to_string().contains("simulated buy-venue failure"));
     }
 
-    /// `close_hedged_position` 测试替身：额外记录 `market_info_calls`，用于区分
-    /// "完全跳过的腿"(两个计数都是0)和"dry-run 试了一下但没真下单的腿"
-    /// (`market_info_calls>0` 但 `raw_calls==0`，因为 `place_market_order` 默认
-    /// 方法在 dry_run 短路之前会先查 `market_info` 做数量校验)。
+    /// `close_hedged_position` 测试替身：记录每条腿真实下单（走过 dry_run 之外
+    /// 分支）的调用参数，用于区分"完全跳过的腿"和"真正下了单的腿"。
     struct FakeCloseProvider {
         name: &'static str,
-        info: MarketInfo,
         fail: bool,
-        market_info_calls: Arc<AtomicUsize>,
         raw_calls: Arc<Mutex<Vec<(OrderSide, Decimal)>>>,
     }
 
@@ -1443,10 +1406,6 @@ mod tests {
     impl OrderProvider for FakeCloseProvider {
         fn venue(&self) -> Venue {
             Venue::new(self.name)
-        }
-        async fn market_info(&self, _symbol: &Symbol) -> anyhow::Result<MarketInfo> {
-            self.market_info_calls.fetch_add(1, Ordering::SeqCst);
-            Ok(self.info.clone())
         }
         async fn place_market_order_raw(&self, req: &MarketOrderRequest) -> anyhow::Result<OrderResult> {
             let OrderAmount::Base(quantity) = req.amount else {
@@ -1467,25 +1426,14 @@ mod tests {
         }
     }
 
-    fn close_info() -> MarketInfo {
-        MarketInfo {
-            symbol: btc_usdt(),
-            qty_step: Decimal::new(1, 3),
-            min_qty: Decimal::new(1, 3),
-        }
-    }
-
-    fn close_provider(name: &'static str, fail: bool) -> (FakeCloseProvider, Arc<AtomicUsize>, Arc<Mutex<Vec<(OrderSide, Decimal)>>>) {
-        let market_info_calls = Arc::new(AtomicUsize::new(0));
+    fn close_provider(name: &'static str, fail: bool) -> (FakeCloseProvider, Arc<Mutex<Vec<(OrderSide, Decimal)>>>) {
         let raw_calls = Arc::new(Mutex::new(Vec::new()));
         let provider = FakeCloseProvider {
             name,
-            info: close_info(),
             fail,
-            market_info_calls: market_info_calls.clone(),
             raw_calls: raw_calls.clone(),
         };
-        (provider, market_info_calls, raw_calls)
+        (provider, raw_calls)
     }
 
     fn close_params(
@@ -1506,9 +1454,9 @@ mod tests {
 
     #[tokio::test]
     async fn close_all_three_legs_dry_run_skips_raw_calls() {
-        let (binance_spot, _bs_info_calls, bs_raw) = close_provider("binance-spot", false);
-        let (kraken_spot, _ks_info_calls, ks_raw) = close_provider("kraken-spot", false);
-        let (futures, _f_info_calls, f_raw) = close_provider("futures", false);
+        let (binance_spot, bs_raw) = close_provider("binance-spot", false);
+        let (kraken_spot, ks_raw) = close_provider("kraken-spot", false);
+        let (futures, f_raw) = close_provider("futures", false);
 
         let report = close_hedged_position(
             Some(&binance_spot),
@@ -1529,9 +1477,9 @@ mod tests {
 
     #[tokio::test]
     async fn close_happy_path_fills_all_three_legs() {
-        let (binance_spot, _, bs_raw) = close_provider("binance-spot", false);
-        let (kraken_spot, _, ks_raw) = close_provider("kraken-spot", false);
-        let (futures, _, f_raw) = close_provider("futures", false);
+        let (binance_spot, bs_raw) = close_provider("binance-spot", false);
+        let (kraken_spot, ks_raw) = close_provider("kraken-spot", false);
+        let (futures, f_raw) = close_provider("futures", false);
 
         let report = close_hedged_position(
             Some(&binance_spot),
@@ -1552,9 +1500,9 @@ mod tests {
 
     #[tokio::test]
     async fn close_skips_leg_with_qty_none() {
-        let (binance_spot, bs_info_calls, bs_raw) = close_provider("binance-spot", false);
-        let (kraken_spot, ks_info_calls, ks_raw) = close_provider("kraken-spot", false);
-        let (futures, _f_info_calls, f_raw) = close_provider("futures", false);
+        let (binance_spot, bs_raw) = close_provider("binance-spot", false);
+        let (kraken_spot, ks_raw) = close_provider("kraken-spot", false);
+        let (futures, f_raw) = close_provider("futures", false);
 
         let report = close_hedged_position(
             Some(&binance_spot),
@@ -1568,8 +1516,6 @@ mod tests {
         assert!(report.binance_spot_order.is_none());
         assert!(report.kraken_spot_order.is_none());
         assert!(report.futures_order.is_some());
-        assert_eq!(bs_info_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(ks_info_calls.load(Ordering::SeqCst), 0);
         assert!(bs_raw.lock().unwrap().is_empty());
         assert!(ks_raw.lock().unwrap().is_empty());
         assert_eq!(f_raw.lock().unwrap().len(), 1);
@@ -1577,9 +1523,9 @@ mod tests {
 
     #[tokio::test]
     async fn close_binance_spot_failure_still_places_other_two_legs() {
-        let (binance_spot, _, _) = close_provider("binance-spot", true);
-        let (kraken_spot, _, ks_raw) = close_provider("kraken-spot", false);
-        let (futures, _, f_raw) = close_provider("futures", false);
+        let (binance_spot, _) = close_provider("binance-spot", true);
+        let (kraken_spot, ks_raw) = close_provider("kraken-spot", false);
+        let (futures, f_raw) = close_provider("futures", false);
 
         let err = close_hedged_position(
             Some(&binance_spot),
@@ -1598,9 +1544,9 @@ mod tests {
 
     #[tokio::test]
     async fn close_kraken_spot_failure_still_places_other_two_legs() {
-        let (binance_spot, _, bs_raw) = close_provider("binance-spot", false);
-        let (kraken_spot, _, _) = close_provider("kraken-spot", true);
-        let (futures, _, f_raw) = close_provider("futures", false);
+        let (binance_spot, bs_raw) = close_provider("binance-spot", false);
+        let (kraken_spot, _) = close_provider("kraken-spot", true);
+        let (futures, f_raw) = close_provider("futures", false);
 
         let err = close_hedged_position(
             Some(&binance_spot),
@@ -1619,9 +1565,9 @@ mod tests {
 
     #[tokio::test]
     async fn close_futures_failure_still_places_other_two_legs() {
-        let (binance_spot, _, bs_raw) = close_provider("binance-spot", false);
-        let (kraken_spot, _, ks_raw) = close_provider("kraken-spot", false);
-        let (futures, _, _) = close_provider("futures", true);
+        let (binance_spot, bs_raw) = close_provider("binance-spot", false);
+        let (kraken_spot, ks_raw) = close_provider("kraken-spot", false);
+        let (futures, _) = close_provider("futures", true);
 
         let err = close_hedged_position(
             Some(&binance_spot),
@@ -1640,9 +1586,9 @@ mod tests {
 
     #[tokio::test]
     async fn close_all_three_legs_fail_combined_error_message() {
-        let (binance_spot, _, _) = close_provider("binance-spot", true);
-        let (kraken_spot, _, _) = close_provider("kraken-spot", true);
-        let (futures, _, _) = close_provider("futures", true);
+        let (binance_spot, _) = close_provider("binance-spot", true);
+        let (kraken_spot, _) = close_provider("kraken-spot", true);
+        let (futures, _) = close_provider("futures", true);
 
         let err = close_hedged_position(
             Some(&binance_spot),
@@ -1660,7 +1606,7 @@ mod tests {
 
     #[tokio::test]
     async fn close_validation_error_when_qty_is_non_positive() {
-        let (binance_spot, bs_info_calls, bs_raw) = close_provider("binance-spot", false);
+        let (binance_spot, bs_raw) = close_provider("binance-spot", false);
 
         let err = close_hedged_position(
             Some(&binance_spot),
@@ -1672,7 +1618,6 @@ mod tests {
         .unwrap_err();
 
         assert!(err.to_string().contains("binance_spot qty must be positive"));
-        assert_eq!(bs_info_calls.load(Ordering::SeqCst), 0);
         assert!(bs_raw.lock().unwrap().is_empty());
     }
 

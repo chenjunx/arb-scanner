@@ -37,8 +37,9 @@ pub struct MarketOrderRequest {
     /// 幂等去重用的客户端订单号；不同交易所是否必填/长度限制不同，
     /// 具体由各交易所实现自行处理。
     pub client_order_id: Option<String>,
-    /// true 时只做下单前校验(数量精度/最小下单量，`Quote` 只校验金额为正)，
-    /// 不真正提交订单。
+    /// true 时只做下单前校验(数量为正；数量精度/最小下单量由调用方通过
+    /// `exchange_info::PrecisionCache` 提前转换好，这里不重复校验)，不真正
+    /// 提交订单。
     pub dry_run: bool,
 }
 
@@ -61,13 +62,4 @@ pub struct OrderResult {
     /// 不同步返回成交信息、Binance 合约缺私有流)，由 Portfolio 退化为估算。
     pub fee: Option<Decimal>,
     pub fee_asset: Option<String>,
-}
-
-/// 某个交易对的下单精度/最小下单量限制，用于下单前校验。
-#[derive(Debug, Clone, PartialEq)]
-pub struct MarketInfo {
-    pub symbol: Symbol,
-    /// 数量步进，下单数量必须是它的整数倍(如 0.001)。
-    pub qty_step: Decimal,
-    pub min_qty: Decimal,
 }

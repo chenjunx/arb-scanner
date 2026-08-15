@@ -12,7 +12,7 @@ use crate::market_data::now_ms;
 use crate::types::{Symbol, Venue};
 
 use super::ExchangeInfoProvider;
-use super::types::{SpotPerpPair, TradingFee};
+use super::types::{MarketPrecision, QtyPrecision, SpotPerpPair, TradingFee};
 
 const SPOT_MAINNET_HOST: &str = "https://api.binance.com";
 const SPOT_TESTNET_HOST: &str = "https://testnet.binance.vision";
@@ -142,6 +142,18 @@ impl ExchangeInfoProvider for BinanceExchangeInfoProvider {
             .await?;
         parse_usdt_perpetual_symbols(&text)
     }
+
+    async fn spot_market_precisions(&self) -> anyhow::Result<Vec<MarketPrecision>> {
+        let text = self.public_request(self.spot_host, "/api/v3/exchangeInfo", Vec::new()).await?;
+        parse_spot_market_precisions(&text)
+    }
+
+    async fn perpetual_market_precisions(&self) -> anyhow::Result<Vec<MarketPrecision>> {
+        let text = self
+            .public_request(self.futures_host, "/fapi/v1/exchangeInfo", Vec::new())
+            .await?;
+        parse_perpetual_market_precisions(&text)
+    }
 }
 
 fn build_http_client(proxy: Option<&str>) -> anyhow::Result<reqwest::Client> {
@@ -256,6 +268,8 @@ struct SpotSymbolInfo {
     base_asset: String,
     #[serde(rename = "quoteAsset")]
     quote_asset: String,
+    #[serde(default)]
+    filters: Vec<serde_json::Value>,
 }
 
 fn parse_usdt_spot_symbols(text: &str) -> anyhow::Result<Vec<Symbol>> {
@@ -286,6 +300,8 @@ struct FuturesSymbolInfo {
     base_asset: String,
     #[serde(rename = "quoteAsset")]
     quote_asset: String,
+    #[serde(default)]
+    filters: Vec<serde_json::Value>,
 }
 
 fn parse_usdt_perpetual_symbols(text: &str) -> anyhow::Result<Vec<Symbol>> {
@@ -299,6 +315,63 @@ fn parse_usdt_perpetual_symbols(text: &str) -> anyhow::Result<Vec<Symbol>> {
         .into_iter()
         .filter(|s| s.status == "TRADING" && s.contract_type == "PERPETUAL" && s.quote_asset.eq_ignore_ascii_case("USDT"))
         .map(|s| Symbol::new(s.base_asset, s.quote_asset))
+        .collect())
+}
+
+/// 从币安 `filters` 数组里按 `filterType` 取 `stepSize`/`minQty`。
+fn extract_qty_precision(filters: &[serde_json::Value], filter_type: &str) -> Option<QtyPrecision> {
+    let filter = filters.iter().find(|f| f.get("filterType").and_then(|v| v.as_str()) == Some(filter_type))?;
+    let qty_step: Decimal = filter.get("stepSize")?.as_str()?.parse().ok()?;
+    let min_qty: Decimal = filter.get("minQty")?.as_str()?.parse().ok()?;
+    Some(QtyPrecision { qty_step, min_qty })
+}
+
+/// 从币安 `filters` 数组里取 `PRICE_FILTER.tickSize`。
+fn extract_price_tick(filters: &[serde_json::Value]) -> Option<Decimal> {
+    let filter = filters.iter().find(|f| f.get("filterType").and_then(|v| v.as_str()) == Some("PRICE_FILTER"))?;
+    filter.get("tickSize")?.as_str()?.parse().ok()
+}
+
+/// 币安市价单按 `MARKET_LOT_SIZE` 校验精度、限价单按 `LOT_SIZE`，两者可能不同
+/// (`MARKET_LOT_SIZE` 的 stepSize 通常更粗)。`MARKET_LOT_SIZE` 该 symbol 缺失时
+/// 整体退回 `LOT_SIZE`，不混用两个 filter 的字段。
+fn build_market_precision(symbol: Symbol, filters: &[serde_json::Value]) -> Option<MarketPrecision> {
+    let limit = extract_qty_precision(filters, "LOT_SIZE")?;
+    let market = extract_qty_precision(filters, "MARKET_LOT_SIZE").unwrap_or(limit);
+    let price_tick = extract_price_tick(filters).unwrap_or(Decimal::ZERO);
+    Some(MarketPrecision {
+        symbol,
+        market,
+        limit,
+        price_tick,
+    })
+}
+
+fn parse_spot_market_precisions(text: &str) -> anyhow::Result<Vec<MarketPrecision>> {
+    if let Ok(err) = serde_json::from_str::<ErrorResponse>(text) {
+        anyhow::bail!("binance error {}: {}", err.code, err.msg);
+    }
+    let resp: SpotExchangeInfoResponse =
+        serde_json::from_str(text).context("failed to parse binance spot exchangeInfo response")?;
+    Ok(resp
+        .symbols
+        .into_iter()
+        .filter(|s| s.status == "TRADING" && s.quote_asset.eq_ignore_ascii_case("USDT"))
+        .filter_map(|s| build_market_precision(Symbol::new(s.base_asset, s.quote_asset), &s.filters))
+        .collect())
+}
+
+fn parse_perpetual_market_precisions(text: &str) -> anyhow::Result<Vec<MarketPrecision>> {
+    if let Ok(err) = serde_json::from_str::<ErrorResponse>(text) {
+        anyhow::bail!("binance futures error {}: {}", err.code, err.msg);
+    }
+    let resp: FuturesExchangeInfoResponse =
+        serde_json::from_str(text).context("failed to parse binance futures exchangeInfo response")?;
+    Ok(resp
+        .symbols
+        .into_iter()
+        .filter(|s| s.status == "TRADING" && s.contract_type == "PERPETUAL" && s.quote_asset.eq_ignore_ascii_case("USDT"))
+        .filter_map(|s| build_market_precision(Symbol::new(s.base_asset, s.quote_asset), &s.filters))
         .collect())
 }
 
@@ -460,6 +533,100 @@ mod tests {
     fn parse_usdt_spot_symbols_surfaces_error_response() {
         let text = r#"{"code":-2015,"msg":"Invalid API-key, IP, or permissions for action."}"#;
         let err = parse_usdt_spot_symbols(text).unwrap_err();
+        assert!(err.to_string().contains("-2015"));
+    }
+
+    #[test]
+    fn parse_spot_market_precisions_prefers_market_lot_size_over_lot_size() {
+        // 市价单精度按 MARKET_LOT_SIZE 校验，即便 stepSize 比 LOT_SIZE 粗，
+        // 也必须优先取它——否则会复现 -1111 Precision is over the maximum
+        // defined for this asset。
+        let text = r#"{
+            "symbols": [
+                {
+                    "symbol": "APEUSDT",
+                    "status": "TRADING",
+                    "baseAsset": "APE",
+                    "quoteAsset": "USDT",
+                    "filters": [
+                        {"filterType": "PRICE_FILTER", "tickSize": "0.0001"},
+                        {"filterType": "LOT_SIZE", "minQty": "1", "maxQty": "1000000", "stepSize": "1"},
+                        {"filterType": "MARKET_LOT_SIZE", "minQty": "10", "maxQty": "500000", "stepSize": "10"}
+                    ]
+                }
+            ]
+        }"#;
+        let precisions = parse_spot_market_precisions(text).expect("should parse");
+        assert_eq!(precisions.len(), 1);
+        let info = &precisions[0];
+        assert_eq!(info.market.qty_step, "10".parse().unwrap());
+        assert_eq!(info.market.min_qty, "10".parse().unwrap());
+        assert_eq!(info.limit.qty_step, "1".parse().unwrap());
+        assert_eq!(info.limit.min_qty, "1".parse().unwrap());
+        assert_eq!(info.price_tick, "0.0001".parse().unwrap());
+    }
+
+    #[test]
+    fn parse_spot_market_precisions_falls_back_to_lot_size_when_market_lot_size_missing() {
+        let text = r#"{
+            "symbols": [
+                {
+                    "symbol": "BTCUSDT",
+                    "status": "TRADING",
+                    "baseAsset": "BTC",
+                    "quoteAsset": "USDT",
+                    "filters": [
+                        {"filterType": "LOT_SIZE", "minQty": "0.001", "maxQty": "1000", "stepSize": "0.001"}
+                    ]
+                }
+            ]
+        }"#;
+        let precisions = parse_spot_market_precisions(text).expect("should parse");
+        assert_eq!(precisions.len(), 1);
+        assert_eq!(precisions[0].market, precisions[0].limit);
+        assert_eq!(precisions[0].market.qty_step, "0.001".parse().unwrap());
+    }
+
+    #[test]
+    fn parse_spot_market_precisions_filters_by_status_and_quote() {
+        let text = r#"{
+            "symbols": [
+                {"symbol":"BTCUSDT","status":"TRADING","baseAsset":"BTC","quoteAsset":"USDT","filters":[{"filterType":"LOT_SIZE","minQty":"0.001","maxQty":"1000","stepSize":"0.001"}]},
+                {"symbol":"ETHBTC","status":"TRADING","baseAsset":"ETH","quoteAsset":"BTC","filters":[{"filterType":"LOT_SIZE","minQty":"0.001","maxQty":"1000","stepSize":"0.001"}]},
+                {"symbol":"OLDUSDT","status":"BREAK","baseAsset":"OLD","quoteAsset":"USDT","filters":[{"filterType":"LOT_SIZE","minQty":"0.001","maxQty":"1000","stepSize":"0.001"}]}
+            ]
+        }"#;
+        let precisions = parse_spot_market_precisions(text).expect("should parse");
+        assert_eq!(precisions.len(), 1);
+        assert_eq!(precisions[0].symbol, Symbol::new("BTC", "USDT"));
+    }
+
+    #[test]
+    fn parse_perpetual_market_precisions_prefers_market_lot_size() {
+        let text = r#"{
+            "symbols": [
+                {
+                    "symbol": "APEUSDT",
+                    "status": "TRADING",
+                    "contractType": "PERPETUAL",
+                    "baseAsset": "APE",
+                    "quoteAsset": "USDT",
+                    "filters": [
+                        {"filterType": "LOT_SIZE", "minQty": "1", "maxQty": "1000000", "stepSize": "1"},
+                        {"filterType": "MARKET_LOT_SIZE", "minQty": "10", "maxQty": "500000", "stepSize": "10"}
+                    ]
+                }
+            ]
+        }"#;
+        let precisions = parse_perpetual_market_precisions(text).expect("should parse");
+        assert_eq!(precisions.len(), 1);
+        assert_eq!(precisions[0].market.qty_step, "10".parse().unwrap());
+    }
+
+    #[test]
+    fn parse_spot_market_precisions_surfaces_error_response() {
+        let text = r#"{"code":-2015,"msg":"Invalid API-key, IP, or permissions for action."}"#;
+        let err = parse_spot_market_precisions(text).unwrap_err();
         assert!(err.to_string().contains("-2015"));
     }
 

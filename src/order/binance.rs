@@ -20,7 +20,7 @@ use crate::order_manager::stream::{ExchangeOrderUpdate, OrderStreamSource};
 use crate::types::{Symbol, Venue};
 
 use super::OrderProvider;
-use super::types::{MarketInfo, MarketOrderRequest, OrderAmount, OrderResult, OrderSide, OrderStatus};
+use super::types::{MarketOrderRequest, OrderAmount, OrderResult, OrderSide, OrderStatus};
 
 const MAINNET_HOST: &str = "https://api.binance.com";
 const TESTNET_HOST: &str = "https://testnet.binance.vision";
@@ -96,20 +96,6 @@ impl BinanceOrderProvider {
         Ok(text)
     }
 
-    /// 不需要签名的公开接口请求，用于查询交易对精度限制。
-    async fn public_request(&self, path: &str, params: Vec<(String, String)>) -> anyhow::Result<String> {
-        let query = build_query_string(&params);
-        let url = format!("{}{}?{}", self.host, path, query);
-        crate::ratelimit::throttle(self.host).await;
-        let resp = self
-            .http
-            .get(&url)
-            .send()
-            .await
-            .context("binance public request failed")?;
-        resp.text().await.context("failed to read binance public response body")
-    }
-
     fn binance_symbol(symbol: &Symbol) -> String {
         format!("{}{}", symbol.base, symbol.quote).to_ascii_uppercase()
     }
@@ -119,12 +105,6 @@ impl BinanceOrderProvider {
 impl OrderProvider for BinanceOrderProvider {
     fn venue(&self) -> Venue {
         self.venue.clone()
-    }
-
-    async fn market_info(&self, symbol: &Symbol) -> anyhow::Result<MarketInfo> {
-        let params = vec![("symbol".to_string(), Self::binance_symbol(symbol))];
-        let text = self.public_request("/api/v3/exchangeInfo", params).await?;
-        parse_market_info(&text, symbol)
     }
 
     async fn place_market_order_raw(&self, req: &MarketOrderRequest) -> anyhow::Result<OrderResult> {
@@ -214,53 +194,6 @@ fn map_status(status: &str) -> OrderStatus {
 struct ErrorResponse {
     code: i64,
     msg: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct ExchangeInfoResponse {
-    symbols: Vec<SymbolInfo>,
-}
-
-#[derive(Debug, Deserialize)]
-struct SymbolInfo {
-    filters: Vec<serde_json::Value>,
-}
-
-fn parse_market_info(text: &str, symbol: &Symbol) -> anyhow::Result<MarketInfo> {
-    if let Ok(err) = serde_json::from_str::<ErrorResponse>(text) {
-        anyhow::bail!("binance error {}: {}", err.code, err.msg);
-    }
-    let resp: ExchangeInfoResponse = serde_json::from_str(text).context("failed to parse binance exchangeInfo response")?;
-    let info = resp
-        .symbols
-        .into_iter()
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("binance exchangeInfo returned no symbol for {symbol}"))?;
-
-    let lot_size = info
-        .filters
-        .iter()
-        .find(|f| f.get("filterType").and_then(|v| v.as_str()) == Some("LOT_SIZE"))
-        .ok_or_else(|| anyhow::anyhow!("binance exchangeInfo missing LOT_SIZE filter for {symbol}"))?;
-
-    let step_size: Decimal = lot_size
-        .get("stepSize")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow::anyhow!("binance LOT_SIZE filter missing stepSize for {symbol}"))?
-        .parse()
-        .context("failed to parse binance stepSize")?;
-    let min_qty: Decimal = lot_size
-        .get("minQty")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow::anyhow!("binance LOT_SIZE filter missing minQty for {symbol}"))?
-        .parse()
-        .context("failed to parse binance minQty")?;
-
-    Ok(MarketInfo {
-        symbol: symbol.clone(),
-        qty_step: step_size,
-        min_qty,
-    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -686,33 +619,6 @@ mod tests {
         assert_eq!(map_status("NEW"), OrderStatus::New);
         assert_eq!(map_status("REJECTED"), OrderStatus::Rejected);
         assert_eq!(map_status("EXPIRED"), OrderStatus::Expired);
-    }
-
-    #[test]
-    fn parses_market_info_from_exchange_info() {
-        let text = r#"{
-            "symbols": [
-                {
-                    "symbol": "BTCUSDT",
-                    "filters": [
-                        {"filterType": "PRICE_FILTER", "tickSize": "0.01"},
-                        {"filterType": "LOT_SIZE", "minQty": "0.00001000", "maxQty": "9000.00000000", "stepSize": "0.00001000"}
-                    ]
-                }
-            ]
-        }"#;
-        let symbol = Symbol::new("BTC", "USDT");
-        let info = parse_market_info(text, &symbol).expect("should parse");
-        assert_eq!(info.qty_step, "0.00001000".parse().unwrap());
-        assert_eq!(info.min_qty, "0.00001000".parse().unwrap());
-    }
-
-    #[test]
-    fn parse_market_info_surfaces_error_response() {
-        let text = r#"{"code":-1121,"msg":"Invalid symbol."}"#;
-        let symbol = Symbol::new("BTC", "USDT");
-        let err = parse_market_info(text, &symbol).unwrap_err();
-        assert!(err.to_string().contains("-1121"));
     }
 
     #[test]

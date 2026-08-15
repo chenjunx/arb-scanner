@@ -13,6 +13,7 @@ use arb_scanner::accounting::{FundingFeeProvider, FundingFeeTracker, RedisFundin
 use arb_scanner::config::{AppConfig, ScanConfig, VenueConfig};
 use arb_scanner::engine::ArbitrageEngine;
 use arb_scanner::exchange_info::ExchangeInfoProvider;
+use arb_scanner::exchange_info::PrecisionCache;
 use arb_scanner::exchange_info::binance::BinanceExchangeInfoProvider;
 use arb_scanner::exchange_info::kraken::KrakenExchangeInfoProvider;
 use arb_scanner::exchange_info::types::TradingFee;
@@ -343,6 +344,14 @@ async fn run_open_command(args: &[String]) -> anyhow::Result<()> {
     let binance_wallet = BinanceWalletProvider::from_env(Venue::new("binance"), testnet, proxy.as_deref())?;
     let kraken_wallet = KrakenWalletProvider::from_env(Venue::new("kraken"), proxy.as_deref())?;
 
+    // 启动时一次性加载合约下单精度缓存，凭证/网络问题在下单前就暴露（fail-fast），
+    // 而不是现货腿已经成交了才发现；即使 dry_run 分支用不到它也没关系——一次性
+    // 启动成本，不是每次下单都要付的代价。
+    let exchange_info = BinanceExchangeInfoProvider::from_env(Venue::new("binance"), testnet, proxy.as_deref())?;
+    let futures_precision = PrecisionCache::load_perpetual(&exchange_info)
+        .await
+        .context("failed to load futures market precision cache")?;
+
     info!(
         "open: symbol={symbol} amount={quote_amount} transfer_asset={transfer_asset} testnet={testnet} dry_run={dry_run} transfer_to_kraken={transfer_to_kraken}"
     );
@@ -443,6 +452,7 @@ async fn run_open_command(args: &[String]) -> anyhow::Result<()> {
         &kraken_wallet,
         order_manager.as_ref(),
         &mut event_rx,
+        &futures_precision,
         execution::OpenPositionParams {
             symbol,
             quote_amount,
