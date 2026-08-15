@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::order::types::OrderStatus;
+use crate::order::types::{OrderAmount, OrderStatus};
 use crate::order_manager::OrderStore;
 use crate::report::section::ReportSection;
 
@@ -61,15 +61,20 @@ impl ReportSection for OrderSection {
             lines.push("当前挂单:".to_string());
         }
         for order in shown {
+            // filled_qty 始终是成交的 base 数量；下单量 amount 可能是 base 也可能是
+            // quote(按金额下单)，两者单位不一致时不能直接拼成一个分数，否则会把
+            // quote 金额误读成 base 数量(例如"以 10 USDT 下单"显示成 filled=0/10)。
+            let base = &order.request.symbol.base;
+            let filled_vs_target = match order.request.amount {
+                OrderAmount::Base(target) => format!("filled={} {base}/{} {base}", order.filled_qty, target),
+                OrderAmount::Quote(target) => {
+                    let quote = &order.request.symbol.quote;
+                    format!("filled={} {base} target={} {quote}", order.filled_qty, target)
+                }
+            };
             lines.push(format!(
-                "  {} {} {} {:?} side={:?} filled={}/{}",
-                order.order_id,
-                order.request.venue,
-                order.request.symbol,
-                order.status,
-                order.request.side,
-                order.filled_qty,
-                order.request.amount.value(),
+                "  {} {} {} {:?} side={:?} {}",
+                order.order_id, order.request.venue, order.request.symbol, order.status, order.request.side, filled_vs_target,
             ));
         }
         lines.join("\n")
