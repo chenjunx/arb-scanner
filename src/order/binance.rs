@@ -5,7 +5,7 @@ use anyhow::Context;
 use async_trait::async_trait;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as base64_engine;
-use futures_util::StreamExt;
+use futures_util::{SinkExt, StreamExt};
 use log::{debug, warn};
 use ring::signature::Ed25519KeyPair;
 use rust_decimal::Decimal;
@@ -25,17 +25,18 @@ use super::types::{MarketInfo, MarketOrderRequest, OrderAmount, OrderResult, Ord
 
 const MAINNET_HOST: &str = "https://api.binance.com";
 const TESTNET_HOST: &str = "https://testnet.binance.vision";
-const MAINNET_WS_HOST: &str = "stream.binance.com";
-const MAINNET_WS_PORT: u16 = 9443;
-const TESTNET_WS_HOST: &str = "testnet.binance.vision";
-const TESTNET_WS_PORT: u16 = 443;
+// 现货 listenKey REST 接口(POST/PUT/DELETE /api/v3/userDataStream)已在
+// 2026-02-20 下线，User Data Stream 改成在 WS API 连接内做 session.logon
+// 签名鉴权 + userDataStream.subscribe，见 BinanceUserDataStream。
+const WS_API_MAINNET_HOST: &str = "ws-api.binance.com";
+const WS_API_TESTNET_HOST: &str = "ws-api.testnet.binance.vision";
+const WS_API_PORT: u16 = 443;
+const WS_API_PATH: &str = "/ws-api/v3";
 // 5000 曾在并发下三条腿一起发请求时因调度延迟触发过一次 -1022(签名无效)，
 // 实际是时间戳超出 recvWindow 但被币安网关报成了签名错误，调大留出冗余。
 const RECV_WINDOW_MS: u64 = 10_000;
 const MIN_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
-// listenKey 60 分钟不活动会过期，30 分钟续期一次留足冗余。
-const LISTEN_KEY_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30 * 60);
 
 /// 币安下单(执行层)客户端：查询交易对精度限制、提交市价单。签名方式和
 /// `wallet::binance::BinanceWalletProvider` 一致，用 Ed25519，凭证也复用同一套
@@ -317,76 +318,84 @@ fn parse_order_response(text: &str) -> anyhow::Result<OrderResult> {
     })
 }
 
-/// 币安现货 User Data Stream 客户端：管理 listenKey 生命周期、维护私有订单
-/// WebSocket 连接，把 `executionReport` 推送转换成 `ExchangeOrderUpdate`。
-/// listenKey 的获取/续期只需要 `X-MBX-APIKEY` 头，不需要签名。
+/// 币安现货 User Data Stream 客户端：在 WS API 连接内做 `session.logon`
+/// (Ed25519 签名鉴权) + `userDataStream.subscribe`，把推送的 `executionReport`
+/// 转换成 `ExchangeOrderUpdate`。2026-02-20 起旧的 listenKey REST 接口
+/// (POST/PUT/DELETE /api/v3/userDataStream) 已下线，不能再用。
 pub struct BinanceUserDataStream {
     venue: Venue,
     api_key: String,
-    host: &'static str,
+    key_pair: Ed25519KeyPair,
     ws_host: &'static str,
     ws_port: u16,
-    http: reqwest::Client,
     proxy: Option<String>,
 }
 
 impl BinanceUserDataStream {
-    pub fn new(venue: Venue, api_key: String, testnet: bool, proxy: Option<&str>) -> anyhow::Result<Self> {
-        let http = build_http_client(proxy)?;
-        let (host, ws_host, ws_port) = if testnet {
-            (TESTNET_HOST, TESTNET_WS_HOST, TESTNET_WS_PORT)
-        } else {
-            (MAINNET_HOST, MAINNET_WS_HOST, MAINNET_WS_PORT)
-        };
+    pub fn new(venue: Venue, api_key: String, private_key_pem: &str, testnet: bool, proxy: Option<&str>) -> anyhow::Result<Self> {
+        let key_pair = load_ed25519_key(private_key_pem)?;
+        let ws_host = if testnet { WS_API_TESTNET_HOST } else { WS_API_MAINNET_HOST };
         Ok(Self {
             venue,
             api_key,
-            host,
+            key_pair,
             ws_host,
-            ws_port,
-            http,
+            ws_port: WS_API_PORT,
             proxy: proxy.map(str::to_string),
         })
     }
 
-    /// 从环境变量读取凭证，和 `BinanceOrderProvider::from_env` 复用同一个
-    /// `BINANCE_API_KEY`（listenKey 接口不需要 API secret/签名）。
+    /// 从环境变量读取凭证，和 `BinanceOrderProvider::from_env` 复用同一套
+    /// `BINANCE_API_KEY` + `BINANCE_API_SECRET`：session.logon 需要用私钥签名，
+    /// 不再是 listenKey 时代只需要 API Key 的轻量鉴权。
     pub fn from_env(venue: Venue, testnet: bool, proxy: Option<&str>) -> anyhow::Result<Self> {
         let api_key = std::env::var("BINANCE_API_KEY").context("BINANCE_API_KEY not set")?;
-        Self::new(venue, api_key, testnet, proxy)
+        let private_key_pem = std::env::var("BINANCE_API_SECRET").context("BINANCE_API_SECRET not set")?;
+        Self::new(venue, api_key, &private_key_pem, testnet, proxy)
     }
 
-    async fn create_listen_key(&self) -> anyhow::Result<String> {
-        crate::ratelimit::throttle(self.host).await;
-        let resp = self
-            .http
-            .post(format!("{}/api/v3/userDataStream", self.host))
-            .header("X-MBX-APIKEY", &self.api_key)
-            .send()
-            .await
-            .context("failed to create binance listenKey")?;
-        let text = resp.text().await.context("failed to read binance listenKey response")?;
-        parse_listen_key(&text)
-    }
-
-    async fn keepalive_listen_key(&self, listen_key: &str) -> anyhow::Result<()> {
-        crate::ratelimit::throttle(self.host).await;
-        self.http
-            .put(format!("{}/api/v3/userDataStream?listenKey={}", self.host, listen_key))
-            .header("X-MBX-APIKEY", &self.api_key)
-            .send()
-            .await
-            .context("failed to keepalive binance listenKey")?;
-        Ok(())
-    }
-
-    async fn connect(&self, listen_key: &str) -> anyhow::Result<WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>> {
+    async fn connect(&self) -> anyhow::Result<WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>> {
         let tcp = connect_tcp(self.ws_host, self.ws_port, self.proxy.as_deref()).await?;
-        let url = format!("wss://{}:{}/ws/{}", self.ws_host, self.ws_port, listen_key);
+        let url = format!("wss://{}:{}{}", self.ws_host, self.ws_port, WS_API_PATH);
         let (ws, _) = tokio_tungstenite::client_async_tls(url, tcp)
             .await
             .context("binance user data stream handshake failed")?;
         Ok(ws)
+    }
+
+    /// 按字母序拼接 `k=v&k=v...`(value 做 percent-encode，币安 2026-01-15 起
+    /// 要求签名前编码，见 WS API request security 文档)，用下单同一把 Ed25519
+    /// 私钥签名。
+    fn sign_ws_params(&self, params: &[(&str, &str)]) -> String {
+        let mut sorted = params.to_vec();
+        sorted.sort_by_key(|(k, _)| *k);
+        let payload = sorted
+            .iter()
+            .map(|(k, v)| format!("{k}={}", percent_encode(v)))
+            .collect::<Vec<_>>()
+            .join("&");
+        sign_ed25519(&self.key_pair, &payload)
+    }
+
+    async fn session_logon(&self, ws: &mut WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>) -> anyhow::Result<()> {
+        let timestamp = now_ms();
+        let timestamp_str = timestamp.to_string();
+        let signature = self.sign_ws_params(&[("apiKey", &self.api_key), ("timestamp", &timestamp_str)]);
+        let req = serde_json::json!({
+            "id": "logon",
+            "method": "session.logon",
+            "params": {
+                "apiKey": self.api_key,
+                "signature": signature,
+                "timestamp": timestamp,
+            }
+        });
+        send_ws_api_request(ws, "logon", &req).await.context("session.logon failed")
+    }
+
+    async fn subscribe_user_data(&self, ws: &mut WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>) -> anyhow::Result<()> {
+        let req = serde_json::json!({"id": "sub", "method": "userDataStream.subscribe"});
+        send_ws_api_request(ws, "sub", &req).await.context("userDataStream.subscribe failed")
     }
 }
 
@@ -400,20 +409,7 @@ impl OrderStreamSource for BinanceUserDataStream {
             let mut backoff = MIN_BACKOFF;
 
             loop {
-                let listen_key = match self.create_listen_key().await {
-                    Ok(key) => key,
-                    Err(err) => {
-                        warn!(
-                            "binance user data stream: failed to create listenKey for venue={} err={err:#}, retrying in {:?}",
-                            self.venue, backoff
-                        );
-                        tokio::time::sleep(backoff).await;
-                        backoff = (backoff * 2).min(MAX_BACKOFF);
-                        continue;
-                    }
-                };
-
-                let mut ws = match self.connect(&listen_key).await {
+                let mut ws = match self.connect().await {
                     Ok(ws) => ws,
                     Err(err) => {
                         warn!(
@@ -425,38 +421,52 @@ impl OrderStreamSource for BinanceUserDataStream {
                         continue;
                     }
                 };
-                debug!("binance user data stream connected for venue={}", self.venue);
+
+                if let Err(err) = self.session_logon(&mut ws).await {
+                    warn!(
+                        "binance user data stream: session.logon failed for venue={} err={err:#}, retrying in {:?}",
+                        self.venue, backoff
+                    );
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(MAX_BACKOFF);
+                    continue;
+                }
+                if let Err(err) = self.subscribe_user_data(&mut ws).await {
+                    warn!(
+                        "binance user data stream: userDataStream.subscribe failed for venue={} err={err:#}, retrying in {:?}",
+                        self.venue, backoff
+                    );
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(MAX_BACKOFF);
+                    continue;
+                }
+                debug!("binance user data stream connected and subscribed for venue={}", self.venue);
                 backoff = MIN_BACKOFF;
 
-                let mut keepalive_ticker = tokio::time::interval(LISTEN_KEY_KEEPALIVE_INTERVAL);
-                // 第一次 tick 立即完成(interval 语义)，先消费掉避免刚连上就续期一次。
-                keepalive_ticker.tick().await;
-
                 loop {
-                    tokio::select! {
-                        _ = keepalive_ticker.tick() => {
-                            if let Err(err) = self.keepalive_listen_key(&listen_key).await {
-                                warn!(
-                                    "binance user data stream: listenKey keepalive failed for venue={} err={err:#}",
-                                    self.venue
-                                );
+                    let msg = match ws.next().await {
+                        Some(Ok(msg)) => msg,
+                        Some(Err(err)) => {
+                            warn!("binance user data stream error for venue={} err={err}", self.venue);
+                            break;
+                        }
+                        None => break,
+                    };
+                    match msg {
+                        // WS API 20s 一次 ping / 60s 无 pong 就断连，比旧的
+                        // listenKey(60 分钟)严格得多，必须及时应答。
+                        Message::Ping(payload) => {
+                            if ws.send(Message::Pong(payload)).await.is_err() {
+                                break;
                             }
                         }
-                        msg = ws.next() => {
-                            let Some(msg) = msg else { break };
-                            let msg = match msg {
-                                Ok(msg) => msg,
-                                Err(err) => {
-                                    warn!("binance user data stream error for venue={} err={err}", self.venue);
-                                    break;
-                                }
-                            };
-                            let Message::Text(text) = msg else { continue };
+                        Message::Text(text) => {
                             let Some(update) = parse_execution_report(&text, &self.venue) else { continue };
                             if tx.send(update).await.is_err() {
                                 return;
                             }
                         }
+                        _ => {}
                     }
                 }
 
@@ -471,19 +481,63 @@ impl OrderStreamSource for BinanceUserDataStream {
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct ListenKeyResponse {
-    #[serde(rename = "listenKey")]
-    listen_key: String,
+/// RFC 3986 未保留字符集之外的字节一律 percent-encode。
+fn percent_encode(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for byte in input.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(byte as char),
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
 }
 
-fn parse_listen_key(text: &str) -> anyhow::Result<String> {
-    if let Ok(err) = serde_json::from_str::<ErrorResponse>(text) {
-        anyhow::bail!("binance error {}: {}", err.code, err.msg);
+#[derive(Debug, Deserialize)]
+struct WsApiResponse {
+    id: Option<String>,
+    #[serde(default)]
+    status: i64,
+}
+
+/// 判断一条 WS API 响应文本是否是我们在等的那个请求的结果：`id` 不匹配(或
+/// 干脆不是响应，比如推送事件)返回 `None`，忽略即可；`id` 匹配时返回
+/// `Some(status == 200)`。纯函数，不依赖真实连接，便于单元测试。
+fn match_ws_api_response(text: &str, expected_id: &str) -> Option<bool> {
+    let resp: WsApiResponse = serde_json::from_str(text).ok()?;
+    if resp.id.as_deref() != Some(expected_id) {
+        return None;
     }
-    let resp: ListenKeyResponse =
-        serde_json::from_str(text).with_context(|| format!("failed to parse binance listenKey response, raw body: {text}"))?;
-    Ok(resp.listen_key)
+    Some(resp.status == 200)
+}
+
+/// 发送一条 WS API 请求并阻塞等待匹配 `id` 的响应；`status` 非 200 时把响应体
+/// 透传成错误。等待期间收到 `Ping` 帧会先回 `Pong`，避免在鉴权/订阅阶段就被
+/// 服务端因超时断连。
+async fn send_ws_api_request(
+    ws: &mut WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
+    expected_id: &str,
+    req: &serde_json::Value,
+) -> anyhow::Result<()> {
+    ws.send(Message::Text(req.to_string())).await.context("failed to send websocket api request")?;
+    loop {
+        let msg = ws
+            .next()
+            .await
+            .context("connection closed while waiting for websocket api response")?
+            .context("websocket error while waiting for response")?;
+        match msg {
+            Message::Ping(payload) => {
+                ws.send(Message::Pong(payload)).await.context("failed to send pong")?;
+            }
+            Message::Text(text) => match match_ws_api_response(&text, expected_id) {
+                Some(true) => return Ok(()),
+                Some(false) => anyhow::bail!("binance websocket api error: {text}"),
+                None => continue,
+            },
+            _ => {}
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -517,20 +571,25 @@ struct ExecutionReport {
 }
 
 /// 解析一条 User Data Stream 消息，只关心 `executionReport` 事件(其它如
-/// `outboundAccountPosition`/`balanceUpdate` 直接忽略)。纯函数，不依赖真实
-/// WebSocket 连接，便于单元测试。
+/// `outboundAccountPosition`/`balanceUpdate`，以及 WS API 请求响应，直接忽略)。
+/// WS API 订阅推送把原始事件包了一层 `{"subscriptionId":N,"event":{...}}`，
+/// 先取出内层 `event`(取不到就把原文当兜底，兼容旧格式测试数据)。纯函数，
+/// 不依赖真实 WebSocket 连接，便于单元测试。
 fn parse_execution_report(text: &str, venue: &Venue) -> Option<ExchangeOrderUpdate> {
-    let envelope: UserDataEventEnvelope = match serde_json::from_str(text) {
-        Ok(envelope) => envelope,
+    let raw: serde_json::Value = match serde_json::from_str(text) {
+        Ok(raw) => raw,
         Err(err) => {
             warn!("failed to parse binance user data stream message: {err}");
             return None;
         }
     };
+    let event = raw.get("event").cloned().unwrap_or(raw);
+
+    let envelope: UserDataEventEnvelope = serde_json::from_value(event.clone()).ok()?;
     if envelope.event_type != "executionReport" {
         return None;
     }
-    let report: ExecutionReport = match serde_json::from_str(text) {
+    let report: ExecutionReport = match serde_json::from_value(event) {
         Ok(report) => report,
         Err(err) => {
             warn!("failed to parse binance executionReport: {err}");
@@ -725,32 +784,51 @@ mod tests {
     }
 
     #[test]
-    fn parses_listen_key_response() {
-        let text = r#"{"listenKey":"abc123"}"#;
-        assert_eq!(parse_listen_key(text).expect("should parse"), "abc123");
+    fn percent_encodes_reserved_characters() {
+        assert_eq!(percent_encode("abcXYZ019-_.~"), "abcXYZ019-_.~");
+        assert_eq!(percent_encode("a+b/c=d"), "a%2Bb%2Fc%3Dd");
     }
 
     #[test]
-    fn parse_listen_key_surfaces_error_response() {
-        let text = r#"{"code":-2014,"msg":"API-key format invalid."}"#;
-        let err = parse_listen_key(text).unwrap_err();
-        assert!(err.to_string().contains("API-key format invalid"));
+    fn matches_ws_api_response_success() {
+        let text = r#"{"id":"logon","status":200,"result":{}}"#;
+        assert_eq!(match_ws_api_response(text, "logon"), Some(true));
+    }
+
+    #[test]
+    fn matches_ws_api_response_failure() {
+        let text = r#"{"id":"logon","status":400,"error":{"code":-1022,"msg":"Signature for this request is not valid."}}"#;
+        assert_eq!(match_ws_api_response(text, "logon"), Some(false));
+    }
+
+    #[test]
+    fn ignores_ws_api_response_with_different_id() {
+        let text = r#"{"id":"sub","status":200,"result":{}}"#;
+        assert_eq!(match_ws_api_response(text, "logon"), None);
+    }
+
+    #[test]
+    fn ignores_malformed_ws_api_response() {
+        assert_eq!(match_ws_api_response("not json", "logon"), None);
     }
 
     #[test]
     fn parses_execution_report_partial_fill() {
         let venue = Venue::new("binance");
         let text = r#"{
-            "e": "executionReport",
-            "E": 1700000000123,
-            "s": "BTCUSDT",
-            "c": "ORD-000000000001",
-            "S": "BUY",
-            "o": "MARKET",
-            "X": "PARTIALLY_FILLED",
-            "i": 123456,
-            "z": "0.40000000",
-            "Z": "16000.00000000"
+            "subscriptionId": 0,
+            "event": {
+                "e": "executionReport",
+                "E": 1700000000123,
+                "s": "BTCUSDT",
+                "c": "ORD-000000000001",
+                "S": "BUY",
+                "o": "MARKET",
+                "X": "PARTIALLY_FILLED",
+                "i": 123456,
+                "z": "0.40000000",
+                "Z": "16000.00000000"
+            }
         }"#;
         let update = parse_execution_report(text, &venue).expect("should parse");
         assert_eq!(update.venue, venue);
@@ -768,18 +846,21 @@ mod tests {
     fn parses_execution_report_with_commission() {
         let venue = Venue::new("binance");
         let text = r#"{
-            "e": "executionReport",
-            "E": 1700000000123,
-            "s": "BTCUSDT",
-            "c": "ORD-000000000001",
-            "S": "BUY",
-            "o": "MARKET",
-            "X": "PARTIALLY_FILLED",
-            "i": 123456,
-            "z": "0.40000000",
-            "Z": "16000.00000000",
-            "n": "0.0004",
-            "N": "BTC"
+            "subscriptionId": 0,
+            "event": {
+                "e": "executionReport",
+                "E": 1700000000123,
+                "s": "BTCUSDT",
+                "c": "ORD-000000000001",
+                "S": "BUY",
+                "o": "MARKET",
+                "X": "PARTIALLY_FILLED",
+                "i": 123456,
+                "z": "0.40000000",
+                "Z": "16000.00000000",
+                "n": "0.0004",
+                "N": "BTC"
+            }
         }"#;
         let update = parse_execution_report(text, &venue).expect("should parse");
         assert_eq!(update.fee, Some("0.0004".parse().unwrap()));
@@ -790,16 +871,19 @@ mod tests {
     fn parses_execution_report_new_order_without_fill() {
         let venue = Venue::new("binance");
         let text = r#"{
-            "e": "executionReport",
-            "E": 1700000000000,
-            "s": "BTCUSDT",
-            "c": "ORD-000000000002",
-            "S": "BUY",
-            "o": "MARKET",
-            "X": "NEW",
-            "i": 654321,
-            "z": "0.00000000",
-            "Z": "0.00000000"
+            "subscriptionId": 0,
+            "event": {
+                "e": "executionReport",
+                "E": 1700000000000,
+                "s": "BTCUSDT",
+                "c": "ORD-000000000002",
+                "S": "BUY",
+                "o": "MARKET",
+                "X": "NEW",
+                "i": 654321,
+                "z": "0.00000000",
+                "Z": "0.00000000"
+            }
         }"#;
         let update = parse_execution_report(text, &venue).expect("should parse");
         assert_eq!(update.status, OrderStatus::New);
@@ -812,7 +896,14 @@ mod tests {
     #[test]
     fn ignores_non_execution_report_events() {
         let venue = Venue::new("binance");
-        let text = r#"{"e":"outboundAccountPosition","E":1700000000000,"u":1700000000000,"B":[]}"#;
+        let text = r#"{"subscriptionId":0,"event":{"e":"outboundAccountPosition","E":1700000000000,"u":1700000000000,"B":[]}}"#;
+        assert!(parse_execution_report(text, &venue).is_none());
+    }
+
+    #[test]
+    fn ignores_ws_api_response_messages_in_execution_report_parsing() {
+        let venue = Venue::new("binance");
+        let text = r#"{"id":"logon","status":200,"result":{}}"#;
         assert!(parse_execution_report(text, &venue).is_none());
     }
 

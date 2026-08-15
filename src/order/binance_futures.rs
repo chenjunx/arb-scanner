@@ -232,7 +232,9 @@ impl BinanceFuturesUserDataStream {
 
     async fn connect(&self, listen_key: &str) -> anyhow::Result<WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>> {
         let tcp = connect_tcp(self.ws_host, self.ws_port, self.proxy.as_deref()).await?;
-        let url = format!("wss://{}:{}/ws/{}", self.ws_host, self.ws_port, listen_key);
+        // 2026-04-23 起币安把私有推流迁到了 `/private` 路由前缀下，不带前缀的
+        // 旧连接虽然还能握手成功，但收不到任何 ORDER_TRADE_UPDATE 消息(静默失效)。
+        let url = format!("wss://{}:{}/private/ws/{}", self.ws_host, self.ws_port, listen_key);
         let (ws, _) = tokio_tungstenite::client_async_tls(url, tcp)
             .await
             .context("binance futures user data stream handshake failed")?;
