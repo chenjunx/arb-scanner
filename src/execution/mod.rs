@@ -7,8 +7,10 @@ use tokio::sync::mpsc;
 
 use crate::exchange_info::types::PrecisionKind;
 use crate::exchange_info::PrecisionCache;
+use crate::market_data::now_ms;
 use crate::order::types::{MarketOrderRequest, OrderAmount, OrderResult, OrderSide};
 use crate::order::OrderProvider;
+use crate::order_manager::stream::ExchangeOrderUpdate;
 use crate::order_manager::types::{OrderEvent, OrderId, OrderRequest};
 use crate::order_manager::OrderManager;
 use crate::types::Symbol;
@@ -113,7 +115,8 @@ pub async fn open_hedged_position_live(
         .context("order manager dropped result channel for spot order")?
         .map_err(|reason| anyhow::anyhow!("spot order rejected: {reason}"))?;
 
-    let (filled_qty, spot_avg_price) = wait_for_fill(event_rx, &spot_order_id, params.fill_timeout).await?;
+    let (filled_qty, spot_avg_price) =
+        wait_for_fill(event_rx, &spot_order_id, params.fill_timeout, spot, order_manager).await?;
     if filled_qty <= Decimal::ZERO {
         anyhow::bail!("spot buy filled_qty is zero, aborting hedge/transfer");
     }
@@ -160,7 +163,7 @@ pub async fn open_hedged_position_live(
         .map_err(|reason| anyhow::anyhow!("futures order rejected: {reason}"))?;
 
     let (futures_filled_qty, futures_avg_price) =
-        wait_for_fill(event_rx, &futures_order_id, params.fill_timeout).await?;
+        wait_for_fill(event_rx, &futures_order_id, params.fill_timeout, futures, order_manager).await?;
     log::info!("open_hedged_position_live: futures hedge filled qty={futures_filled_qty} avg_price={futures_avg_price}");
     let futures_order_after_fill = order_manager
         .get_order(&futures_order_id)
@@ -213,34 +216,113 @@ pub async fn open_hedged_position_live(
 /// 和均价)，或者收到该订单被风控/交易所拒绝的事件(直接报错)。不匹配
 /// `order_id` 的事件会被忽略——同一个 `event_rx` 在 `open_hedged_position_live`
 /// 里被现货、合约两条腿先后共用。`timeout` 防止私有 WS 没连上时无限等待。
+///
+/// 超时后不直接报错，而是先走一次 REST 兜底核对(`provider.query_order`)：
+/// 私有 WS 断连/丢消息是真实会发生的失败模式，此时订单可能早已在交易所侧
+/// 成交，直接报错会让调用方误以为下单失败。查到的结果通过
+/// `order_manager.handle_exchange_update` 写回(自动完成 Redis upsert + 风控/
+/// 账本更新，和 WS 推送走完全相同的路径)，再对 `event_rx` 做一次短超时
+/// 等待去捕获这次 reconcile 触发的事件。REST 核对也未能确认成交(查询失败、
+/// 或订单在交易所侧确实还不是终态)才真正报错。
 async fn wait_for_fill(
     event_rx: &mut mpsc::Receiver<OrderEvent>,
     order_id: &OrderId,
     timeout: Duration,
+    provider: &dyn OrderProvider,
+    order_manager: &OrderManager,
 ) -> anyhow::Result<(Decimal, Decimal)> {
-    let wait = async {
-        loop {
-            match event_rx.recv().await {
-                Some(OrderEvent::Filled { order_id: id, filled_qty, avg_price }) if &id == order_id => {
-                    return Ok((filled_qty, avg_price));
-                }
-                Some(OrderEvent::RejectedByRisk { order_id: id, reason }) if &id == order_id => {
-                    anyhow::bail!("order {order_id} rejected by risk: {reason}");
-                }
-                Some(OrderEvent::RejectedByExchange { order_id: id, reason }) if &id == order_id => {
-                    anyhow::bail!("order {order_id} rejected by exchange: {reason}");
-                }
-                Some(_) => continue,
-                None => anyhow::bail!("order event channel closed while waiting for order {order_id} to fill"),
-            }
+    match tokio::time::timeout(timeout, wait_for_fill_events(event_rx, order_id)).await {
+        Ok(result) => return result,
+        Err(_) => {
+            log::warn!(
+                "wait_for_fill: order {order_id} timed out after {timeout:?} waiting on exchange private WS, \
+                 falling back to a REST query_order reconciliation check"
+            );
         }
-    };
+    }
 
-    match tokio::time::timeout(timeout, wait).await {
+    reconcile_via_rest_query(event_rx, order_id, provider, order_manager)
+        .await
+        .with_context(|| {
+            format!(
+                "timed out after {timeout:?} waiting for order {order_id} to fill via exchange private WS, \
+                 and REST 核对也未确认成交，需要人工检查 (check that the exchange order-update WS stream is connected)"
+            )
+        })
+}
+
+async fn wait_for_fill_events(
+    event_rx: &mut mpsc::Receiver<OrderEvent>,
+    order_id: &OrderId,
+) -> anyhow::Result<(Decimal, Decimal)> {
+    loop {
+        match event_rx.recv().await {
+            Some(OrderEvent::Filled { order_id: id, filled_qty, avg_price }) if &id == order_id => {
+                return Ok((filled_qty, avg_price));
+            }
+            Some(OrderEvent::RejectedByRisk { order_id: id, reason }) if &id == order_id => {
+                anyhow::bail!("order {order_id} rejected by risk: {reason}");
+            }
+            Some(OrderEvent::RejectedByExchange { order_id: id, reason }) if &id == order_id => {
+                anyhow::bail!("order {order_id} rejected by exchange: {reason}");
+            }
+            Some(_) => continue,
+            None => anyhow::bail!("order event channel closed while waiting for order {order_id} to fill"),
+        }
+    }
+}
+
+/// `wait_for_fill` 超时后的 REST 兜底：查订单当前存的 `exchange_order_id`，
+/// 拿去问交易所，结果喂回 `handle_exchange_update`，再短暂等一次事件。
+const RECONCILE_REWAIT: Duration = Duration::from_secs(5);
+
+async fn reconcile_via_rest_query(
+    event_rx: &mut mpsc::Receiver<OrderEvent>,
+    order_id: &OrderId,
+    provider: &dyn OrderProvider,
+    order_manager: &OrderManager,
+) -> anyhow::Result<(Decimal, Decimal)> {
+    let order = order_manager
+        .get_order(order_id)
+        .with_context(|| format!("order {order_id} not found in order manager, cannot reconcile via REST"))?;
+    let exchange_order_id = order
+        .exchange_order_id
+        .clone()
+        .with_context(|| format!("order {order_id} has no exchange_order_id yet, cannot reconcile via REST"))?;
+
+    let result = provider
+        .query_order(&order.request.symbol, &exchange_order_id)
+        .await
+        .with_context(|| format!("REST query_order failed for order {order_id} (exchange_order_id={exchange_order_id})"))?;
+
+    log::info!(
+        "wait_for_fill: REST reconciliation for order {order_id} (exchange_order_id={exchange_order_id}) \
+         returned status={:?} filled_qty={} avg_price={:?}",
+        result.status,
+        result.filled_qty,
+        result.avg_price
+    );
+
+    order_manager
+        .handle_exchange_update(ExchangeOrderUpdate {
+            venue: order.request.venue.clone(),
+            client_order_id: order.request.client_order_id.clone(),
+            exchange_order_id: Some(exchange_order_id),
+            status: result.status,
+            filled_qty: result.filled_qty,
+            avg_price: result.avg_price,
+            fee: result.fee,
+            fee_asset: result.fee_asset,
+            ts_ms: now_ms(),
+        })
+        .await;
+
+    match tokio::time::timeout(RECONCILE_REWAIT, wait_for_fill_events(event_rx, order_id)).await {
         Ok(result) => result,
         Err(_) => anyhow::bail!(
-            "timed out after {timeout:?} waiting for order {order_id} to fill via exchange private WS \
-             (check that the exchange order-update WS stream is connected)"
+            "REST 核对返回 status={:?} filled_qty={}，仍未确认成交",
+            result.status,
+            result.filled_qty
         ),
     }
 }
@@ -647,6 +729,42 @@ mod tests {
         }
     }
 
+    /// `wait_for_fill` REST 兜底测试用的替身：REST 下单响应故意不带成交信息
+    /// (`status=New`，和真实交易所的设计一致——成交状态不由 REST 驱动)，
+    /// `query_order` 固定返回一笔成交，模拟"WS 没推送、REST 核对能查到已成交"
+    /// 的场景。
+    struct QueryableProvider {
+        venue: Venue,
+        query_filled_qty: Decimal,
+    }
+
+    #[async_trait]
+    impl OrderProvider for QueryableProvider {
+        fn venue(&self) -> Venue {
+            self.venue.clone()
+        }
+        async fn place_market_order_raw(&self, req: &MarketOrderRequest) -> anyhow::Result<OrderResult> {
+            Ok(OrderResult {
+                order_id: format!("exchange-{}", req.symbol),
+                status: OrderStatus::New,
+                filled_qty: Decimal::ZERO,
+                avg_price: None,
+                fee: None,
+                fee_asset: None,
+            })
+        }
+        async fn query_order(&self, _symbol: &Symbol, exchange_order_id: &str) -> anyhow::Result<OrderResult> {
+            Ok(OrderResult {
+                order_id: exchange_order_id.to_string(),
+                status: OrderStatus::Filled,
+                filled_qty: self.query_filled_qty,
+                avg_price: Some(Decimal::ONE),
+                fee: None,
+                fee_asset: None,
+            })
+        }
+    }
+
     /// 钱包测试替身：固定返回一份网络列表，记录 `withdraw_raw` 调用参数。
     struct FakeWalletProvider {
         name: &'static str,
@@ -918,6 +1036,50 @@ mod tests {
         assert!(err.to_string().contains("filled_qty is zero"));
         assert!(futures_calls.lock().unwrap().is_empty());
         assert!(binance_wallet.withdraw_calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn wait_for_fill_falls_back_to_rest_query_on_ws_timeout() {
+        let venue = Venue::new("fake-queryable");
+        let provider: Arc<dyn OrderProvider> = Arc::new(QueryableProvider {
+            venue: venue.clone(),
+            query_filled_qty: Decimal::new(5, 1), // 0.5
+        });
+
+        let LiveEnv { order_manager, mut event_rx } = setup_live_env(provider.clone(), provider.clone());
+
+        let request = OrderRequest {
+            strategy_name: "test".to_string(),
+            venue: venue.clone(),
+            symbol: btc_usdt(),
+            side: OrderSide::Buy,
+            amount: OrderAmount::Base(Decimal::ONE),
+            client_order_id: Some("test-query-fallback".to_string()),
+            group_id: None,
+            metadata: None,
+        };
+        let response = order_manager.submit_order(request).await;
+        let order_id = response.order_id.clone();
+        // 等 process_order 跑完：exchange_order_id 已经写入，但 REST 响应本身
+        // 不带成交状态(status=New)，也没有任何 WS 推送——这是要测的超时场景。
+        response.result_rx.await.unwrap().unwrap();
+
+        let (filled_qty, avg_price) = wait_for_fill(
+            &mut event_rx,
+            &order_id,
+            Duration::from_millis(50),
+            provider.as_ref(),
+            order_manager.as_ref(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(filled_qty, Decimal::new(5, 1));
+        assert_eq!(avg_price, Decimal::ONE);
+
+        let final_order = order_manager.get_order(&order_id).unwrap();
+        assert_eq!(final_order.status, OrderStatus::Filled);
+        assert_eq!(final_order.filled_qty, Decimal::new(5, 1));
     }
 
     #[tokio::test]

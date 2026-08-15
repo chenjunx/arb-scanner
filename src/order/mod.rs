@@ -6,7 +6,7 @@ pub mod types;
 use async_trait::async_trait;
 use rust_decimal::Decimal;
 
-use crate::types::Venue;
+use crate::types::{Symbol, Venue};
 use types::{MarketOrderRequest, OrderResult, OrderStatus};
 
 /// 下单(执行层)扩展点：每个交易所实现市价单提交逻辑。这是按需调用的请求/响应
@@ -43,6 +43,16 @@ pub trait OrderProvider: Send + Sync {
             });
         }
         self.place_market_order_raw(&req).await
+    }
+
+    /// 按交易所自己的订单号回查一笔订单当前的状态/成交量/均价，用于
+    /// `wait_for_fill` 在私有 WS 迟迟没有推送确认时的 REST 兜底核对
+    /// (见 `execution::wait_for_fill`)——只在这一条防御路径上使用，正常
+    /// 成交确认仍然只信任 WS，不改变 `place_market_order_raw` 的既有约定。
+    /// 默认实现是报错，交易所没有对应查询接口(如 Kraken `AddOrder` 之外
+    /// 没有实现)时不需要改动。
+    async fn query_order(&self, _symbol: &Symbol, _exchange_order_id: &str) -> anyhow::Result<OrderResult> {
+        anyhow::bail!("query_order not supported for venue {}", self.venue())
     }
 }
 

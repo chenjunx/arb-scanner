@@ -123,6 +123,21 @@ impl OrderProvider for BinanceOrderProvider {
         let text = self.signed_request(reqwest::Method::POST, "/api/v3/order", params).await?;
         parse_order_response(&text)
     }
+
+    /// `GET /api/v3/order` 按 orderId 查询。响应不带 `avgPrice`/`fills`，但带
+    /// `cummulativeQuoteQty`，`parse_order_response` 本来就是用
+    /// `cummulativeQuoteQty / executedQty` 算均价(而不是依赖 `avgPrice` 字段)，
+    /// `fills` 靠 `#[serde(default)]` 缺省为空即可直接复用，缺失的手续费信息
+    /// 交给 Portfolio 按 `FeeConfig` 估算兜底(和下单响应里没有 fills 时的处理
+    /// 方式一致)。用于 `wait_for_fill` 的 REST 兜底核对。
+    async fn query_order(&self, symbol: &Symbol, exchange_order_id: &str) -> anyhow::Result<OrderResult> {
+        let params = vec![
+            ("symbol".to_string(), Self::binance_symbol(symbol)),
+            ("orderId".to_string(), exchange_order_id.to_string()),
+        ];
+        let text = self.signed_request(reqwest::Method::GET, "/api/v3/order", params).await?;
+        parse_order_response(&text)
+    }
 }
 
 fn build_http_client(proxy: Option<&str>) -> anyhow::Result<reqwest::Client> {
@@ -701,6 +716,36 @@ mod tests {
         let text = r#"{"code":-2010,"msg":"Account has insufficient balance for requested action."}"#;
         let err = parse_order_response(text).unwrap_err();
         assert!(err.to_string().contains("insufficient balance"));
+    }
+
+    /// `GET /api/v3/order`(query_order 用的接口)不带 `fills` 字段，也没有
+    /// `avgPrice` 字段——确认这种响应形状也能正确解析出成交量/均价(均价靠
+    /// cummulativeQuoteQty/executedQty 算，不依赖 fills)。
+    #[test]
+    fn parses_get_order_response_without_fills_field() {
+        let text = r#"{
+            "symbol": "BTCUSDT",
+            "orderId": 28,
+            "clientOrderId": "abc",
+            "price": "0.00000000",
+            "origQty": "10.00000000",
+            "executedQty": "10.00000000",
+            "cummulativeQuoteQty": "500000.00000000",
+            "status": "FILLED",
+            "timeInForce": "GTC",
+            "type": "MARKET",
+            "side": "BUY",
+            "time": 1507725176595,
+            "updateTime": 1507725176595,
+            "isWorking": true
+        }"#;
+        let result = parse_order_response(text).expect("should parse");
+        assert_eq!(result.order_id, "28");
+        assert_eq!(result.status, OrderStatus::Filled);
+        assert_eq!(result.filled_qty, Decimal::new(10, 0));
+        assert_eq!(result.avg_price, Some(Decimal::new(50000, 0)));
+        assert_eq!(result.fee, None);
+        assert_eq!(result.fee_asset, None);
     }
 
     #[test]

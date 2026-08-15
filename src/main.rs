@@ -30,9 +30,10 @@ use arb_scanner::order::binance::{BinanceOrderProvider, BinanceUserDataStream};
 use arb_scanner::order::binance_futures::{BinanceFuturesOrderProvider, BinanceFuturesUserDataStream};
 use arb_scanner::order::kraken::KrakenOrderProvider;
 use arb_scanner::order_manager::{
-    ExchangeAdapter, ExecutionEngine, OrderManager, OrderStreamSource, RedisOrderIdAllocator, RedisOrderStore,
-    RiskEngine, RiskLimits,
+    ExchangeAdapter, ExchangeOrderUpdate, ExecutionEngine, OrderManager, OrderStore, OrderStreamSource,
+    RedisOrderIdAllocator, RedisOrderStore, RiskEngine, RiskLimits,
 };
+use arb_scanner::order_manager::types::OrderId;
 use arb_scanner::portfolio::{PortfolioManager, RedisPnlStore};
 use arb_scanner::position::{PositionManager, RedisPositionStore};
 use arb_scanner::report::channels::LogChannel;
@@ -76,6 +77,9 @@ async fn main() -> anyhow::Result<()> {
     }
     if args.get(1).map(String::as_str) == Some("report") {
         return run_report_command(&args[2..]).await;
+    }
+    if args.get(1).map(String::as_str) == Some("reconcile-order") {
+        return run_reconcile_order_command(&args[2..]).await;
     }
 
     let config_path = args.get(1).cloned().unwrap_or_else(|| "config.toml".to_string());
@@ -475,6 +479,146 @@ async fn run_open_command(args: &[String]) -> anyhow::Result<()> {
 
     let report = live_result?;
     println!("{report:#?}");
+    Ok(())
+}
+
+/// `reconcile-order` 子命令：一次性核对/修正卡在非终态(通常是 `New`)的历史
+/// 订单，用于修复 `process_order` 并发覆盖写这个历史 bug 遗留下来的脏数据
+/// (根因见 manager.rs 里 `process_order` 的注释)。只处理 `binance_spot`/
+/// `binance_futures` 两个场所(Kraken 的 `query_order` 没有实现)。
+///
+/// 默认只读：从 Redis 读订单 -> 按 exchange_order_id 查交易所 REST -> 打印
+/// 结果，不落库。确认输出和交易所后台一致后，加 `--confirm` 重新执行一次
+/// 才会真正调用 `handle_exchange_update` 写回 Redis——这是修改生产数据的一步，
+/// 刻意要求分两次执行、不给默认写权限。
+async fn run_reconcile_order_command(args: &[String]) -> anyhow::Result<()> {
+    let mut order_id: Option<String> = None;
+    let mut testnet = false;
+    let mut confirm = false;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--order-id" => {
+                order_id = Some(args.get(i + 1).context("--order-id requires a value")?.clone());
+                i += 2;
+            }
+            "--testnet" => {
+                testnet = true;
+                i += 1;
+            }
+            "--confirm" => {
+                confirm = true;
+                i += 1;
+            }
+            other => anyhow::bail!("unknown argument '{other}' for 'reconcile-order' subcommand"),
+        }
+    }
+
+    let order_id = OrderId::new(order_id.context("--order-id is required, e.g. --order-id ORD-...")?);
+
+    let redis_url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379/".to_string());
+    info!("reconcile-order: connecting to redis at {redis_url}");
+    let order_store = RedisOrderStore::new(&redis_url).context("failed to connect RedisOrderStore to redis")?;
+    let order_id_allocator =
+        RedisOrderIdAllocator::new(&redis_url).context("failed to connect RedisOrderIdAllocator to redis")?;
+    let (position_manager, portfolio_manager) = build_portfolio_stack(&redis_url, Arc::new(DashMap::new()))?;
+
+    let order = order_store
+        .get(&order_id)
+        .with_context(|| format!("order {order_id} not found in redis"))?;
+    info!(
+        "reconcile-order: 从 Redis 读到订单 venue={} symbol={} status={:?} filled_qty={} avg_price={:?} exchange_order_id={:?}",
+        order.request.venue, order.request.symbol, order.status, order.filled_qty, order.avg_price, order.exchange_order_id
+    );
+
+    let exchange_order_id = order
+        .exchange_order_id
+        .clone()
+        .with_context(|| format!("order {order_id} 没有 exchange_order_id，无法通过 REST 核对"))?;
+
+    let proxy = net::proxy_from_env();
+    let spot_venue = Venue::new("binance_spot");
+    let futures_venue = Venue::new("binance_futures");
+    let provider: Arc<dyn OrderProvider> = if order.request.venue == spot_venue {
+        Arc::new(BinanceOrderProvider::from_env(spot_venue.clone(), testnet, proxy.as_deref())?)
+    } else if order.request.venue == futures_venue {
+        Arc::new(BinanceFuturesOrderProvider::from_env(futures_venue.clone(), testnet, proxy.as_deref())?)
+    } else {
+        anyhow::bail!("reconcile-order: venue {} 不支持 REST 核对(目前只实现了 binance_spot/binance_futures)", order.request.venue);
+    };
+
+    let result = provider
+        .query_order(&order.request.symbol, &exchange_order_id)
+        .await
+        .with_context(|| format!("REST query_order 失败 (exchange_order_id={exchange_order_id})"))?;
+
+    info!(
+        "reconcile-order: REST 查询结果 status={:?} filled_qty={} avg_price={:?} fee={:?} fee_asset={:?}",
+        result.status, result.filled_qty, result.avg_price, result.fee, result.fee_asset
+    );
+    println!("REST query_order result: {result:#?}");
+
+    if !confirm {
+        println!(
+            "只读模式(默认)：以上是 REST 查到的结果，尚未写入 Redis。确认和交易所后台一致后，加 --confirm 重新执行以落库。"
+        );
+        return Ok(());
+    }
+
+    info!("reconcile-order: --confirm 已指定，写入 handle_exchange_update 落库");
+
+    let mut risk_limits = HashMap::new();
+    risk_limits.insert(
+        (order.request.venue.clone(), order.request.symbol.clone()),
+        RiskLimits {
+            max_order_amount: Decimal::MAX,
+            max_position: Decimal::MAX,
+            max_orders_per_window: 3,
+        },
+    );
+    let risk_engine = Arc::new(RiskEngine::new(risk_limits, position_manager));
+
+    let (event_tx, _event_rx) = tokio::sync::mpsc::channel(100);
+    let mut adapters = HashMap::new();
+    adapters.insert(
+        order.request.venue.clone(),
+        Arc::new(ExchangeAdapter::new(order.request.venue.clone(), provider.clone())),
+    );
+    let execution_engine = Arc::new(ExecutionEngine::new(adapters, event_tx.clone()));
+    let order_manager = Arc::new(OrderManager::new(
+        risk_engine,
+        execution_engine,
+        portfolio_manager,
+        event_tx,
+        Arc::new(order_store),
+        Arc::new(order_id_allocator),
+    ));
+
+    order_manager.seed_order(order.clone());
+
+    let ts_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or_default();
+
+    order_manager
+        .handle_exchange_update(ExchangeOrderUpdate {
+            venue: order.request.venue.clone(),
+            client_order_id: order.request.client_order_id.clone(),
+            exchange_order_id: Some(exchange_order_id),
+            status: result.status,
+            filled_qty: result.filled_qty,
+            avg_price: result.avg_price,
+            fee: result.fee,
+            fee_asset: result.fee_asset,
+            ts_ms,
+        })
+        .await;
+
+    let final_order = order_manager.get_order(&order_id);
+    println!("落库后订单状态: {final_order:#?}");
+
     Ok(())
 }
 

@@ -148,6 +148,18 @@ impl OrderProvider for BinanceFuturesOrderProvider {
         let text = self.signed_request(reqwest::Method::POST, "/fapi/v1/order", params).await?;
         parse_order_response(&text)
     }
+
+    /// `GET /fapi/v1/order` 按 orderId 查询，响应字段(orderId/status/
+    /// executedQty/avgPrice)和下单 RESULT 响应一致，直接复用
+    /// `parse_order_response`。用于 `wait_for_fill` 的 REST 兜底核对。
+    async fn query_order(&self, symbol: &Symbol, exchange_order_id: &str) -> anyhow::Result<OrderResult> {
+        let params = vec![
+            ("symbol".to_string(), Self::binance_symbol(symbol)),
+            ("orderId".to_string(), exchange_order_id.to_string()),
+        ];
+        let text = self.signed_request(reqwest::Method::GET, "/fapi/v1/order", params).await?;
+        parse_order_response(&text)
+    }
 }
 
 /// 币安 U 本位合约 User Data Stream 客户端：管理 listenKey 生命周期、维护私有
