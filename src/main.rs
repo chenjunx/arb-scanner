@@ -30,7 +30,8 @@ use arb_scanner::order::binance::{BinanceOrderProvider, BinanceUserDataStream};
 use arb_scanner::order::binance_futures::{BinanceFuturesOrderProvider, BinanceFuturesUserDataStream};
 use arb_scanner::order::kraken::KrakenOrderProvider;
 use arb_scanner::order_manager::{
-    ExchangeAdapter, ExecutionEngine, OrderManager, OrderStreamSource, RedisOrderStore, RiskEngine, RiskLimits,
+    ExchangeAdapter, ExecutionEngine, OrderManager, OrderStreamSource, RedisOrderIdAllocator, RedisOrderStore,
+    RiskEngine, RiskLimits,
 };
 use arb_scanner::portfolio::{PortfolioManager, RedisPnlStore};
 use arb_scanner::position::{PositionManager, RedisPositionStore};
@@ -381,6 +382,8 @@ async fn run_open_command(args: &[String]) -> anyhow::Result<()> {
     let redis_url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379/".to_string());
     info!("open --live: connecting to redis at {redis_url}");
     let order_store = RedisOrderStore::new(&redis_url).context("failed to connect RedisOrderStore to redis")?;
+    let order_id_allocator =
+        RedisOrderIdAllocator::new(&redis_url).context("failed to connect RedisOrderIdAllocator to redis")?;
     let (position_manager, portfolio_manager) = build_portfolio_stack(&redis_url, Arc::new(DashMap::new()))?;
 
     let mut risk_limits = HashMap::new();
@@ -413,6 +416,7 @@ async fn run_open_command(args: &[String]) -> anyhow::Result<()> {
         portfolio_manager,
         event_tx,
         Arc::new(order_store),
+        Arc::new(order_id_allocator),
     ));
 
     let (update_tx, mut update_rx) = tokio::sync::mpsc::channel(100);

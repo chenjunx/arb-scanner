@@ -575,7 +575,9 @@ mod tests {
     use crate::order::types::OrderStatus;
     use crate::order_manager::store::InMemoryOrderStore;
     use crate::order_manager::types::Order;
-    use crate::order_manager::{ExchangeAdapter, ExchangeOrderUpdate, ExecutionEngine, RiskEngine, RiskLimits};
+    use crate::order_manager::{
+        ExchangeAdapter, ExchangeOrderUpdate, ExecutionEngine, InMemoryOrderIdAllocator, RiskEngine, RiskLimits,
+    };
     use crate::portfolio::{InMemoryPnlStore, PortfolioManager};
     use crate::position::{InMemoryPositionStore, PositionManager};
     use crate::wallet::types::{AssetInfo, ChainInfo, DepositAddress};
@@ -797,7 +799,15 @@ mod tests {
 
         let execution_engine = Arc::new(ExecutionEngine::new(adapters, event_tx.clone()));
         let order_store = Arc::new(InMemoryOrderStore::new());
-        let order_manager = Arc::new(OrderManager::new(risk_engine, execution_engine, portfolio, event_tx, order_store));
+        let order_id_allocator = Arc::new(InMemoryOrderIdAllocator::new());
+        let order_manager = Arc::new(OrderManager::new(
+            risk_engine,
+            execution_engine,
+            portfolio,
+            event_tx,
+            order_store,
+            order_id_allocator,
+        ));
 
         LiveEnv { order_manager, event_rx }
     }

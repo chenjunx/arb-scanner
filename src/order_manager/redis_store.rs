@@ -4,10 +4,12 @@ use anyhow::Context;
 use log::warn;
 use redis::Commands;
 
+use super::id_allocator::OrderIdAllocator;
 use super::store::OrderStore;
 use super::types::{Order, OrderId};
 
 const ORDERS_KEY: &str = "arb_scanner:orders";
+const ORDER_SEQ_KEY: &str = "arb_scanner:order_seq";
 
 /// `OrderStore` 的 Redis 实现：单个 Hash(`arb_scanner:orders`)，field=OrderId，
 /// value=JSON。用阻塞式 `redis::Connection` + `Mutex` 而不是异步客户端，因为
@@ -71,6 +73,33 @@ impl OrderStore for RedisOrderStore {
         let result: redis::RedisResult<()> = conn.hset(ORDERS_KEY, order.order_id.to_string(), json);
         if let Err(err) = result {
             warn!("RedisOrderStore: failed to write order_id={}: {err}", order.order_id);
+        }
+    }
+}
+
+/// `OrderIdAllocator` 的 Redis 实现：用 `INCR` 分配跨进程共享的全局序号。
+pub struct RedisOrderIdAllocator {
+    conn: Mutex<redis::Connection>,
+}
+
+impl RedisOrderIdAllocator {
+    /// 立即建连校验可用性，理由同 `RedisOrderStore::new`。
+    pub fn new(redis_url: &str) -> anyhow::Result<Self> {
+        let client = redis::Client::open(redis_url).with_context(|| format!("invalid redis url: {redis_url}"))?;
+        let conn = client.get_connection().with_context(|| format!("failed to connect to redis at {redis_url}"))?;
+        Ok(Self { conn: Mutex::new(conn) })
+    }
+}
+
+impl OrderIdAllocator for RedisOrderIdAllocator {
+    fn next(&self) -> Option<u64> {
+        let mut conn = self.conn.lock().unwrap();
+        match conn.incr(ORDER_SEQ_KEY, 1u64) {
+            Ok(seq) => Some(seq),
+            Err(err) => {
+                warn!("RedisOrderIdAllocator: INCR {ORDER_SEQ_KEY} failed, falling back to local order id: {err}");
+                None
+            }
         }
     }
 }

@@ -10,6 +10,7 @@ use crate::order::types::OrderStatus;
 use crate::portfolio::PortfolioManager;
 
 use super::execution::ExecutionEngine;
+use super::id_allocator::OrderIdAllocator;
 use super::risk::RiskEngine;
 use super::store::OrderStore;
 use super::stream::ExchangeOrderUpdate;
@@ -21,8 +22,11 @@ pub struct OrderManager {
     risk_engine: Arc<RiskEngine>,
     execution_engine: Arc<ExecutionEngine>,
     portfolio: Arc<PortfolioManager>,
-    /// 全局订单计数器，用于生成唯一订单ID
-    next_order_seq: AtomicU64,
+    /// 跨进程共享的订单序号分配器（见 `id_allocator.rs`）
+    order_id_allocator: Arc<dyn OrderIdAllocator>,
+    /// `order_id_allocator` 不可用时的本地兜底计数器，与时间戳组合生成订单ID
+    /// 以降低跨进程碰撞概率（见 `generate_order_id`）
+    fallback_order_seq: AtomicU64,
     /// 订单状态存储，key=OrderId。用 `Arc` 包装以便后台执行任务共享同一份存储。
     orders: Arc<Mutex<HashMap<OrderId, Order>>>,
     /// 下单时透传给交易所的 client_order_id -> 内部 OrderId，用于交易所私有 WS
@@ -44,12 +48,14 @@ impl OrderManager {
         portfolio: Arc<PortfolioManager>,
         event_tx: mpsc::Sender<OrderEvent>,
         order_store: Arc<dyn OrderStore>,
+        order_id_allocator: Arc<dyn OrderIdAllocator>,
     ) -> Self {
         Self {
             risk_engine,
             execution_engine,
             portfolio,
-            next_order_seq: AtomicU64::new(1),
+            order_id_allocator,
+            fallback_order_seq: AtomicU64::new(1),
             orders: Arc::new(Mutex::new(HashMap::new())),
             client_order_index: Arc::new(Mutex::new(HashMap::new())),
             exchange_order_index: Arc::new(Mutex::new(HashMap::new())),
@@ -347,10 +353,22 @@ impl OrderManager {
         self.orders.lock().unwrap().values().cloned().collect()
     }
 
-    /// 生成全局唯一的订单ID
+    /// 生成全局唯一的订单ID。ID 里始终带生成时的毫秒时间戳——即使 Redis 的
+    /// `order_id_allocator` 计数器因为重启/未持久化/被清空而从头计数，新订单
+    /// 的时间戳也和历史订单不同，不会撞上 `RedisOrderStore` 里已有的 Hash
+    /// field 而覆盖历史记录（这才是真正要防的碰撞，而不是序号本身单调）。
+    /// 序号只用来消歧同一毫秒内提交的多笔订单：优先用 `order_id_allocator`
+    /// （跨进程共享，通常是 Redis INCR）；分配失败（如 Redis 断连）时退化为
+    /// 本地计数器。
     fn generate_order_id(&self) -> OrderId {
-        let seq = self.next_order_seq.fetch_add(1, Ordering::SeqCst);
-        OrderId::new(format!("ORD-{:012}", seq))
+        let ts = current_timestamp_ms();
+        match self.order_id_allocator.next() {
+            Some(seq) => OrderId::new(format!("ORD-{ts}-{seq:06}")),
+            None => {
+                let local_seq = self.fallback_order_seq.fetch_add(1, Ordering::SeqCst);
+                OrderId::new(format!("ORD-{ts}-F{local_seq:04}"))
+            }
+        }
     }
 }
 
@@ -367,6 +385,7 @@ mod tests {
     use crate::order::types::{OrderAmount, OrderResult, OrderSide, OrderStatus};
     use crate::order::OrderProvider;
     use crate::order_manager::execution::ExchangeAdapter;
+    use crate::order_manager::id_allocator::InMemoryOrderIdAllocator;
     use crate::order_manager::risk::RiskLimits;
     use crate::order_manager::store::InMemoryOrderStore;
     use crate::portfolio::{InMemoryPnlStore, PortfolioManager};
@@ -445,7 +464,15 @@ mod tests {
 
         let execution_engine = Arc::new(ExecutionEngine::new(adapters, event_tx.clone()));
         let order_store = Arc::new(InMemoryOrderStore::new());
-        let manager = Arc::new(OrderManager::new(risk_engine.clone(), execution_engine, portfolio, event_tx, order_store));
+        let order_id_allocator = Arc::new(InMemoryOrderIdAllocator::new());
+        let manager = Arc::new(OrderManager::new(
+            risk_engine.clone(),
+            execution_engine,
+            portfolio,
+            event_tx,
+            order_store,
+            order_id_allocator,
+        ));
 
         (manager, event_rx, risk_engine)
     }
