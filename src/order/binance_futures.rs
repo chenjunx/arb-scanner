@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::time::Duration;
 
 use anyhow::Context;
@@ -151,14 +152,51 @@ impl OrderProvider for BinanceFuturesOrderProvider {
 
     /// `GET /fapi/v1/order` 按 orderId 查询，响应字段(orderId/status/
     /// executedQty/avgPrice)和下单 RESULT 响应一致，直接复用
-    /// `parse_order_response`。用于 `wait_for_fill` 的 REST 兜底核对。
+    /// `parse_order_response`——但这个接口本身不带手续费(和现货一样，订单
+    /// 汇总查询不给逐笔成交明细)，成交了就再查一次 `GET /fapi/v1/userTrades`
+    /// 补真实手续费；那一步失败不影响这里返回订单状态本身，只是手续费留空，
+    /// 交给 Portfolio 按 `FeeConfig` 估算兜底。用于 `wait_for_fill` 的 REST
+    /// 兜底核对，以及 `reconcile-order` 命令。
     async fn query_order(&self, symbol: &Symbol, exchange_order_id: &str) -> anyhow::Result<OrderResult> {
         let params = vec![
             ("symbol".to_string(), Self::binance_symbol(symbol)),
             ("orderId".to_string(), exchange_order_id.to_string()),
         ];
         let text = self.signed_request(reqwest::Method::GET, "/fapi/v1/order", params).await?;
-        parse_order_response(&text)
+        let mut result = parse_order_response(&text)?;
+
+        if result.fee.is_none() && result.filled_qty > Decimal::ZERO {
+            match self.query_order_fee(symbol, exchange_order_id).await {
+                Ok((fee, fee_asset)) => {
+                    result.fee = fee;
+                    result.fee_asset = fee_asset;
+                }
+                Err(err) => {
+                    warn!(
+                        "query_order: 补查 userTrades 手续费失败(order_id={exchange_order_id})，手续费留空交给估算兜底: {err:#}"
+                    );
+                }
+            }
+        }
+
+        Ok(result)
+    }
+}
+
+impl BinanceFuturesOrderProvider {
+    /// `GET /fapi/v1/userTrades` 按 orderId 查这笔订单的逐笔成交明细，汇总出
+    /// 真实手续费。只在 `query_order` 里、订单确实有成交但拿不到手续费时调用。
+    async fn query_order_fee(
+        &self,
+        symbol: &Symbol,
+        exchange_order_id: &str,
+    ) -> anyhow::Result<(Option<Decimal>, Option<String>)> {
+        let params = vec![
+            ("symbol".to_string(), Self::binance_symbol(symbol)),
+            ("orderId".to_string(), exchange_order_id.to_string()),
+        ];
+        let text = self.signed_request(reqwest::Method::GET, "/fapi/v1/userTrades", params).await?;
+        parse_user_trades_response(&text)
     }
 }
 
@@ -524,6 +562,40 @@ fn parse_order_response(text: &str) -> anyhow::Result<OrderResult> {
 }
 
 #[derive(Debug, Deserialize)]
+struct TradeFill {
+    commission: Decimal,
+    #[serde(rename = "commissionAsset")]
+    commission_asset: String,
+}
+
+/// 按 `commissionAsset` 分组求和；只有单一币种时才认为是可信的单一手续费值
+/// 返回 `Some`，混合多币种时返回 `None`，交给 Portfolio 按 `FeeConfig` 估算
+/// 兜底，不做加权处理(和现货 `binance.rs` 里的同名逻辑一致)。
+fn sum_fee_by_asset(fills: &[TradeFill]) -> (Option<Decimal>, Option<String>) {
+    let mut totals: HashMap<&str, Decimal> = HashMap::new();
+    for fill in fills {
+        *totals.entry(fill.commission_asset.as_str()).or_insert(Decimal::ZERO) += fill.commission;
+    }
+    if totals.len() == 1 {
+        let (asset, total) = totals.into_iter().next().unwrap();
+        (Some(total), Some(asset.to_string()))
+    } else {
+        (None, None)
+    }
+}
+
+/// `GET /fapi/v1/userTrades` 响应是一个成交明细数组，`commission`/
+/// `commissionAsset` 字段名和现货 `myTrades` 一致。
+fn parse_user_trades_response(text: &str) -> anyhow::Result<(Option<Decimal>, Option<String>)> {
+    if let Ok(err) = serde_json::from_str::<ErrorResponse>(text) {
+        anyhow::bail!("binance futures error {}: {}", err.code, err.msg);
+    }
+    let fills: Vec<TradeFill> = serde_json::from_str(text)
+        .with_context(|| format!("failed to parse binance futures userTrades response, raw body: {text}"))?;
+    Ok(sum_fee_by_asset(&fills))
+}
+
+#[derive(Debug, Deserialize)]
 struct IncomeEntry {
     #[serde(rename = "incomeType")]
     income_type: String,
@@ -651,6 +723,27 @@ mod tests {
         let text = r#"{"code":-2019,"msg":"Margin is insufficient."}"#;
         let err = parse_order_response(text).unwrap_err();
         assert!(err.to_string().contains("Margin is insufficient"));
+    }
+
+    /// `GET /fapi/v1/userTrades`(query_order 内部为补手续费而调用的接口)返回
+    /// 的是成交明细数组，字段名和现货 myTrades 一样，按 commissionAsset 汇总
+    /// 求和即可。
+    #[test]
+    fn parses_user_trades_response_and_sums_commission() {
+        let text = r#"[
+            {"symbol":"BTCUSDT","id":1,"orderId":28,"side":"SELL","price":"100.0","qty":"6","realizedPnl":"0","marginAsset":"USDT","quoteQty":"600","commission":"0.006","commissionAsset":"USDT","time":1,"positionSide":"BOTH","buyer":false,"maker":false},
+            {"symbol":"BTCUSDT","id":2,"orderId":28,"side":"SELL","price":"100.0","qty":"4","realizedPnl":"0","marginAsset":"USDT","quoteQty":"400","commission":"0.004","commissionAsset":"USDT","time":1,"positionSide":"BOTH","buyer":false,"maker":false}
+        ]"#;
+        let (fee, fee_asset) = parse_user_trades_response(text).expect("should parse");
+        assert_eq!(fee, Some("0.010".parse().unwrap()));
+        assert_eq!(fee_asset, Some("USDT".to_string()));
+    }
+
+    #[test]
+    fn parse_user_trades_response_surfaces_error_response() {
+        let text = r#"{"code":-1121,"msg":"Invalid symbol."}"#;
+        let err = parse_user_trades_response(text).unwrap_err();
+        assert!(err.to_string().contains("Invalid symbol"));
     }
 
     #[test]
