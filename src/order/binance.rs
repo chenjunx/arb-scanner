@@ -127,16 +127,51 @@ impl OrderProvider for BinanceOrderProvider {
     /// `GET /api/v3/order` 按 orderId 查询。响应不带 `avgPrice`/`fills`，但带
     /// `cummulativeQuoteQty`，`parse_order_response` 本来就是用
     /// `cummulativeQuoteQty / executedQty` 算均价(而不是依赖 `avgPrice` 字段)，
-    /// `fills` 靠 `#[serde(default)]` 缺省为空即可直接复用，缺失的手续费信息
-    /// 交给 Portfolio 按 `FeeConfig` 估算兜底(和下单响应里没有 fills 时的处理
-    /// 方式一致)。用于 `wait_for_fill` 的 REST 兜底核对。
+    /// `fills` 靠 `#[serde(default)]` 缺省为空即可直接复用。这个接口本身不带
+    /// 手续费(币安故意不在订单汇总查询里给逐笔成交明细)，成交了就再查一次
+    /// `GET /api/v3/myTrades` 补真实手续费；那一步失败也不影响这里返回订单
+    /// 状态本身，只是手续费留空，交给 Portfolio 按 `FeeConfig` 估算兜底。
+    /// 用于 `wait_for_fill` 的 REST 兜底核对，以及 `reconcile-order` 命令。
     async fn query_order(&self, symbol: &Symbol, exchange_order_id: &str) -> anyhow::Result<OrderResult> {
         let params = vec![
             ("symbol".to_string(), Self::binance_symbol(symbol)),
             ("orderId".to_string(), exchange_order_id.to_string()),
         ];
         let text = self.signed_request(reqwest::Method::GET, "/api/v3/order", params).await?;
-        parse_order_response(&text)
+        let mut result = parse_order_response(&text)?;
+
+        if result.fee.is_none() && result.filled_qty > Decimal::ZERO {
+            match self.query_order_fee(symbol, exchange_order_id).await {
+                Ok((fee, fee_asset)) => {
+                    result.fee = fee;
+                    result.fee_asset = fee_asset;
+                }
+                Err(err) => {
+                    warn!(
+                        "query_order: 补查 myTrades 手续费失败(order_id={exchange_order_id})，手续费留空交给估算兜底: {err:#}"
+                    );
+                }
+            }
+        }
+
+        Ok(result)
+    }
+}
+
+impl BinanceOrderProvider {
+    /// `GET /api/v3/myTrades` 按 orderId 查这笔订单的逐笔成交明细，汇总出真实
+    /// 手续费。只在 `query_order` 里、订单确实有成交但拿不到手续费时调用。
+    async fn query_order_fee(
+        &self,
+        symbol: &Symbol,
+        exchange_order_id: &str,
+    ) -> anyhow::Result<(Option<Decimal>, Option<String>)> {
+        let params = vec![
+            ("symbol".to_string(), Self::binance_symbol(symbol)),
+            ("orderId".to_string(), exchange_order_id.to_string()),
+        ];
+        let text = self.signed_request(reqwest::Method::GET, "/api/v3/myTrades", params).await?;
+        parse_my_trades_response(&text)
     }
 }
 
@@ -266,6 +301,18 @@ fn parse_order_response(text: &str) -> anyhow::Result<OrderResult> {
         fee,
         fee_asset,
     })
+}
+
+/// `GET /api/v3/myTrades` 响应是一个成交明细数组，每一项的 `commission`/
+/// `commissionAsset` 字段名和下单响应里 `fills` 数组的字段完全一样，直接复用
+/// `OrderFill`/`sum_fee_by_asset`。
+fn parse_my_trades_response(text: &str) -> anyhow::Result<(Option<Decimal>, Option<String>)> {
+    if let Ok(err) = serde_json::from_str::<ErrorResponse>(text) {
+        anyhow::bail!("binance error {}: {}", err.code, err.msg);
+    }
+    let fills: Vec<OrderFill> = serde_json::from_str(text)
+        .with_context(|| format!("failed to parse binance myTrades response, raw body: {text}"))?;
+    Ok(sum_fee_by_asset(&fills))
 }
 
 /// 币安现货 User Data Stream 客户端：在 WS API 连接内做 `session.logon`
@@ -746,6 +793,27 @@ mod tests {
         assert_eq!(result.avg_price, Some(Decimal::new(50000, 0)));
         assert_eq!(result.fee, None);
         assert_eq!(result.fee_asset, None);
+    }
+
+    /// `GET /api/v3/myTrades`(query_order 内部为补手续费而调用的接口)返回的是
+    /// 成交明细数组，字段名和下单响应里的 `fills` 一样，按 commissionAsset
+    /// 汇总求和即可。
+    #[test]
+    fn parses_my_trades_response_and_sums_commission() {
+        let text = r#"[
+            {"symbol":"BTCUSDT","id":1,"orderId":28,"orderListId":-1,"price":"50000.00","qty":"6.00000000","quoteQty":"300000.00","commission":"0.006","commissionAsset":"BNB","time":1507725176595,"isBuyer":true,"isMaker":false,"isBestMatch":true},
+            {"symbol":"BTCUSDT","id":2,"orderId":28,"orderListId":-1,"price":"50000.00","qty":"4.00000000","quoteQty":"200000.00","commission":"0.004","commissionAsset":"BNB","time":1507725176595,"isBuyer":true,"isMaker":false,"isBestMatch":true}
+        ]"#;
+        let (fee, fee_asset) = parse_my_trades_response(text).expect("should parse");
+        assert_eq!(fee, Some("0.010".parse().unwrap()));
+        assert_eq!(fee_asset, Some("BNB".to_string()));
+    }
+
+    #[test]
+    fn parse_my_trades_response_surfaces_error_response() {
+        let text = r#"{"code":-1121,"msg":"Invalid symbol."}"#;
+        let err = parse_my_trades_response(text).unwrap_err();
+        assert!(err.to_string().contains("Invalid symbol"));
     }
 
     #[test]
