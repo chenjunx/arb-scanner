@@ -1,3 +1,4 @@
+pub mod accounting;
 pub mod config;
 pub mod engine;
 pub mod exchange_info;
@@ -10,6 +11,7 @@ pub mod order_manager;
 pub mod portfolio;
 pub mod position;
 pub mod ratelimit;
+pub mod report;
 pub mod scan;
 pub mod sink;
 pub mod strategy;

@@ -11,6 +11,7 @@ use crate::portfolio::PortfolioManager;
 
 use super::execution::ExecutionEngine;
 use super::risk::RiskEngine;
+use super::store::OrderStore;
 use super::stream::ExchangeOrderUpdate;
 use super::types::{Order, OrderEvent, OrderId, OrderRequest, OrderResponse, RiskCheckResult};
 
@@ -32,6 +33,8 @@ pub struct OrderManager {
     exchange_order_index: Arc<Mutex<HashMap<String, OrderId>>>,
     /// 事件发布通道，策略通过订阅这个通道接收订单事件
     event_tx: mpsc::Sender<OrderEvent>,
+    /// 订单历史持久化，每次 `orders` map 更新后同步 upsert 一份。
+    order_store: Arc<dyn OrderStore>,
 }
 
 impl OrderManager {
@@ -40,6 +43,7 @@ impl OrderManager {
         execution_engine: Arc<ExecutionEngine>,
         portfolio: Arc<PortfolioManager>,
         event_tx: mpsc::Sender<OrderEvent>,
+        order_store: Arc<dyn OrderStore>,
     ) -> Self {
         Self {
             risk_engine,
@@ -50,6 +54,7 @@ impl OrderManager {
             client_order_index: Arc::new(Mutex::new(HashMap::new())),
             exchange_order_index: Arc::new(Mutex::new(HashMap::new())),
             event_tx,
+            order_store,
         }
     }
 
@@ -93,6 +98,7 @@ impl OrderManager {
 
         // 存储订单状态
         self.orders.lock().unwrap().insert(order_id.clone(), order.clone());
+        self.order_store.upsert(order.clone());
 
         // 发送 Submitted 事件
         let _ = self.event_tx.send(OrderEvent::Submitted {
@@ -105,6 +111,7 @@ impl OrderManager {
         let orders = self.orders.clone();
         let exchange_order_index = self.exchange_order_index.clone();
         let event_tx = self.event_tx.clone();
+        let order_store = self.order_store.clone();
 
         tokio::spawn(async move {
             let result = Self::process_order(
@@ -114,6 +121,7 @@ impl OrderManager {
                 orders,
                 exchange_order_index,
                 event_tx,
+                order_store,
             ).await;
             let _ = result_tx.send(result);
         });
@@ -132,6 +140,7 @@ impl OrderManager {
         orders: Arc<Mutex<HashMap<OrderId, Order>>>,
         exchange_order_index: Arc<Mutex<HashMap<String, OrderId>>>,
         event_tx: mpsc::Sender<OrderEvent>,
+        order_store: Arc<dyn OrderStore>,
     ) -> Result<Order, String> {
         // 1. 风控检查
         let risk_result = risk_engine.check(
@@ -152,6 +161,7 @@ impl OrderManager {
 
                 // 更新存储
                 orders.lock().unwrap().insert(updated_order.order_id.clone(), updated_order.clone());
+                order_store.upsert(updated_order.clone());
 
                 // 发送拒绝事件
                 let _ = event_tx.send(OrderEvent::RejectedByRisk {
@@ -189,6 +199,7 @@ impl OrderManager {
 
         // 4. 更新订单状态存储
         orders.lock().unwrap().insert(executed_order.order_id.clone(), executed_order.clone());
+        order_store.upsert(executed_order.clone());
 
         if executed_order.status == OrderStatus::Rejected {
             Err(executed_order.reject_reason.unwrap_or_else(|| "unknown rejection".to_string()))
@@ -269,10 +280,12 @@ impl OrderManager {
                 order.status,
                 order.filled_qty,
                 order.avg_price,
+                order.clone(),
             )
         };
 
-        let (venue, symbol, side, fill_delta, status, filled_qty, avg_price) = applied;
+        let (venue, symbol, side, fill_delta, status, filled_qty, avg_price, updated_order) = applied;
+        self.order_store.upsert(updated_order);
 
         if fill_delta > Decimal::ZERO {
             let outcome = self.risk_engine.on_filled(&venue, &symbol, side, fill_delta, avg_price, update.ts_ms);
@@ -355,6 +368,7 @@ mod tests {
     use crate::order::OrderProvider;
     use crate::order_manager::execution::ExchangeAdapter;
     use crate::order_manager::risk::RiskLimits;
+    use crate::order_manager::store::InMemoryOrderStore;
     use crate::portfolio::{InMemoryPnlStore, PortfolioManager};
     use crate::position::{InMemoryPositionStore, PositionManager};
     use crate::types::{Symbol, Venue};
@@ -438,7 +452,8 @@ mod tests {
         adapters.insert(venue.clone(), adapter);
 
         let execution_engine = Arc::new(ExecutionEngine::new(adapters, event_tx.clone()));
-        let manager = Arc::new(OrderManager::new(risk_engine.clone(), execution_engine, portfolio, event_tx));
+        let order_store = Arc::new(InMemoryOrderStore::new());
+        let manager = Arc::new(OrderManager::new(risk_engine.clone(), execution_engine, portfolio, event_tx, order_store));
 
         (manager, event_rx, risk_engine)
     }

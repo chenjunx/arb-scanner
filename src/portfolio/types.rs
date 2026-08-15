@@ -1,9 +1,10 @@
 use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
 
 use crate::types::{Symbol, Venue};
 
 /// 单个 (venue, symbol) 的已实现盈亏/手续费累计。
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct VenuePnl {
     pub venue: Venue,
     pub symbol: Symbol,
@@ -14,6 +15,11 @@ pub struct VenuePnl {
     /// true 不会被后续的真实值覆盖回 false。
     pub fee_is_estimated: bool,
     pub trade_count: u64,
+    /// 永续合约资金费累计(正=收到，负=支付)，由 `accounting::FundingFeeTracker`
+    /// 定期轮询交易所资金费流水写入。`#[serde(default)]` 兼容旧的、没有这个
+    /// 字段的 Redis 记录。
+    #[serde(default)]
+    pub funding_pnl: Decimal,
     pub updated_at_ms: u64,
 }
 
@@ -26,6 +32,7 @@ impl VenuePnl {
             fees_paid: Decimal::ZERO,
             fee_is_estimated: false,
             trade_count: 0,
+            funding_pnl: Decimal::ZERO,
             updated_at_ms: 0,
         }
     }
@@ -37,11 +44,13 @@ pub struct AssetPnlSummary {
     pub asset: String,
     pub realized_pnl: Decimal,
     pub fees_paid: Decimal,
+    /// 永续合约资金费累计(正=收到，负=支付)。
+    pub funding_pnl: Decimal,
     /// 来自 `asset_valuation()` 的浮动盈亏；缺行情时为 None，不当 0 处理。
     pub unrealized_pnl: Option<Decimal>,
-    /// `realized_pnl - fees_paid + unrealized_pnl.unwrap_or(0)`；缺行情时仍然
-    /// 给出这个值(只是不含浮动部分)，并靠 unrealized_pnl=None 提示调用方
-    /// "这不是全量"。
+    /// `realized_pnl - fees_paid + funding_pnl + unrealized_pnl.unwrap_or(0)`；
+    /// 缺行情时仍然给出这个值(只是不含浮动部分)，并靠 unrealized_pnl=None 提示
+    /// 调用方"这不是全量"。
     pub net_pnl: Decimal,
 }
 

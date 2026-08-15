@@ -78,6 +78,7 @@ mod tests {
                     fees_paid: Decimal::ZERO,
                     fee_is_estimated: false,
                     trade_count: 1,
+                    funding_pnl: Decimal::ZERO,
                     updated_at_ms: 1,
                 }
             }),

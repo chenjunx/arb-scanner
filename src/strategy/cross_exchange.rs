@@ -38,7 +38,7 @@ impl CrossExchangeStrategy {
 }
 
 /// 给定买/卖两侧的价格和各自手续费，返回扣费后的价差(基点)。买价 <= 0 时返回
-/// `None`(报价还没来)。`on_update` 和 `monitor` 子命令的 periodic 模式共用这份算法。
+/// `None`(报价还没来)。供 `on_update` 使用。
 pub fn compute_profit_bps(
     buy_ask: Decimal,
     buy_fee: FeeSchedule,

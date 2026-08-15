@@ -1,4 +1,5 @@
 use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::oneshot;
 
@@ -6,7 +7,7 @@ use crate::order::types::{OrderAmount, OrderSide, OrderStatus};
 use crate::types::{Symbol, Venue};
 
 /// 订单唯一标识符，由 OrderManager 生成
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct OrderId(pub Arc<str>);
 
 impl OrderId {
@@ -22,7 +23,7 @@ impl std::fmt::Display for OrderId {
 }
 
 /// 策略提交的订单请求
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrderRequest {
     /// 策略名称，用于跟踪和风控
     pub strategy_name: String,
@@ -43,7 +44,7 @@ pub struct OrderRequest {
 }
 
 /// 经过 OrderManager 增强后的内部订单
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Order {
     /// 内部订单ID
     pub order_id: OrderId,

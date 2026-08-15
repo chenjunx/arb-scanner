@@ -1,10 +1,11 @@
 use std::sync::Arc;
 
 use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
 
 /// 交易所/交易场所标识，如 "binance"、"okx"。用字符串封装而非枚举，
 /// 便于在不改动核心代码的情况下接入任意新的场所。
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct Venue(pub Arc<str>);
 
 impl Venue {
@@ -24,7 +25,7 @@ impl std::fmt::Display for Venue {
 }
 
 /// 交易对，如 base=BTC quote=USDT。
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct Symbol {
     pub base: Arc<str>,
     pub quote: Arc<str>,

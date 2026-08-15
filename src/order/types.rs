@@ -1,8 +1,9 @@
 use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
 
 use crate::types::Symbol;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OrderSide {
     Buy,
     Sell,
@@ -12,7 +13,7 @@ pub enum OrderSide {
 /// `quoteOrderQty`)。后者下单前不知道精确的基础币数量，买/卖多少基础币由
 /// 交易所按下单那一刻的价格决定。目前只有 `order::binance::BinanceOrderProvider`
 /// (现货)支持 `Quote`，其它交易所收到 `Quote` 会报错，见 `OrderProvider` trait 说明。
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum OrderAmount {
     Base(Decimal),
     Quote(Decimal),
@@ -41,7 +42,7 @@ pub struct MarketOrderRequest {
     pub dry_run: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OrderStatus {
     New,
     PartiallyFilled,

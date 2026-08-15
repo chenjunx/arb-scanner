@@ -87,26 +87,46 @@ impl PortfolioManager {
         self.pnl_store.get(venue, symbol)
     }
 
-    /// 按 base 资产聚合已实现盈亏/手续费，并拼上 `asset_valuation` 算出的浮动
-    /// 盈亏。`unrealized_pnl` 缺行情时为 `None`，`net_pnl` 仍然给出不含浮动
-    /// 部分的值。
+    /// 永续合约资金费到账后调用(由 `accounting::FundingFeeTracker` 定期轮询交易
+    /// 所资金费流水后转发)：`amount` 正=收到、负=支付，累加进 `PnlStore` 的
+    /// `funding_pnl`，不影响 `trade_count`(那是成交笔数，资金费不是成交)。
+    pub fn record_funding_fee(&self, venue: &Venue, symbol: &Symbol, amount: Decimal, ts_ms: u64) {
+        let venue_for_closure = venue.clone();
+        let symbol_for_closure = symbol.clone();
+        self.pnl_store.update(
+            venue,
+            symbol,
+            Box::new(move |current| {
+                let mut pnl =
+                    current.unwrap_or_else(|| VenuePnl::flat(venue_for_closure.clone(), symbol_for_closure.clone()));
+                pnl.funding_pnl += amount;
+                pnl.updated_at_ms = ts_ms;
+                pnl
+            }),
+        );
+    }
+
+    /// 按 base 资产聚合已实现盈亏/手续费/资金费，并拼上 `asset_valuation` 算出
+    /// 的浮动盈亏。`unrealized_pnl` 缺行情时为 `None`，`net_pnl` 仍然给出不含
+    /// 浮动部分的值。
     pub fn asset_pnl(&self, asset: &str) -> AssetPnlSummary {
-        let (realized_pnl, fees_paid) = self
+        let (realized_pnl, fees_paid, funding_pnl) = self
             .pnl_store
             .all()
             .into_iter()
             .filter(|p| p.symbol.base.as_ref().eq_ignore_ascii_case(asset))
-            .fold((Decimal::ZERO, Decimal::ZERO), |(realized, fees), p| {
-                (realized + p.realized_pnl, fees + p.fees_paid)
+            .fold((Decimal::ZERO, Decimal::ZERO, Decimal::ZERO), |(realized, fees, funding), p| {
+                (realized + p.realized_pnl, fees + p.fees_paid, funding + p.funding_pnl)
             });
 
         let unrealized_pnl = self.asset_valuation(asset).unrealized_pnl;
-        let net_pnl = realized_pnl - fees_paid + unrealized_pnl.unwrap_or(Decimal::ZERO);
+        let net_pnl = realized_pnl - fees_paid + funding_pnl + unrealized_pnl.unwrap_or(Decimal::ZERO);
 
         AssetPnlSummary {
             asset: asset.to_string(),
             realized_pnl,
             fees_paid,
+            funding_pnl,
             unrealized_pnl,
             net_pnl,
         }
@@ -416,5 +436,34 @@ mod tests {
         assert_eq!(summary.fees_paid, Decimal::new(8, 0));
         assert_eq!(summary.unrealized_pnl, None);
         assert_eq!(summary.net_pnl, Decimal::new(142, 0));
+    }
+
+    #[test]
+    fn record_funding_fee_accumulates_and_updates_timestamp() {
+        let (portfolio, _pm) = manager();
+        portfolio.record_funding_fee(&venue(), &symbol(), Decimal::new(-5, 1), 1);
+        portfolio.record_funding_fee(&venue(), &symbol(), Decimal::new(8, 1), 2);
+
+        let pnl = portfolio.venue_pnl(&venue(), &symbol()).unwrap();
+        assert_eq!(pnl.funding_pnl, Decimal::new(3, 1));
+        assert_eq!(pnl.updated_at_ms, 2);
+        // 资金费不是成交，不应该影响 trade_count/fees_paid/realized_pnl
+        assert_eq!(pnl.trade_count, 0);
+        assert_eq!(pnl.fees_paid, Decimal::ZERO);
+        assert_eq!(pnl.realized_pnl, Decimal::ZERO);
+    }
+
+    #[test]
+    fn asset_pnl_includes_funding_pnl_in_net_pnl() {
+        let (portfolio, _pm) = manager();
+        let binance = Venue::new("binance_spot");
+        let futures = Venue::new("binance_futures");
+        portfolio.record_fill(&binance, &symbol(), Decimal::ONE, Some(Decimal::new(50000, 0)), Some(Decimal::new(5, 0)), Decimal::new(100, 0), 1);
+        portfolio.record_funding_fee(&futures, &symbol(), Decimal::new(-15, 1), 2);
+
+        let summary = portfolio.asset_pnl("BTC");
+        assert_eq!(summary.funding_pnl, Decimal::new(-15, 1));
+        // net_pnl = realized_pnl(100) - fees_paid(5) + funding_pnl(-1.5) = 93.5
+        assert_eq!(summary.net_pnl, Decimal::new(935, 1));
     }
 }

@@ -1,12 +1,15 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
+use dashmap::DashMap;
 use futures_util::StreamExt;
 use futures_util::stream;
 use log::info;
 use rust_decimal::Decimal;
 
+use arb_scanner::accounting::{FundingFeeProvider, FundingFeeTracker, RedisFundingCursorStore};
 use arb_scanner::config::{AppConfig, ScanConfig, VenueConfig};
 use arb_scanner::engine::ArbitrageEngine;
 use arb_scanner::exchange_info::ExchangeInfoProvider;
@@ -17,20 +20,28 @@ use arb_scanner::execution;
 use arb_scanner::logging;
 use arb_scanner::market_data::MarketDataSource;
 use arb_scanner::market_data::binance::BinanceSpotSource;
+use arb_scanner::market_data::binance_futures::BinanceFuturesSource;
 use arb_scanner::market_data::kraken::KrakenSpotSource;
 use arb_scanner::market_data::mock::{MockSource, MockSymbolConfig};
 use arb_scanner::net;
 use arb_scanner::order::OrderProvider;
-use arb_scanner::order::binance::BinanceOrderProvider;
-use arb_scanner::order::binance_futures::BinanceFuturesOrderProvider;
+use arb_scanner::order::binance::{BinanceOrderProvider, BinanceUserDataStream};
+use arb_scanner::order::binance_futures::{BinanceFuturesOrderProvider, BinanceFuturesUserDataStream};
 use arb_scanner::order::kraken::KrakenOrderProvider;
+use arb_scanner::order_manager::{
+    ExchangeAdapter, ExecutionEngine, OrderManager, OrderStreamSource, RedisOrderStore, RiskEngine, RiskLimits,
+};
+use arb_scanner::portfolio::{PortfolioManager, RedisPnlStore};
+use arb_scanner::position::{PositionManager, RedisPositionStore};
+use arb_scanner::report::channels::LogChannel;
+use arb_scanner::report::{OrderSection, PortfolioSection, PositionSection, ReportChannel, ReportTracker};
 use arb_scanner::scan;
 use arb_scanner::sink::OpportunitySink;
 use arb_scanner::sink::log_sink::LogSink;
-use arb_scanner::strategy::cross_exchange::{CrossExchangeStrategy, compute_profit_bps};
+use arb_scanner::strategy::cross_exchange::CrossExchangeStrategy;
 use arb_scanner::strategy::triangular::{LegSide, TriangularLeg, TriangularPath, TriangularStrategy};
 use arb_scanner::strategy::{FeeSchedule, Strategy};
-use arb_scanner::types::{Symbol, Venue};
+use arb_scanner::types::{Quote, Symbol, Venue};
 use arb_scanner::wallet::binance::BinanceWalletProvider;
 use arb_scanner::wallet::kraken::KrakenWalletProvider;
 
@@ -57,6 +68,12 @@ async fn main() -> anyhow::Result<()> {
     }
     if args.get(1).map(String::as_str) == Some("monitor") {
         return run_monitor_command(&args[2..]).await;
+    }
+    if args.get(1).map(String::as_str) == Some("accounting") {
+        return run_accounting_command(&args[2..]).await;
+    }
+    if args.get(1).map(String::as_str) == Some("report") {
+        return run_report_command(&args[2..]).await;
     }
 
     let config_path = args.get(1).cloned().unwrap_or_else(|| "config.toml".to_string());
@@ -171,6 +188,31 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// 连 Redis 建出 `PositionManager`/`PortfolioManager` 这套仓位/组合盈亏技术栈，
+/// 供 `open --live`/`monitor`/`accounting`/`report` 共用，避免各自重复一遍
+/// "连 Redis -> RedisPositionStore/RedisPnlStore -> PositionManager/PortfolioManager"
+/// 的引导代码。`quote_cache` 由调用方决定：不需要浮动盈亏(纯记账场景)传空
+/// `Arc::new(DashMap::new())`，需要 mark-to-market 就传接了实时行情的
+/// `ArbitrageEngine::shared_cache()`。手续费配置固定用空 `HashMap`(按
+/// `FeeConfig::default()` 估算)，目前没有命令需要自定义。
+fn build_portfolio_stack(
+    redis_url: &str,
+    quote_cache: Arc<DashMap<(Venue, Symbol), Quote>>,
+) -> anyhow::Result<(Arc<PositionManager>, Arc<PortfolioManager>)> {
+    let position_store =
+        RedisPositionStore::new(redis_url).context("failed to connect RedisPositionStore to redis")?;
+    let pnl_store = RedisPnlStore::new(redis_url).context("failed to connect RedisPnlStore to redis")?;
+
+    let position_manager = Arc::new(PositionManager::new(Arc::new(position_store)));
+    let portfolio_manager = Arc::new(PortfolioManager::new(
+        position_manager.clone(),
+        Arc::new(pnl_store),
+        quote_cache,
+        HashMap::new(),
+    ));
+    Ok((position_manager, portfolio_manager))
+}
+
 /// `open` 子命令：手动触发一次"币安现货按 USDT 金额买入 -> 币安 U 本位合约等量
 /// 做空对冲 -> 买入量的一半划转到 Kraken 现货"流程。不接入 engine 主循环，
 /// 也不读取 `config.toml`，参数全部来自命令行。
@@ -187,6 +229,8 @@ async fn run_open_command(args: &[String]) -> anyhow::Result<()> {
     let mut client_order_id_prefix: Option<String> = None;
     let mut from_transfer = false;
     let mut filled_qty: Option<Decimal> = None;
+    let mut transfer_to_kraken = false;
+    let mut fill_timeout_secs: u64 = 60;
 
     let mut i = 0;
     while i < args.len() {
@@ -237,6 +281,15 @@ async fn run_open_command(args: &[String]) -> anyhow::Result<()> {
                 filled_qty = Some(v.parse().context("--filled-qty must be a valid decimal number")?);
                 i += 2;
             }
+            "--transfer-to-kraken" => {
+                transfer_to_kraken = true;
+                i += 1;
+            }
+            "--fill-timeout-secs" => {
+                let v = args.get(i + 1).context("--fill-timeout-secs requires a value")?;
+                fill_timeout_secs = v.parse().context("--fill-timeout-secs must be a valid non-negative integer")?;
+                i += 2;
+            }
             other => anyhow::bail!("unknown argument '{other}' for 'open' subcommand"),
         }
     }
@@ -279,35 +332,122 @@ async fn run_open_command(args: &[String]) -> anyhow::Result<()> {
     let symbol = symbol.context("--symbol is required, e.g. --symbol BTC/USDT")?;
     let quote_amount = amount.context("--amount is required, e.g. --amount 1000")?;
     let transfer_asset = asset.unwrap_or_else(|| symbol.base.to_string());
+    let spot_venue = Venue::new("binance_spot");
+    let futures_venue = Venue::new("binance_futures");
 
     let proxy = net::proxy_from_env();
-    let spot = BinanceOrderProvider::from_env(Venue::new("binance_spot"), testnet, proxy.as_deref())?;
-    let futures = BinanceFuturesOrderProvider::from_env(Venue::new("binance_futures"), testnet, proxy.as_deref())?;
+    let spot: Arc<dyn OrderProvider> =
+        Arc::new(BinanceOrderProvider::from_env(spot_venue.clone(), testnet, proxy.as_deref())?);
+    let futures: Arc<dyn OrderProvider> =
+        Arc::new(BinanceFuturesOrderProvider::from_env(futures_venue.clone(), testnet, proxy.as_deref())?);
     let binance_wallet = BinanceWalletProvider::from_env(Venue::new("binance"), testnet, proxy.as_deref())?;
     let kraken_wallet = KrakenWalletProvider::from_env(Venue::new("kraken"), proxy.as_deref())?;
 
     info!(
-        "open: symbol={symbol} amount={quote_amount} transfer_asset={transfer_asset} testnet={testnet} dry_run={dry_run}"
+        "open: symbol={symbol} amount={quote_amount} transfer_asset={transfer_asset} testnet={testnet} dry_run={dry_run} transfer_to_kraken={transfer_to_kraken}"
     );
+
     if dry_run {
         info!("open: dry_run=true (default), pass --live to actually place orders/withdraw");
+        let report = execution::open_hedged_position_dry_run(
+            spot.as_ref(),
+            execution::OpenPositionParams {
+                symbol,
+                quote_amount,
+                transfer_asset,
+                client_order_id_prefix,
+                dry_run,
+                transfer_to_kraken,
+                fill_timeout: Duration::from_secs(fill_timeout_secs),
+            },
+        )
+        .await?;
+        println!("{report:#?}");
+        return Ok(());
     }
 
-    let report = execution::open_hedged_position(
-        &spot,
-        &futures,
+    // --live：两条腿都要走完整的 OrderManager 流水线(风控 -> 执行引擎 -> 交易所
+    // 私有 WS 成交确认)，成交结果才会真正落进 PositionManager/PortfolioManager。
+    // Redis 连不上直接快速失败，不能等下单后才发现存不进去。
+    let redis_url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379/".to_string());
+    info!("open --live: connecting to redis at {redis_url}");
+    let order_store = RedisOrderStore::new(&redis_url).context("failed to connect RedisOrderStore to redis")?;
+    let (position_manager, portfolio_manager) = build_portfolio_stack(&redis_url, Arc::new(DashMap::new()))?;
+
+    let mut risk_limits = HashMap::new();
+    risk_limits.insert(
+        (spot_venue.clone(), symbol.clone()),
+        RiskLimits {
+            max_order_amount: quote_amount,
+            max_position: Decimal::MAX,
+            max_orders_per_window: 3,
+        },
+    );
+    risk_limits.insert(
+        (futures_venue.clone(), symbol.clone()),
+        RiskLimits {
+            max_order_amount: Decimal::MAX,
+            max_position: Decimal::MAX,
+            max_orders_per_window: 3,
+        },
+    );
+    let risk_engine = Arc::new(RiskEngine::new(risk_limits, position_manager));
+
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(100);
+    let mut adapters = HashMap::new();
+    adapters.insert(spot_venue.clone(), Arc::new(ExchangeAdapter::new(spot_venue.clone(), spot.clone())));
+    adapters.insert(futures_venue.clone(), Arc::new(ExchangeAdapter::new(futures_venue.clone(), futures.clone())));
+    let execution_engine = Arc::new(ExecutionEngine::new(adapters, event_tx.clone()));
+    let order_manager = Arc::new(OrderManager::new(
+        risk_engine,
+        execution_engine,
+        portfolio_manager,
+        event_tx,
+        Arc::new(order_store),
+    ));
+
+    let (update_tx, mut update_rx) = tokio::sync::mpsc::channel(100);
+    let spot_stream = BinanceUserDataStream::from_env(spot_venue.clone(), testnet, proxy.as_deref())
+        .context("failed to start binance spot user data stream")?;
+    let futures_stream = BinanceFuturesUserDataStream::from_env(futures_venue.clone(), testnet, proxy.as_deref())
+        .context("failed to start binance futures user data stream")?;
+    let spot_stream_handle = Box::new(spot_stream).spawn(update_tx.clone());
+    let futures_stream_handle = Box::new(futures_stream).spawn(update_tx.clone());
+    drop(update_tx);
+
+    let forward_handle = {
+        let order_manager = order_manager.clone();
+        tokio::spawn(async move {
+            while let Some(update) = update_rx.recv().await {
+                order_manager.handle_exchange_update(update).await;
+            }
+        })
+    };
+
+    let live_result = execution::open_hedged_position_live(
+        spot.as_ref(),
+        futures.as_ref(),
         &binance_wallet,
         &kraken_wallet,
+        order_manager.as_ref(),
+        &mut event_rx,
         execution::OpenPositionParams {
             symbol,
             quote_amount,
             transfer_asset,
             client_order_id_prefix,
             dry_run,
+            transfer_to_kraken,
+            fill_timeout: Duration::from_secs(fill_timeout_secs),
         },
     )
-    .await?;
+    .await;
 
+    spot_stream_handle.abort();
+    futures_stream_handle.abort();
+    forward_handle.abort();
+
+    let report = live_result?;
     println!("{report:#?}");
     Ok(())
 }
@@ -583,38 +723,30 @@ async fn run_scan_command(args: &[String]) -> anyhow::Result<()> {
 /// 和 `scan/mod.rs` 里 `KRAKEN_WALLET_CONCURRENCY` 同样的考虑。
 const FEE_QUERY_CONCURRENCY: usize = 4;
 
-/// `monitor` 命令的两种运行模式，通过 `--mode` 互斥选择。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MonitorMode {
-    /// 事件驱动，只在扣费后价差 >= `--min-profit-bps` 时打印(默认，historic 行为)。
-    PositiveOnly,
-    /// 定时器驱动，每隔 `--periodic-interval-secs` 打印一次所有监控币种的双向价差，
-    /// 不管正负，只额外标注是否达到 `--min-profit-bps` 阈值。
-    Periodic,
-}
-
-/// `monitor` 子命令：复用 `scan::find_overlap` 筛出的币安/Kraken 交集币种，持续监控
-/// 两边现货价差。每个币的手续费用 [`ExchangeInfoProvider::spot_trading_fee`] 查询两边
-/// 真实账户 taker 费率(而不是固定值)，币安这边再乘上 `config.toml` `[[venues]]` 里
-/// 币安条目的 `fee_discount` 折扣(如 BNB 抵扣手续费，默认 1 不打折，见
-/// [`VenueConfig::load_fee_discount`])，Kraken 不打折。
+/// `monitor` 子命令：复用 `scan::find_overlap` 筛出的币安/Kraken 交集币种，接入现成的
+/// 行情源 + `CrossExchangeStrategy` + `LogSink` 管线，持续监控两边现货价差。每个币的
+/// 手续费用 [`ExchangeInfoProvider::spot_trading_fee`] 查询两边真实账户 taker 费率(而
+/// 不是固定值)，币安这边再乘上 `config.toml` `[[venues]]` 里币安条目的 `fee_discount`
+/// 折扣(如 BNB 抵扣手续费，默认 1 不打折，见 [`VenueConfig::load_fee_discount`])，
+/// Kraken 不打折。扣费后价差只要 >= `--min-profit-bps`(默认 0，即扣费后为正)就打印。
 ///
-/// `--mode`(默认 `positive-only`)控制打印方式:
-/// - `positive-only`:接入现成的 `CrossExchangeStrategy` + `LogSink` 管线，只在扣费后
-///   价差 >= `--min-profit-bps`(默认 0，即扣费后为正)时打印。
-/// - `periodic`:不注册任何 `Strategy`/`Sink`，改为在独立的定时任务里，每隔
-///   `--periodic-interval-secs`(默认 5)读一次引擎的行情缓存快照，为每个监控币打印
-///   双向价差(不管正负)，并标注 `profitable` 是否达到 `--min-profit-bps` 阈值。
+/// `CrossExchangeStrategy` 的手续费 map 不区分 symbol，因此给每个币单独构造一个只监控
+/// 该币、只装这个币真实手续费的 `CrossExchangeStrategy` 实例，而不是像默认主流程那样
+/// 所有 symbol 共享一份手续费配置。不接入 `config.toml` 驱动的默认主循环。
 ///
-/// `positive-only` 模式下 `CrossExchangeStrategy` 的手续费 map 不区分 symbol，因此给
-/// 每个币单独构造一个只监控该币、只装这个币真实手续费的 `CrossExchangeStrategy` 实例，
-/// 而不是像默认主流程那样所有 symbol 共享一份手续费配置。不接入 `config.toml` 驱动的
-/// 默认主循环。
+/// 除非传了 `--no-portfolio`，否则默认把仓位/组合盈亏/资金费/定期报告这几个"基础服务"
+/// 一起跑起来：额外起一个 `BinanceFuturesSource` 把期货行情喂进
+/// `ArbitrageEngine::shared_cache()`，供 `PortfolioManager` 做 mark-to-market；连接 Redis
+/// 读取 `open`/`close` 写入的仓位并持续追踪；起 `FundingFeeTracker`/`ReportTracker` 定期
+/// 结算资金费、打印报告。Redis 连不上时直接报错退出(和 `accounting`/`report` 现有行为
+/// 一致)，不想连 Redis 就加 `--no-portfolio` 退回纯价差扫描。
 async fn run_monitor_command(args: &[String]) -> anyhow::Result<()> {
     let mut testnet = false;
     let mut min_profit_bps = Decimal::ZERO;
-    let mut mode = MonitorMode::PositiveOnly;
-    let mut periodic_interval_secs: u64 = 5;
+    let mut no_portfolio = false;
+    let mut funding_interval_secs: u64 = 1800;
+    let mut funding_initial_lookback_hours: u64 = 168;
+    let mut report_interval_secs: u64 = 300;
 
     let mut i = 0;
     while i < args.len() {
@@ -628,21 +760,27 @@ async fn run_monitor_command(args: &[String]) -> anyhow::Result<()> {
                 min_profit_bps = v.parse().context("--min-profit-bps must be a valid decimal number")?;
                 i += 2;
             }
-            "--mode" => {
-                let v = args.get(i + 1).context("--mode requires a value")?;
-                mode = match v.as_str() {
-                    "positive-only" => MonitorMode::PositiveOnly,
-                    "periodic" => MonitorMode::Periodic,
-                    other => anyhow::bail!(
-                        "invalid value '{other}' for --mode, expected 'positive-only' or 'periodic'"
-                    ),
-                };
+            "--no-portfolio" => {
+                no_portfolio = true;
+                i += 1;
+            }
+            "--funding-interval-secs" => {
+                let v = args.get(i + 1).context("--funding-interval-secs requires a value")?;
+                funding_interval_secs =
+                    v.parse().context("--funding-interval-secs must be a valid non-negative integer")?;
                 i += 2;
             }
-            "--periodic-interval-secs" => {
-                let v = args.get(i + 1).context("--periodic-interval-secs requires a value")?;
-                periodic_interval_secs =
-                    v.parse().context("--periodic-interval-secs must be a valid non-negative integer")?;
+            "--funding-initial-lookback-hours" => {
+                let v = args.get(i + 1).context("--funding-initial-lookback-hours requires a value")?;
+                funding_initial_lookback_hours = v
+                    .parse()
+                    .context("--funding-initial-lookback-hours must be a valid non-negative integer")?;
+                i += 2;
+            }
+            "--report-interval-secs" => {
+                let v = args.get(i + 1).context("--report-interval-secs requires a value")?;
+                report_interval_secs =
+                    v.parse().context("--report-interval-secs must be a valid non-negative integer")?;
                 i += 2;
             }
             other => anyhow::bail!("unknown argument '{other}' for 'monitor' subcommand"),
@@ -722,7 +860,7 @@ async fn run_monitor_command(args: &[String]) -> anyhow::Result<()> {
     }
 
     monitored_summary.sort();
-    println!("== Monitoring {} Symbols (mode={mode:?} min_profit_bps={min_profit_bps}) ==", symbols.len());
+    println!("== Monitoring {} Symbols (min_profit_bps={min_profit_bps}) ==", symbols.len());
     println!("{}", monitored_summary.join("\n"));
     if !skipped.is_empty() {
         skipped.sort();
@@ -730,6 +868,16 @@ async fn run_monitor_command(args: &[String]) -> anyhow::Result<()> {
         println!("== Skipped ({}) ==", skipped.len());
         println!("{}", skipped.join("\n"));
     }
+
+    let strategies: Vec<Box<dyn Strategy>> = coin_fees
+        .iter()
+        .map(|(_, symbol, fees)| {
+            Box::new(CrossExchangeStrategy::new(vec![symbol.clone()], fees.clone(), min_profit_bps))
+                as Box<dyn Strategy>
+        })
+        .collect();
+    let sinks: Vec<Box<dyn OpportunitySink>> = vec![Box::new(LogSink) as Box<dyn OpportunitySink>];
+    let engine = ArbitrageEngine::new(strategies, sinks);
 
     let (tx, rx) = tokio::sync::mpsc::channel(1024);
     let mut source_handles = Vec::new();
@@ -743,63 +891,51 @@ async fn run_monitor_command(args: &[String]) -> anyhow::Result<()> {
     let kraken_source: Box<dyn MarketDataSource> =
         Box::new(KrakenSpotSource::new(Venue::new("kraken"), symbols.clone(), proxy.clone()));
     source_handles.push(kraken_source.spawn(tx.clone()));
-    drop(tx);
 
-    let (strategies, sinks): (Vec<Box<dyn Strategy>>, Vec<Box<dyn OpportunitySink>>) = match mode {
-        MonitorMode::PositiveOnly => {
-            let strategies = coin_fees
-                .iter()
-                .map(|(_, symbol, fees)| {
-                    Box::new(CrossExchangeStrategy::new(vec![symbol.clone()], fees.clone(), min_profit_bps))
-                        as Box<dyn Strategy>
-                })
-                .collect();
-            (strategies, vec![Box::new(LogSink) as Box<dyn OpportunitySink>])
-        }
-        MonitorMode::Periodic => (Vec::new(), Vec::new()),
-    };
+    if !no_portfolio {
+        let redis_url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379/".to_string());
+        info!("monitor: connecting to redis at {redis_url}");
+        let (position_manager, portfolio_manager) = build_portfolio_stack(&redis_url, engine.shared_cache())?;
 
-    let engine = ArbitrageEngine::new(strategies, sinks);
-    if mode == MonitorMode::Periodic {
-        let shared_cache = engine.shared_cache();
-        let periodic_coins = coin_fees;
-        let binance_venue = Venue::new("binance");
-        let kraken_venue = Venue::new("kraken");
-        tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(Duration::from_secs(periodic_interval_secs));
-            loop {
-                ticker.tick().await;
-                for (coin, symbol, fees) in &periodic_coins {
-                    let Some(binance_quote) =
-                        shared_cache.get(&(binance_venue.clone(), symbol.clone())).map(|e| *e.value())
-                    else {
-                        continue;
-                    };
-                    let Some(kraken_quote) =
-                        shared_cache.get(&(kraken_venue.clone(), symbol.clone())).map(|e| *e.value())
-                    else {
-                        continue;
-                    };
-                    let binance_fee = fees.get(&binance_venue).copied().unwrap_or(FeeSchedule::new(0));
-                    let kraken_fee = fees.get(&kraken_venue).copied().unwrap_or(FeeSchedule::new(0));
+        let futures_venue = Venue::new("binance_futures");
+        let futures_source: Box<dyn MarketDataSource> =
+            Box::new(BinanceFuturesSource::new(futures_venue.clone(), symbols.clone(), testnet, proxy.clone()));
+        source_handles.push(futures_source.spawn(tx.clone()));
 
-                    for (buy_label, buy_quote, buy_fee, sell_label, sell_quote, sell_fee) in [
-                        ("binance", binance_quote, binance_fee, "kraken", kraken_quote, kraken_fee),
-                        ("kraken", kraken_quote, kraken_fee, "binance", binance_quote, binance_fee),
-                    ] {
-                        let Some(profit_bps) = compute_profit_bps(buy_quote.ask, buy_fee, sell_quote.bid, sell_fee)
-                        else {
-                            continue;
-                        };
-                        let profitable = profit_bps >= min_profit_bps;
-                        log::info!(
-                            "[periodic] {coin:<10} buy={buy_label:<7} sell={sell_label:<7} profit_bps={profit_bps:>10} profitable={profitable}"
-                        );
-                    }
-                }
-            }
-        });
+        let futures_provider: Arc<dyn FundingFeeProvider> =
+            Arc::new(BinanceFuturesOrderProvider::from_env(futures_venue.clone(), testnet, proxy.as_deref())?);
+        let providers: HashMap<Venue, Arc<dyn FundingFeeProvider>> =
+            HashMap::from([(futures_venue, futures_provider)]);
+        let cursor_store =
+            RedisFundingCursorStore::new(&redis_url).context("failed to connect RedisFundingCursorStore to redis")?;
+        let funding_tracker = Arc::new(FundingFeeTracker::new(
+            providers,
+            position_manager.clone(),
+            portfolio_manager.clone(),
+            Arc::new(cursor_store),
+            Duration::from_secs(funding_interval_secs),
+            Duration::from_secs(funding_initial_lookback_hours * 3600),
+        ));
+        funding_tracker.spawn();
+
+        let order_store = RedisOrderStore::new(&redis_url).context("failed to connect RedisOrderStore to redis")?;
+        let order_store: Arc<dyn arb_scanner::order_manager::OrderStore> = Arc::new(order_store);
+        let sections: Vec<Arc<dyn arb_scanner::report::ReportSection>> = vec![
+            Arc::new(PortfolioSection::new(position_manager.clone(), portfolio_manager)),
+            Arc::new(PositionSection::new(position_manager)),
+            Arc::new(OrderSection::new(order_store)),
+        ];
+        let channels: Vec<Arc<dyn ReportChannel>> = vec![Arc::new(LogChannel)];
+        let report_tracker =
+            Arc::new(ReportTracker::new(sections, channels, Duration::from_secs(report_interval_secs)));
+        report_tracker.spawn();
+
+        info!(
+            "monitor: portfolio tracking enabled funding_interval_secs={funding_interval_secs} funding_initial_lookback_hours={funding_initial_lookback_hours} report_interval_secs={report_interval_secs}"
+        );
     }
+
+    drop(tx);
 
     info!("monitor: engine starting");
     engine.run(rx).await;
@@ -808,6 +944,114 @@ async fn run_monitor_command(args: &[String]) -> anyhow::Result<()> {
         let _ = handle.await;
     }
 
+    Ok(())
+}
+
+/// 独立的常驻进程：定期轮询交易所资金费流水，累加进 `PortfolioManager` 的
+/// `PnlStore`(`funding_pnl` 字段)。跟踪对象是 `PositionManager`(Redis 支撑)里
+/// 每次轮询时读到的当前非零仓位，而不是启动时固定的一份列表，所以
+/// `open`/`close` 开平的期货仓位不需要重启这个进程就能被自动跟踪/停止跟踪。
+/// 如果 `monitor` 已经在跑且没加 `--no-portfolio`，通常不需要单独起本命令；只需要
+/// 资金费追踪、不想启动价差扫描和行情连接时单独使用。
+async fn run_accounting_command(args: &[String]) -> anyhow::Result<()> {
+    let mut testnet = false;
+    let mut interval_secs: u64 = 1800;
+    let mut initial_lookback_hours: u64 = 168;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--testnet" => {
+                testnet = true;
+                i += 1;
+            }
+            "--interval-secs" => {
+                let v = args.get(i + 1).context("--interval-secs requires a value")?;
+                interval_secs = v.parse().context("--interval-secs must be a valid non-negative integer")?;
+                i += 2;
+            }
+            "--initial-lookback-hours" => {
+                let v = args.get(i + 1).context("--initial-lookback-hours requires a value")?;
+                initial_lookback_hours =
+                    v.parse().context("--initial-lookback-hours must be a valid non-negative integer")?;
+                i += 2;
+            }
+            other => anyhow::bail!("unknown argument '{other}' for 'accounting' subcommand"),
+        }
+    }
+
+    let proxy = net::proxy_from_env();
+    let futures_venue = Venue::new("binance_futures");
+    let futures_provider: Arc<dyn FundingFeeProvider> =
+        Arc::new(BinanceFuturesOrderProvider::from_env(futures_venue.clone(), testnet, proxy.as_deref())?);
+    let providers: HashMap<Venue, Arc<dyn FundingFeeProvider>> = HashMap::from([(futures_venue, futures_provider)]);
+
+    let redis_url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379/".to_string());
+    info!("accounting: connecting to redis at {redis_url}");
+    let (position_manager, portfolio_manager) = build_portfolio_stack(&redis_url, Arc::new(DashMap::new()))?;
+    let cursor_store =
+        RedisFundingCursorStore::new(&redis_url).context("failed to connect RedisFundingCursorStore to redis")?;
+
+    let tracker = Arc::new(FundingFeeTracker::new(
+        providers,
+        position_manager,
+        portfolio_manager,
+        Arc::new(cursor_store),
+        Duration::from_secs(interval_secs),
+        Duration::from_secs(initial_lookback_hours * 3600),
+    ));
+    tracker.spawn();
+
+    info!(
+        "accounting: tracking funding fees testnet={testnet} interval_secs={interval_secs} initial_lookback_hours={initial_lookback_hours}, press ctrl-c to stop"
+    );
+    tokio::signal::ctrl_c().await.context("failed to listen for ctrl-c")?;
+    info!("accounting: received ctrl-c, shutting down");
+    Ok(())
+}
+
+/// 独立的常驻进程：定期把投资组合盈亏/仓位明细/订单概览汇总成一份报告并
+/// 分发给各个已注册的 `ReportChannel`(目前只有 `LogChannel`)。只连接
+/// Redis 读取数据，不接入实时行情，所以报告里的 `market_value`/
+/// `unrealized_pnl` 会显示为 "N/A"(和 `accounting` 命令同样的既有限制，见
+/// `arb_scanner::report::sections::PortfolioSection` 的说明；如果通过 `monitor`
+/// (未加 `--no-portfolio`)驱动，接了实时行情，会有真实数字)。如果 `monitor` 已经
+/// 在跑且没加 `--no-portfolio`，通常不需要单独起本命令；只需要报告、不想启动价差
+/// 扫描和行情连接时单独使用。
+async fn run_report_command(args: &[String]) -> anyhow::Result<()> {
+    let mut interval_secs: u64 = 300;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--interval-secs" => {
+                let v = args.get(i + 1).context("--interval-secs requires a value")?;
+                interval_secs = v.parse().context("--interval-secs must be a valid non-negative integer")?;
+                i += 2;
+            }
+            other => anyhow::bail!("unknown argument '{other}' for 'report' subcommand"),
+        }
+    }
+
+    let redis_url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379/".to_string());
+    info!("report: connecting to redis at {redis_url}");
+    let (position_manager, portfolio_manager) = build_portfolio_stack(&redis_url, Arc::new(DashMap::new()))?;
+    let order_store = RedisOrderStore::new(&redis_url).context("failed to connect RedisOrderStore to redis")?;
+    let order_store: Arc<dyn arb_scanner::order_manager::OrderStore> = Arc::new(order_store);
+
+    let sections: Vec<Arc<dyn arb_scanner::report::ReportSection>> = vec![
+        Arc::new(PortfolioSection::new(position_manager.clone(), portfolio_manager.clone())),
+        Arc::new(PositionSection::new(position_manager)),
+        Arc::new(OrderSection::new(order_store)),
+    ];
+    let channels: Vec<Arc<dyn ReportChannel>> = vec![Arc::new(LogChannel)];
+
+    let tracker = Arc::new(ReportTracker::new(sections, channels, Duration::from_secs(interval_secs)));
+    tracker.spawn();
+
+    info!("report: reporting every interval_secs={interval_secs}, press ctrl-c to stop");
+    tokio::signal::ctrl_c().await.context("failed to listen for ctrl-c")?;
+    info!("report: received ctrl-c, shutting down");
     Ok(())
 }
 

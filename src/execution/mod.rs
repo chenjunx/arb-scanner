@@ -1,14 +1,19 @@
 use std::collections::HashSet;
+use std::time::Duration;
 
+use anyhow::Context;
 use rust_decimal::Decimal;
+use tokio::sync::mpsc;
 
 use crate::order::types::{MarketOrderRequest, OrderAmount, OrderResult, OrderSide};
 use crate::order::OrderProvider;
+use crate::order_manager::types::{OrderEvent, OrderId, OrderRequest};
+use crate::order_manager::OrderManager;
 use crate::types::Symbol;
 use crate::wallet::types::{WithdrawRequest, WithdrawResult};
 use crate::wallet::WalletProvider;
 
-/// 开仓参数：现货按 USDT 金额买入，合约等量做空对冲，买到的一半划转到 Kraken。
+/// 开仓参数：现货按 USDT 金额买入，合约等量做空对冲，买到的一半可选划转到 Kraken。
 #[derive(Debug, Clone)]
 pub struct OpenPositionParams {
     pub symbol: Symbol,
@@ -17,6 +22,12 @@ pub struct OpenPositionParams {
     pub transfer_asset: String,
     pub client_order_id_prefix: Option<String>,
     pub dry_run: bool,
+    /// true 时才在两条腿都对冲完成后把买入量的一半划转到 Kraken；默认应为
+    /// false（跳过），只做建仓和记账。
+    pub transfer_to_kraken: bool,
+    /// 等待 [`OrderManager`] 通过交易所私有 WS 确认成交的超时时间；只在
+    /// `open_hedged_position_live` 里使用。
+    pub fill_timeout: Duration,
 }
 
 /// 开仓结果汇总。`dry_run=true` 时只有 `spot_order` 有值，后续步骤未执行。
@@ -24,19 +35,21 @@ pub struct OpenPositionParams {
 pub struct OpenPositionReport {
     pub spot_order: OrderResult,
     pub futures_order: Option<OrderResult>,
+    /// 交易所返回的原始订单号（区别于 `spot_order.order_id`——live 路径下
+    /// 后者是 `OrderManager` 内部生成的 `ORD-xxx`，需要这个字段核对交易所后台）。
+    pub spot_exchange_order_id: Option<String>,
+    pub futures_exchange_order_id: Option<String>,
     pub transfer_qty: Option<Decimal>,
     pub withdraw: Option<WithdrawResult>,
     pub note: Option<String>,
 }
 
-/// 串联"现货按金额买入 -> 合约等量做空对冲 -> 买入量的一半划转到 Kraken 现货"
-/// 这三步。任何一步失败都直接 `?` 向上传播，不做自动回滚/重试——半吊子仓位
-/// 需要人工介入，之前几步已经落地的日志就是唯一的进度记录。
-pub async fn open_hedged_position(
+/// dry_run 路径：只调用现货 `place_market_order(dry_run=true)` 做参数校验和
+/// 模拟，完全不接触 `OrderManager`/风控/Redis，和 `open_hedged_position_live`
+/// 相互隔离——`ExchangeAdapter::submit` 本身就没有 dry-run 概念，硬塞进同一个
+/// 函数只会让真实下单路径多一层不必要的分支判断。
+pub async fn open_hedged_position_dry_run(
     spot: &dyn OrderProvider,
-    futures: &dyn OrderProvider,
-    binance_wallet: &dyn WalletProvider,
-    kraken_wallet: &dyn WalletProvider,
     params: OpenPositionParams,
 ) -> anyhow::Result<OpenPositionReport> {
     let spot_order = spot
@@ -45,28 +58,75 @@ pub async fn open_hedged_position(
             side: OrderSide::Buy,
             amount: OrderAmount::Quote(params.quote_amount),
             client_order_id: params.client_order_id_prefix.as_ref().map(|p| format!("{p}-spot")),
-            dry_run: params.dry_run,
+            dry_run: true,
         })
         .await?;
-    log::info!("open_hedged_position: spot buy result = {:?}", spot_order);
+    log::info!("open_hedged_position_dry_run: spot buy result = {:?}", spot_order);
 
-    if params.dry_run {
-        return Ok(OpenPositionReport {
-            spot_order,
-            futures_order: None,
-            transfer_qty: None,
-            withdraw: None,
-            note: Some(
-                "dry_run=true：仅校验并模拟了现货买入这一步；合约对冲和划转数量依赖真实成交量，dry-run 下不做模拟。"
-                    .to_string(),
-            ),
-        });
-    }
+    Ok(OpenPositionReport {
+        spot_order,
+        futures_order: None,
+        spot_exchange_order_id: None,
+        futures_exchange_order_id: None,
+        transfer_qty: None,
+        withdraw: None,
+        note: Some(
+            "dry_run=true：仅校验并模拟了现货买入这一步；合约对冲和划转数量依赖真实成交量，dry-run 下不做模拟。"
+                .to_string(),
+        ),
+    })
+}
 
-    let filled_qty = spot_order.filled_qty;
+/// live 路径：现货买入、合约对冲两条腿都通过 `order_manager.submit_order`
+/// 走完整的风控 -> 执行引擎 -> 交易所私有 WS 成交确认流水线（`wait_for_fill`），
+/// 而不是直接用 REST 同步响应记账——这样 `OrderManager::handle_exchange_update`
+/// 才会被触发，仓位/盈亏才会真正落进 `PositionManager`/`PortfolioManager`。
+/// 只有 `params.transfer_to_kraken=true` 时才在最后划转到 Kraken；任何一步
+/// 失败都直接 `?` 向上传播，不做自动回滚——半吊子仓位需要人工介入。
+pub async fn open_hedged_position_live(
+    spot: &dyn OrderProvider,
+    futures: &dyn OrderProvider,
+    binance_wallet: &dyn WalletProvider,
+    kraken_wallet: &dyn WalletProvider,
+    order_manager: &OrderManager,
+    event_rx: &mut mpsc::Receiver<OrderEvent>,
+    params: OpenPositionParams,
+) -> anyhow::Result<OpenPositionReport> {
+    let spot_request = OrderRequest {
+        strategy_name: "manual-open".to_string(),
+        venue: spot.venue(),
+        symbol: params.symbol.clone(),
+        side: OrderSide::Buy,
+        amount: OrderAmount::Quote(params.quote_amount),
+        client_order_id: params.client_order_id_prefix.as_ref().map(|p| format!("{p}-spot")),
+        group_id: None,
+        metadata: None,
+    };
+    let spot_response = order_manager.submit_order(spot_request).await;
+    let spot_order_id = spot_response.order_id.clone();
+    spot_response
+        .result_rx
+        .await
+        .context("order manager dropped result channel for spot order")?
+        .map_err(|reason| anyhow::anyhow!("spot order rejected: {reason}"))?;
+
+    let (filled_qty, spot_avg_price) = wait_for_fill(event_rx, &spot_order_id, params.fill_timeout).await?;
     if filled_qty <= Decimal::ZERO {
         anyhow::bail!("spot buy filled_qty is zero, aborting hedge/transfer");
     }
+    log::info!("open_hedged_position_live: spot buy filled qty={filled_qty} avg_price={spot_avg_price}");
+    let spot_order_after_fill = order_manager
+        .get_order(&spot_order_id)
+        .context("spot order disappeared from order manager after fill confirmation")?;
+    let spot_exchange_order_id = spot_order_after_fill.exchange_order_id.clone();
+    let spot_result = OrderResult {
+        order_id: spot_order_id.to_string(),
+        status: spot_order_after_fill.status,
+        filled_qty,
+        avg_price: Some(spot_avg_price),
+        fee: None,
+        fee_asset: None,
+    };
 
     let futures_info = futures.market_info(&params.symbol).await?;
     let futures_qty = floor_to_step(filled_qty, futures_info.qty_step);
@@ -79,20 +139,56 @@ pub async fn open_hedged_position(
     }
     if futures_qty != filled_qty {
         log::warn!(
-            "open_hedged_position: futures qty_step rounding, spot filled {filled_qty}, hedging {futures_qty}, residual {}",
+            "open_hedged_position_live: futures qty_step rounding, spot filled {filled_qty}, hedging {futures_qty}, residual {}",
             filled_qty - futures_qty
         );
     }
-    let futures_order = futures
-        .place_market_order(MarketOrderRequest {
-            symbol: params.symbol.clone(),
-            side: OrderSide::Sell,
-            amount: OrderAmount::Base(futures_qty),
-            client_order_id: params.client_order_id_prefix.as_ref().map(|p| format!("{p}-futures")),
-            dry_run: false,
-        })
-        .await?;
-    log::info!("open_hedged_position: futures hedge result = {:?}", futures_order);
+
+    let futures_request = OrderRequest {
+        strategy_name: "manual-open".to_string(),
+        venue: futures.venue(),
+        symbol: params.symbol.clone(),
+        side: OrderSide::Sell,
+        amount: OrderAmount::Base(futures_qty),
+        client_order_id: params.client_order_id_prefix.as_ref().map(|p| format!("{p}-futures")),
+        group_id: None,
+        metadata: None,
+    };
+    let futures_response = order_manager.submit_order(futures_request).await;
+    let futures_order_id = futures_response.order_id.clone();
+    futures_response
+        .result_rx
+        .await
+        .context("order manager dropped result channel for futures order")?
+        .map_err(|reason| anyhow::anyhow!("futures order rejected: {reason}"))?;
+
+    let (futures_filled_qty, futures_avg_price) =
+        wait_for_fill(event_rx, &futures_order_id, params.fill_timeout).await?;
+    log::info!("open_hedged_position_live: futures hedge filled qty={futures_filled_qty} avg_price={futures_avg_price}");
+    let futures_order_after_fill = order_manager
+        .get_order(&futures_order_id)
+        .context("futures order disappeared from order manager after fill confirmation")?;
+    let futures_exchange_order_id = futures_order_after_fill.exchange_order_id.clone();
+    let futures_result = OrderResult {
+        order_id: futures_order_id.to_string(),
+        status: futures_order_after_fill.status,
+        filled_qty: futures_filled_qty,
+        avg_price: Some(futures_avg_price),
+        fee: None,
+        fee_asset: None,
+    };
+
+    if !params.transfer_to_kraken {
+        return Ok(OpenPositionReport {
+            spot_order: spot_result,
+            futures_order: Some(futures_result),
+            spot_exchange_order_id,
+            futures_exchange_order_id,
+            transfer_qty: None,
+            withdraw: None,
+            note: Some("transfer_to_kraken=false（默认）：跳过划转到 Kraken 这一步。".to_string()),
+        });
+    }
 
     let (transfer_qty, withdraw) = transfer_half_to_kraken(
         binance_wallet,
@@ -106,15 +202,53 @@ pub async fn open_hedged_position(
     .await?;
 
     Ok(OpenPositionReport {
-        spot_order,
-        futures_order: Some(futures_order),
+        spot_order: spot_result,
+        futures_order: Some(futures_result),
+        spot_exchange_order_id,
+        futures_exchange_order_id,
         transfer_qty: Some(transfer_qty),
         withdraw: Some(withdraw),
         note: None,
     })
 }
 
-/// 划转参数：与 [`open_hedged_position`] 内部划转步骤使用完全相同的
+/// 循环读 `event_rx` 直到收到 `order_id` 对应的 `Filled` 事件(返回累计成交量
+/// 和均价)，或者收到该订单被风控/交易所拒绝的事件(直接报错)。不匹配
+/// `order_id` 的事件会被忽略——同一个 `event_rx` 在 `open_hedged_position_live`
+/// 里被现货、合约两条腿先后共用。`timeout` 防止私有 WS 没连上时无限等待。
+async fn wait_for_fill(
+    event_rx: &mut mpsc::Receiver<OrderEvent>,
+    order_id: &OrderId,
+    timeout: Duration,
+) -> anyhow::Result<(Decimal, Decimal)> {
+    let wait = async {
+        loop {
+            match event_rx.recv().await {
+                Some(OrderEvent::Filled { order_id: id, filled_qty, avg_price }) if &id == order_id => {
+                    return Ok((filled_qty, avg_price));
+                }
+                Some(OrderEvent::RejectedByRisk { order_id: id, reason }) if &id == order_id => {
+                    anyhow::bail!("order {order_id} rejected by risk: {reason}");
+                }
+                Some(OrderEvent::RejectedByExchange { order_id: id, reason }) if &id == order_id => {
+                    anyhow::bail!("order {order_id} rejected by exchange: {reason}");
+                }
+                Some(_) => continue,
+                None => anyhow::bail!("order event channel closed while waiting for order {order_id} to fill"),
+            }
+        }
+    };
+
+    match tokio::time::timeout(timeout, wait).await {
+        Ok(result) => result,
+        Err(_) => anyhow::bail!(
+            "timed out after {timeout:?} waiting for order {order_id} to fill via exchange private WS \
+             (check that the exchange order-update WS stream is connected)"
+        ),
+    }
+}
+
+/// 划转参数：与 [`open_hedged_position_live`] 内部划转步骤使用完全相同的
 /// `filled_qty / 2` 截断算法，用于"现货已买入、合约已对冲，只从划转步骤
 /// 继续"的场景（见 `main.rs` 里 `open --from-transfer`）。
 #[derive(Debug, Clone)]
@@ -128,8 +262,8 @@ pub struct TransferHalfParams {
 
 /// 库存轮转参数：在 `sell_provider` 卖出、`buy_provider` 买入同等数量的同一
 /// 资产，两条腿真实市价单并发发起。用于在两个交易所之间调整现货库存，比链上
-/// 划转更快。数量统一按基础币指定（而不是像 `open_hedged_position` 现货腿那样
-/// 按计价币金额），因为 Kraken 市价单只支持按基础币数量下单，统一单位才能让
+/// 划转更快。数量统一按基础币指定（而不是像 `open_hedged_position_live` 现货腿
+/// 那样按计价币金额），因为 Kraken 市价单只支持按基础币数量下单，统一单位才能让
 /// 两条腿共用同一套 `OrderProvider::place_market_order` 校验路径。
 #[derive(Debug, Clone)]
 pub struct RotateInventoryParams {
@@ -228,7 +362,7 @@ pub struct ClosePositionReport {
 }
 
 /// 并发平掉币安现货、Kraken 现货、币安合约三条腿：现货两条腿是卖出，合约腿是
-/// 买回(对应 [`open_hedged_position`] 里合约腿卖出开空，平仓自然是买回平空)。
+/// 买回(对应 [`open_hedged_position_live`] 里合约腿卖出开空，平仓自然是买回平空)。
 /// 三条腿互相独立、不做自动回滚：任意一条腿失败，其它已经成交的腿不会被撤销，
 /// 返回的错误里会带上三条腿各自的成交/跳过/失败情况，需要人工介入对账。
 pub async fn close_hedged_position(
@@ -444,10 +578,18 @@ async fn resolve_transfer_network(
 mod tests {
     use super::*;
     use async_trait::async_trait;
+    use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
+    use dashmap::DashMap;
+
     use crate::order::types::{MarketInfo, OrderStatus};
+    use crate::order_manager::store::InMemoryOrderStore;
+    use crate::order_manager::types::Order;
+    use crate::order_manager::{ExchangeAdapter, ExchangeOrderUpdate, ExecutionEngine, RiskEngine, RiskLimits};
+    use crate::portfolio::{InMemoryPnlStore, PortfolioManager};
+    use crate::position::{InMemoryPositionStore, PositionManager};
     use crate::wallet::types::{AssetInfo, ChainInfo, DepositAddress};
     use crate::types::Venue;
 
@@ -615,7 +757,105 @@ mod tests {
             transfer_asset: "BTC".to_string(),
             client_order_id_prefix: Some("test".to_string()),
             dry_run,
+            transfer_to_kraken: false,
+            fill_timeout: Duration::from_secs(2),
         }
+    }
+
+    /// `open_hedged_position_live` 测试用的一整套内存版依赖：风控/执行引擎/
+    /// 订单历史都是纯内存实现，`spot`/`futures` 复用调用方传入的 provider（同一个
+    /// `Arc` 既用来构造 `ExchangeAdapter`，也直接传给被测函数，这样 raw 调用计数
+    /// 才能反映 `ExecutionEngine` 真正发起的下单）。
+    struct LiveEnv {
+        order_manager: Arc<OrderManager>,
+        event_rx: mpsc::Receiver<OrderEvent>,
+    }
+
+    fn setup_live_env(spot: Arc<dyn OrderProvider>, futures: Arc<dyn OrderProvider>) -> LiveEnv {
+        let symbol = btc_usdt();
+        let spot_venue = spot.venue();
+        let futures_venue = futures.venue();
+
+        let mut risk_limits = HashMap::new();
+        risk_limits.insert(
+            (spot_venue.clone(), symbol.clone()),
+            RiskLimits {
+                max_order_amount: Decimal::MAX,
+                max_position: Decimal::MAX,
+                max_orders_per_window: 10,
+            },
+        );
+        risk_limits.insert(
+            (futures_venue.clone(), symbol.clone()),
+            RiskLimits {
+                max_order_amount: Decimal::MAX,
+                max_position: Decimal::MAX,
+                max_orders_per_window: 10,
+            },
+        );
+
+        let position_manager = Arc::new(PositionManager::new(Arc::new(InMemoryPositionStore::new())));
+        let risk_engine = Arc::new(RiskEngine::new(risk_limits, position_manager.clone()));
+        let portfolio = Arc::new(PortfolioManager::new(
+            position_manager,
+            Arc::new(InMemoryPnlStore::new()),
+            Arc::new(DashMap::new()),
+            HashMap::new(),
+        ));
+
+        let (event_tx, event_rx) = mpsc::channel(100);
+
+        let mut adapters = HashMap::new();
+        adapters.insert(spot_venue.clone(), Arc::new(ExchangeAdapter::new(spot_venue, spot)));
+        adapters.insert(futures_venue.clone(), Arc::new(ExchangeAdapter::new(futures_venue, futures)));
+
+        let execution_engine = Arc::new(ExecutionEngine::new(adapters, event_tx.clone()));
+        let order_store = Arc::new(InMemoryOrderStore::new());
+        let order_manager = Arc::new(OrderManager::new(risk_engine, execution_engine, portfolio, event_tx, order_store));
+
+        LiveEnv { order_manager, event_rx }
+    }
+
+    /// 轮询直到 `order_manager` 里出现指定 `client_order_id` 的订单——
+    /// `submit_order` 对 `orders`/`client_order_index` 的写入发生在它自己的
+    /// 异步任务里，测试驱动 WS 推送前需要等这个写入落地，否则
+    /// `handle_exchange_update` 会因为查不到订单而静默丢弃推送。
+    async fn poll_order_by_client_id(order_manager: &OrderManager, client_order_id: &str) -> Order {
+        for _ in 0..500 {
+            if let Some(order) = order_manager
+                .all_orders()
+                .into_iter()
+                .find(|o| o.request.client_order_id.as_deref() == Some(client_order_id))
+            {
+                return order;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        panic!("order with client_order_id={client_order_id} was never submitted to the order manager");
+    }
+
+    /// 模拟交易所私有 WS 推送一次完全成交，驱动 `wait_for_fill` 返回。
+    async fn drive_fill(
+        order_manager: &OrderManager,
+        venue: &Venue,
+        client_order_id: &str,
+        filled_qty: Decimal,
+        avg_price: Decimal,
+    ) {
+        let order = poll_order_by_client_id(order_manager, client_order_id).await;
+        order_manager
+            .handle_exchange_update(ExchangeOrderUpdate {
+                venue: venue.clone(),
+                client_order_id: Some(client_order_id.to_string()),
+                exchange_order_id: order.exchange_order_id.clone(),
+                status: OrderStatus::Filled,
+                filled_qty,
+                avg_price: Some(avg_price),
+                fee: None,
+                fee_asset: None,
+                ts_ms: 1,
+            })
+            .await;
     }
 
     #[tokio::test]
@@ -626,49 +866,57 @@ mod tests {
             fail: false,
             quote_raw_calls: spot_calls.clone(),
         };
-        let futures_calls = Arc::new(Mutex::new(Vec::new()));
-        let futures = FakeFuturesProvider {
-            info: futures_info("0.001", "0.001"),
-            fail: false,
-            raw_calls: futures_calls.clone(),
-        };
-        let binance_wallet = no_op_wallet("binance");
-        let kraken_wallet = no_op_wallet("kraken");
 
-        let report = open_hedged_position(&spot, &futures, &binance_wallet, &kraken_wallet, params(Decimal::new(100, 0), true))
+        let report = open_hedged_position_dry_run(&spot, params(Decimal::new(100, 0), true))
             .await
             .unwrap();
 
         assert_eq!(report.spot_order.order_id, "dry-run");
         assert!(report.futures_order.is_none());
+        assert!(report.spot_exchange_order_id.is_none());
+        assert!(report.futures_exchange_order_id.is_none());
         assert!(report.transfer_qty.is_none());
         assert!(report.withdraw.is_none());
         assert!(report.note.unwrap().contains("dry_run=true"));
         // dry_run 由 place_market_order 的 trait 默认方法拦截，raw 从未被调用。
         assert_eq!(spot_calls.load(Ordering::SeqCst), 0);
-        assert!(futures_calls.lock().unwrap().is_empty());
-        assert!(binance_wallet.withdraw_calls.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
     async fn zero_filled_qty_aborts_before_futures_and_wallet() {
-        let spot = FakeSpotProvider {
+        let spot_arc: Arc<dyn OrderProvider> = Arc::new(FakeSpotProvider {
             filled_qty: Decimal::ZERO,
             fail: false,
             quote_raw_calls: Arc::new(AtomicUsize::new(0)),
-        };
+        });
         let futures_calls = Arc::new(Mutex::new(Vec::new()));
-        let futures = FakeFuturesProvider {
+        let futures_arc: Arc<dyn OrderProvider> = Arc::new(FakeFuturesProvider {
             info: futures_info("0.001", "0.001"),
             fail: false,
             raw_calls: futures_calls.clone(),
-        };
+        });
         let binance_wallet = no_op_wallet("binance");
         let kraken_wallet = no_op_wallet("kraken");
 
-        let err = open_hedged_position(&spot, &futures, &binance_wallet, &kraken_wallet, params(Decimal::new(100, 0), false))
-            .await
-            .unwrap_err();
+        let LiveEnv { order_manager, mut event_rx } = setup_live_env(spot_arc.clone(), futures_arc.clone());
+        let driver_order_manager = order_manager.clone();
+        let spot_venue = spot_arc.venue();
+        let driver = tokio::spawn(async move {
+            drive_fill(&driver_order_manager, &spot_venue, "test-spot", Decimal::ZERO, Decimal::ONE).await;
+        });
+
+        let err = open_hedged_position_live(
+            spot_arc.as_ref(),
+            futures_arc.as_ref(),
+            &binance_wallet,
+            &kraken_wallet,
+            order_manager.as_ref(),
+            &mut event_rx,
+            params(Decimal::new(100, 0), false),
+        )
+        .await
+        .unwrap_err();
+        driver.await.unwrap();
 
         assert!(err.to_string().contains("filled_qty is zero"));
         assert!(futures_calls.lock().unwrap().is_empty());
@@ -677,23 +925,35 @@ mod tests {
 
     #[tokio::test]
     async fn spot_failure_stops_before_futures_and_wallet() {
-        let spot = FakeSpotProvider {
+        let spot_arc: Arc<dyn OrderProvider> = Arc::new(FakeSpotProvider {
             filled_qty: Decimal::new(1, 1),
             fail: true,
             quote_raw_calls: Arc::new(AtomicUsize::new(0)),
-        };
+        });
         let futures_calls = Arc::new(Mutex::new(Vec::new()));
-        let futures = FakeFuturesProvider {
+        let futures_arc: Arc<dyn OrderProvider> = Arc::new(FakeFuturesProvider {
             info: futures_info("0.001", "0.001"),
             fail: false,
             raw_calls: futures_calls.clone(),
-        };
+        });
         let binance_wallet = no_op_wallet("binance");
         let kraken_wallet = no_op_wallet("kraken");
 
-        let err = open_hedged_position(&spot, &futures, &binance_wallet, &kraken_wallet, params(Decimal::new(100, 0), false))
-            .await
-            .unwrap_err();
+        // 现货 REST 调用同步失败，`ExecutionEngine` 会直接把订单标记为 Rejected
+        // 并通过 `result_rx` 报错，不需要驱动任何 WS 推送。
+        let LiveEnv { order_manager, mut event_rx } = setup_live_env(spot_arc.clone(), futures_arc.clone());
+
+        let err = open_hedged_position_live(
+            spot_arc.as_ref(),
+            futures_arc.as_ref(),
+            &binance_wallet,
+            &kraken_wallet,
+            order_manager.as_ref(),
+            &mut event_rx,
+            params(Decimal::new(100, 0), false),
+        )
+        .await
+        .unwrap_err();
 
         assert!(err.to_string().contains("simulated spot failure"));
         assert!(futures_calls.lock().unwrap().is_empty());
@@ -702,22 +962,39 @@ mod tests {
 
     #[tokio::test]
     async fn futures_failure_stops_before_wallet() {
-        let spot = FakeSpotProvider {
-            filled_qty: Decimal::new(1, 1),
+        let spot_filled_qty = Decimal::new(1, 1);
+        let spot_arc: Arc<dyn OrderProvider> = Arc::new(FakeSpotProvider {
+            filled_qty: spot_filled_qty,
             fail: false,
             quote_raw_calls: Arc::new(AtomicUsize::new(0)),
-        };
-        let futures = FakeFuturesProvider {
+        });
+        let futures_arc: Arc<dyn OrderProvider> = Arc::new(FakeFuturesProvider {
             info: futures_info("0.001", "0.001"),
             fail: true,
             raw_calls: Arc::new(Mutex::new(Vec::new())),
-        };
+        });
         let binance_wallet = no_op_wallet("binance");
         let kraken_wallet = no_op_wallet("kraken");
 
-        let err = open_hedged_position(&spot, &futures, &binance_wallet, &kraken_wallet, params(Decimal::new(100, 0), false))
-            .await
-            .unwrap_err();
+        let LiveEnv { order_manager, mut event_rx } = setup_live_env(spot_arc.clone(), futures_arc.clone());
+        let driver_order_manager = order_manager.clone();
+        let spot_venue = spot_arc.venue();
+        let driver = tokio::spawn(async move {
+            drive_fill(&driver_order_manager, &spot_venue, "test-spot", spot_filled_qty, Decimal::ONE).await;
+        });
+
+        let err = open_hedged_position_live(
+            spot_arc.as_ref(),
+            futures_arc.as_ref(),
+            &binance_wallet,
+            &kraken_wallet,
+            order_manager.as_ref(),
+            &mut event_rx,
+            params(Decimal::new(100, 0), false),
+        )
+        .await
+        .unwrap_err();
+        driver.await.unwrap();
 
         assert!(err.to_string().contains("simulated futures failure"));
         assert!(binance_wallet.withdraw_calls.lock().unwrap().is_empty());
@@ -725,23 +1002,40 @@ mod tests {
 
     #[tokio::test]
     async fn futures_qty_below_min_aborts_before_order() {
-        let spot = FakeSpotProvider {
-            filled_qty: Decimal::new(5, 4), // 0.0005
+        let spot_filled_qty = Decimal::new(5, 4); // 0.0005
+        let spot_arc: Arc<dyn OrderProvider> = Arc::new(FakeSpotProvider {
+            filled_qty: spot_filled_qty,
             fail: false,
             quote_raw_calls: Arc::new(AtomicUsize::new(0)),
-        };
+        });
         let futures_calls = Arc::new(Mutex::new(Vec::new()));
-        let futures = FakeFuturesProvider {
+        let futures_arc: Arc<dyn OrderProvider> = Arc::new(FakeFuturesProvider {
             info: futures_info("0.001", "0.001"),
             fail: false,
             raw_calls: futures_calls.clone(),
-        };
+        });
         let binance_wallet = no_op_wallet("binance");
         let kraken_wallet = no_op_wallet("kraken");
 
-        let err = open_hedged_position(&spot, &futures, &binance_wallet, &kraken_wallet, params(Decimal::new(100, 0), false))
-            .await
-            .unwrap_err();
+        let LiveEnv { order_manager, mut event_rx } = setup_live_env(spot_arc.clone(), futures_arc.clone());
+        let driver_order_manager = order_manager.clone();
+        let spot_venue = spot_arc.venue();
+        let driver = tokio::spawn(async move {
+            drive_fill(&driver_order_manager, &spot_venue, "test-spot", spot_filled_qty, Decimal::ONE).await;
+        });
+
+        let err = open_hedged_position_live(
+            spot_arc.as_ref(),
+            futures_arc.as_ref(),
+            &binance_wallet,
+            &kraken_wallet,
+            order_manager.as_ref(),
+            &mut event_rx,
+            params(Decimal::new(100, 0), false),
+        )
+        .await
+        .unwrap_err();
+        driver.await.unwrap();
 
         assert!(err.to_string().contains("below futures min_qty"));
         assert!(futures_calls.lock().unwrap().is_empty());
@@ -749,17 +1043,18 @@ mod tests {
 
     #[tokio::test]
     async fn happy_path_hedges_and_transfers_half() {
-        let spot = FakeSpotProvider {
-            filled_qty: Decimal::new(1234567, 6), // 1.234567
+        let spot_filled_qty = Decimal::new(1234567, 6); // 1.234567
+        let spot_arc: Arc<dyn OrderProvider> = Arc::new(FakeSpotProvider {
+            filled_qty: spot_filled_qty,
             fail: false,
             quote_raw_calls: Arc::new(AtomicUsize::new(0)),
-        };
+        });
         let futures_calls = Arc::new(Mutex::new(Vec::new()));
-        let futures = FakeFuturesProvider {
+        let futures_arc: Arc<dyn OrderProvider> = Arc::new(FakeFuturesProvider {
             info: futures_info("0.01", "0.01"),
             fail: false,
             raw_calls: futures_calls.clone(),
-        };
+        });
         let binance_wallet = FakeWalletProvider {
             name: "binance",
             networks: vec![binance_btc_chain()],
@@ -778,13 +1073,37 @@ mod tests {
             withdraw_calls: Arc::new(Mutex::new(Vec::new())),
         };
 
-        let report = open_hedged_position(&spot, &futures, &binance_wallet, &kraken_wallet, params(Decimal::new(100, 0), false))
-            .await
-            .unwrap();
+        let LiveEnv { order_manager, mut event_rx } = setup_live_env(spot_arc.clone(), futures_arc.clone());
+        let driver_order_manager = order_manager.clone();
+        let spot_venue = spot_arc.venue();
+        let futures_venue = futures_arc.venue();
+        let driver = tokio::spawn(async move {
+            drive_fill(&driver_order_manager, &spot_venue, "test-spot", spot_filled_qty, Decimal::ONE).await;
+            // 1.234567 向下取整到 0.01 的整数倍 -> 1.23
+            drive_fill(&driver_order_manager, &futures_venue, "test-futures", Decimal::new(123, 2), Decimal::ONE).await;
+        });
 
-        // 1.234567 向下取整到 0.01 的整数倍 -> 1.23
+        let mut p = params(Decimal::new(100, 0), false);
+        p.transfer_to_kraken = true;
+
+        let report = open_hedged_position_live(
+            spot_arc.as_ref(),
+            futures_arc.as_ref(),
+            &binance_wallet,
+            &kraken_wallet,
+            order_manager.as_ref(),
+            &mut event_rx,
+            p,
+        )
+        .await
+        .unwrap();
+        driver.await.unwrap();
+
         assert_eq!(futures_calls.lock().unwrap().as_slice(), &[Decimal::new(123, 2)]);
-        assert_eq!(report.futures_order.unwrap().order_id, "futures-BTC/USDT");
+        // live 路径下 `spot_order`/`futures_order` 的 order_id 是 OrderManager 内部
+        // 生成的 ORD-xxx，交易所原始订单号改由 `*_exchange_order_id` 承载。
+        assert_eq!(report.spot_exchange_order_id, Some("spot-BTC/USDT".to_string()));
+        assert_eq!(report.futures_exchange_order_id, Some("futures-BTC/USDT".to_string()));
         // 1.234567 / 2 = 0.6172835,已经<=8位小数,截断后不变
         assert_eq!(report.transfer_qty, Some(Decimal::new(6172835, 7)));
 

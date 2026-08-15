@@ -1,9 +1,10 @@
 use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
 
 use crate::types::{Symbol, Venue};
 
 /// 单个 (venue, symbol) 上的净仓位快照。
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct VenuePosition {
     pub venue: Venue,
     pub symbol: Symbol,
