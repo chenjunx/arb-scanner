@@ -35,7 +35,7 @@ use arb_scanner::order_manager::{
 };
 use arb_scanner::order_manager::types::OrderId;
 use arb_scanner::portfolio::{PortfolioManager, RedisPnlStore};
-use arb_scanner::position::{PositionManager, RedisPositionStore};
+use arb_scanner::position::{PositionManager, PositionStore, RedisPositionStore, VenuePosition};
 use arb_scanner::report::channels::LogChannel;
 use arb_scanner::report::{OrderSection, PortfolioSection, PositionSection, ReportChannel, ReportTracker};
 use arb_scanner::scan;
@@ -80,6 +80,9 @@ async fn main() -> anyhow::Result<()> {
     }
     if args.get(1).map(String::as_str) == Some("reconcile-order") {
         return run_reconcile_order_command(&args[2..]).await;
+    }
+    if args.get(1).map(String::as_str) == Some("set-position") {
+        return run_set_position_command(&args[2..]).await;
     }
 
     let config_path = args.get(1).cloned().unwrap_or_else(|| "config.toml".to_string());
@@ -622,6 +625,104 @@ async fn run_reconcile_order_command(args: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `set-position` 子命令：用交易所后台核对出的真实持仓，覆盖写 Redis 里
+/// `PositionManager` 记的 `net_qty`/`avg_price`——用于修正历史 bug(WS 成交被
+/// REST 轮询覆盖、跨进程订单号碰撞导致重复计成交等)遗留下来的脏数据，这些
+/// 数据是纯增量累加出来的，代码修好之后也不会自动纠正。只支持
+/// `binance_spot`/`binance_futures` 两个 venue，和 `reconcile-order` 一样默认
+/// 只读、加 `--confirm` 才真正覆盖写入。
+async fn run_set_position_command(args: &[String]) -> anyhow::Result<()> {
+    let mut venue: Option<Venue> = None;
+    let mut symbol: Option<Symbol> = None;
+    let mut qty: Option<Decimal> = None;
+    let mut avg_price: Option<Decimal> = None;
+    let mut confirm = false;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--venue" => {
+                let v = args.get(i + 1).context("--venue requires a value")?;
+                if v != "binance_spot" && v != "binance_futures" {
+                    anyhow::bail!("--venue 只支持 binance_spot/binance_futures，收到 '{v}'");
+                }
+                venue = Some(Venue::new(v.clone()));
+                i += 2;
+            }
+            "--symbol" => {
+                let v = args.get(i + 1).context("--symbol requires a value")?;
+                let (base, quote) =
+                    v.split_once('/').context("--symbol must be in Base/Quote format, e.g. APE/USDT")?;
+                symbol = Some(Symbol::new(base, quote));
+                i += 2;
+            }
+            "--qty" => {
+                let v = args.get(i + 1).context("--qty requires a value")?;
+                qty = Some(v.parse().context("--qty must be a valid decimal number (正=多头/净持有，负=空头)")?);
+                i += 2;
+            }
+            "--avg-price" => {
+                let v = args.get(i + 1).context("--avg-price requires a value")?;
+                avg_price = Some(v.parse().context("--avg-price must be a valid decimal number")?);
+                i += 2;
+            }
+            "--confirm" => {
+                confirm = true;
+                i += 1;
+            }
+            other => anyhow::bail!("unknown argument '{other}' for 'set-position' subcommand"),
+        }
+    }
+
+    let venue = venue.context("--venue is required, e.g. --venue binance_spot")?;
+    let symbol = symbol.context("--symbol is required, e.g. --symbol APE/USDT")?;
+    let qty = qty.context("--qty is required, e.g. --qty 322.31 (交易所后台查到的真实净持仓量)")?;
+    if !qty.is_zero() && avg_price.is_none() {
+        anyhow::bail!("--qty 非 0 时必须提供 --avg-price (交易所后台查到的真实持仓均价)");
+    }
+    let avg_price = if qty.is_zero() { None } else { avg_price };
+
+    let redis_url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379/".to_string());
+    info!("set-position: connecting to redis at {redis_url}");
+    let store = RedisPositionStore::new(&redis_url).context("failed to connect RedisPositionStore to redis")?;
+
+    let current = store.get(&venue, &symbol);
+    println!("当前 Redis 里的记录: {current:#?}");
+    println!(
+        "将要写入: venue={venue} symbol={symbol} net_qty={qty} avg_price={}",
+        avg_price.map(|p| p.to_string()).unwrap_or_else(|| "None".to_string())
+    );
+
+    if !confirm {
+        println!("只读模式(默认)：尚未写入 Redis。确认以上数字和交易所后台一致后，加 --confirm 重新执行以落库。");
+        return Ok(());
+    }
+
+    info!("set-position: --confirm 已指定，覆盖写入 Redis");
+    let ts_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or_default();
+    let venue_for_write = venue.clone();
+    let symbol_for_write = symbol.clone();
+    store.update(
+        &venue,
+        &symbol,
+        Box::new(move |_current| VenuePosition {
+            venue: venue_for_write,
+            symbol: symbol_for_write,
+            net_qty: qty,
+            avg_price,
+            updated_at_ms: ts_ms,
+        }),
+    );
+
+    let updated = store.get(&venue, &symbol);
+    println!("写入后的记录: {updated:#?}");
+
+    Ok(())
+}
+
 /// `rotate` 子命令：独立于 `open` 的另一种手动操作——库存轮转。在一个交易所
 /// 卖出、另一个交易所买入等量同一资产，两条腿真实市价单并发发起，不涉及链上
 /// 划转。同样不接入 engine 主循环，也不读取 `config.toml`，参数全部来自命令行。
@@ -1006,7 +1107,7 @@ async fn run_monitor_command(args: &[String]) -> anyhow::Result<()> {
             Ok((binance_fee, kraken_fee)) => {
                 let binance_effective_bps = binance_fee.taker_bps * binance_fee_discount;
                 let fees: HashMap<Venue, FeeSchedule> = HashMap::from([
-                    (Venue::new("binance"), FeeSchedule::new(binance_effective_bps)),
+                    (Venue::new("binance_spot"), FeeSchedule::new(binance_effective_bps)),
                     (Venue::new("kraken"), FeeSchedule::new(kraken_fee.taker_bps)),
                 ]);
                 monitored_summary.push(format!(
@@ -1051,8 +1152,13 @@ async fn run_monitor_command(args: &[String]) -> anyhow::Result<()> {
 
     let (tx, rx) = tokio::sync::mpsc::channel(1024);
     let mut source_handles = Vec::new();
+    // 用 "binance_spot" 而不是策略层惯用的 "binance"，是为了和
+    // `PositionManager`/`PortfolioManager` 里现货仓位统一用的 venue 命名对齐——
+    // 否则 `PortfolioManager::valuation_for` 按仓位的 venue 去 quote_cache 查
+    // mark price 时，现货这条腿永远查不到 (之前拿 "binance" 存的行情)，导致
+    // 现货 market_value/unrealized_pnl 恒为 None。
     let binance_source: Box<dyn MarketDataSource> = Box::new(BinanceSpotSource::new(
-        Venue::new("binance"),
+        Venue::new("binance_spot"),
         symbols.clone(),
         testnet,
         proxy.clone(),
