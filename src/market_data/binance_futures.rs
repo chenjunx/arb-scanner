@@ -17,7 +17,7 @@ use crate::types::{MarketEvent, Quote, Symbol, Venue};
 use super::{MarketDataSource, now_ms};
 
 const MAINNET_WS_HOST: &str = "fstream.binance.com";
-const MAINNET_WS_PORT: u16 = 9443;
+const MAINNET_WS_PORT: u16 = 443;
 const TESTNET_WS_HOST: &str = "stream.binancefuture.com";
 const TESTNET_WS_PORT: u16 = 443;
 const MIN_BACKOFF: Duration = Duration::from_secs(1);
@@ -258,7 +258,7 @@ mod tests {
 
         assert_eq!(
             source.stream_url(),
-            "wss://fstream.binance.com:9443/stream?streams=btcusdt@bookTicker/ethbtc@bookTicker"
+            "wss://fstream.binance.com:443/stream?streams=btcusdt@bookTicker/ethbtc@bookTicker"
         );
     }
 
