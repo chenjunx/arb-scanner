@@ -1,10 +1,11 @@
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
-use log::debug;
+use log::{debug, info};
 use rust_decimal::Decimal;
 
-use crate::engine::MarketView;
-use crate::types::{MarketEvent, Symbol, Venue};
+use crate::topic::{Topic, TopicBus};
+use crate::types::{Quote, Symbol, Venue};
 
 use super::{FeeSchedule, Opportunity, OpportunityKind, Strategy};
 
@@ -14,6 +15,8 @@ pub struct CrossExchangeStrategy {
     symbols: Vec<Symbol>,
     fees: HashMap<Venue, FeeSchedule>,
     min_profit_bps: Decimal,
+    latest: Mutex<HashMap<Symbol, HashMap<Venue, Quote>>>,
+    bus: Arc<TopicBus>,
 }
 
 impl CrossExchangeStrategy {
@@ -21,24 +24,29 @@ impl CrossExchangeStrategy {
         symbols: Vec<Symbol>,
         fees: HashMap<Venue, FeeSchedule>,
         min_profit_bps: Decimal,
+        bus: Arc<TopicBus>,
     ) -> Self {
         Self {
             symbols,
             fees,
             min_profit_bps,
+            latest: Mutex::new(HashMap::new()),
+            bus,
         }
     }
 
+    /// `subscriptions()` 就是从 `fees` 派生出来的，所以这里查不到只可能是调用方
+    /// 传入的行情不是自己订阅范围内的——修 bug 而不是兜底掩盖它。
     fn fee_for(&self, venue: &Venue) -> FeeSchedule {
         self.fees
             .get(venue)
             .copied()
-            .unwrap_or(FeeSchedule::new(0))
+            .expect("CrossExchangeStrategy received a quote for a venue outside its subscriptions")
     }
 }
 
 /// 给定买/卖两侧的价格和各自手续费，返回扣费后的价差(基点)。买价 <= 0 时返回
-/// `None`(报价还没来)。供 `on_update` 使用。
+/// `None`(报价还没来)。供 `on_quote` 使用。
 pub fn compute_profit_bps(
     buy_ask: Decimal,
     buy_fee: FeeSchedule,
@@ -53,32 +61,62 @@ pub fn compute_profit_bps(
     Some((sell_proceeds - buy_cost) / buy_cost * Decimal::from(10_000))
 }
 
+fn log_opportunity(opportunity: &Opportunity) {
+    let OpportunityKind::CrossExchange {
+        symbol,
+        buy_venue,
+        sell_venue,
+    } = &opportunity.kind
+    else {
+        return;
+    };
+    info!(
+        "[{}] {} buy={} sell={} profit_bps={} detail={}",
+        opportunity.strategy, symbol, buy_venue, sell_venue, opportunity.expected_profit_bps, opportunity.detail
+    );
+}
+
 impl Strategy for CrossExchangeStrategy {
     fn name(&self) -> &str {
         "cross_exchange"
     }
 
-    fn on_update(&self, view: &MarketView, changed: &MarketEvent) -> Vec<Opportunity> {
-        if !self.symbols.contains(&changed.symbol) {
-            return Vec::new();
-        }
+    fn subscriptions(&self) -> Vec<Topic> {
+        self.fees
+            .keys()
+            .flat_map(|venue| {
+                self.symbols
+                    .iter()
+                    .map(move |symbol| Topic::quote(venue.clone(), symbol.clone()))
+            })
+            .collect()
+    }
 
-        let quotes = view.quotes_for_symbol(&changed.symbol);
-        let mut opportunities = Vec::new();
+    fn bus(&self) -> &Arc<TopicBus> {
+        &self.bus
+    }
 
-        for (buy_venue, buy_quote) in &quotes {
+    fn on_quote(&self, topic: &Topic, quote: &Quote) {
+        let (venue, symbol) = match topic {
+            Topic::Quote { venue, symbol } => (venue, symbol),
+            _ => return,
+        };
+        let mut latest = self.latest.lock().unwrap();
+        let symbol_quotes = latest.entry(symbol.clone()).or_default();
+        symbol_quotes.insert(venue.clone(), *quote);
+
+        let mut found = Vec::new();
+        for (buy_venue, buy_quote) in symbol_quotes.iter() {
             if buy_quote.ask <= Decimal::ZERO {
                 continue;
             }
             let buy_fee = self.fee_for(buy_venue);
-            let buy_cost = buy_quote.ask * buy_fee.buy_multiplier();
 
-            for (sell_venue, sell_quote) in &quotes {
+            for (sell_venue, sell_quote) in symbol_quotes.iter() {
                 if buy_venue == sell_venue {
                     continue;
                 }
                 let sell_fee = self.fee_for(sell_venue);
-                let sell_proceeds = sell_quote.bid * sell_fee.sell_multiplier();
 
                 let Some(profit_bps) = compute_profit_bps(buy_quote.ask, buy_fee, sell_quote.bid, sell_fee) else {
                     continue;
@@ -86,7 +124,7 @@ impl Strategy for CrossExchangeStrategy {
 
                 debug!(
                     "{sym} spread: buy={bv}@{ba} sell={sv}@{sb} profit_bps={p}",
-                    sym = changed.symbol,
+                    sym = symbol,
                     bv = buy_venue,
                     ba = buy_quote.ask,
                     sv = sell_venue,
@@ -98,34 +136,36 @@ impl Strategy for CrossExchangeStrategy {
                     continue;
                 }
 
-                opportunities.push(Opportunity {
+                let buy_cost = buy_quote.ask * buy_fee.buy_multiplier();
+                let sell_proceeds = sell_quote.bid * sell_fee.sell_multiplier();
+                found.push(Opportunity {
                     strategy: "cross_exchange",
                     kind: OpportunityKind::CrossExchange {
-                        symbol: changed.symbol.clone(),
+                        symbol: symbol.clone(),
                         buy_venue: buy_venue.clone(),
                         sell_venue: sell_venue.clone(),
                     },
                     expected_profit_bps: profit_bps,
                     detail: format!(
                         "buy {symbol} on {buy_venue} @ {buy_ask} (cost {buy_cost}), sell on {sell_venue} @ {sell_bid} (proceeds {sell_proceeds})",
-                        symbol = changed.symbol,
                         buy_ask = buy_quote.ask,
                         sell_bid = sell_quote.bid,
                     ),
-                    ts_ms: changed.quote.ts_ms,
+                    ts_ms: quote.ts_ms,
                 });
             }
         }
+        drop(latest);
 
-        opportunities
+        for opportunity in &found {
+            log_opportunity(opportunity);
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::Quote;
-    use dashmap::DashMap;
 
     fn quote(bid: &str, ask: &str) -> Quote {
         Quote {
@@ -137,8 +177,23 @@ mod tests {
         }
     }
 
-    fn view_with(cache: &DashMap<(Venue, Symbol), Quote>) -> MarketView<'_> {
-        MarketView::new(cache)
+    fn fees_for(venues: &[&Venue]) -> HashMap<Venue, FeeSchedule> {
+        venues.iter().map(|v| ((*v).clone(), FeeSchedule::new(0))).collect()
+    }
+
+    #[test]
+    fn subscriptions_only_cover_configured_venues_and_symbols() {
+        let watched = Symbol::new("BTC", "USDT");
+        let venue_a = Venue::new("a");
+        let strategy = CrossExchangeStrategy::new(
+            vec![watched.clone()],
+            fees_for(&[&venue_a]),
+            Decimal::ZERO,
+            Arc::new(TopicBus::new()),
+        );
+
+        let subs = strategy.subscriptions();
+        assert_eq!(subs, vec![Topic::quote(venue_a, watched)]);
     }
 
     #[test]
@@ -146,42 +201,26 @@ mod tests {
         let symbol = Symbol::new("BTC", "USDT");
         let venue_a = Venue::new("a");
         let venue_b = Venue::new("b");
-        let cache: DashMap<(Venue, Symbol), Quote> = DashMap::new();
-        cache.insert((venue_a.clone(), symbol.clone()), quote("100.0", "100.5"));
-        cache.insert((venue_b.clone(), symbol.clone()), quote("102.0", "102.5"));
-
-        let strategy = CrossExchangeStrategy::new(vec![symbol.clone()], HashMap::new(), Decimal::from(1));
-        let changed = MarketEvent {
-            venue: venue_b.clone(),
-            symbol: symbol.clone(),
-            quote: quote("102.0", "102.5"),
-        };
-
-        let view = view_with(&cache);
-        let opportunities = strategy.on_update(&view, &changed);
-
-        assert!(
-            opportunities
-                .iter()
-                .any(|o| matches!(&o.kind, OpportunityKind::CrossExchange { buy_venue, sell_venue, .. }
-                    if buy_venue == &venue_a && sell_venue == &venue_b))
+        let strategy = CrossExchangeStrategy::new(
+            vec![symbol.clone()],
+            fees_for(&[&venue_a, &venue_b]),
+            Decimal::from(1),
+            Arc::new(TopicBus::new()),
         );
-    }
 
-    #[test]
-    fn ignores_unwatched_symbol() {
-        let watched = Symbol::new("BTC", "USDT");
-        let other = Symbol::new("ETH", "USDT");
-        let cache: DashMap<(Venue, Symbol), Quote> = DashMap::new();
-        let strategy = CrossExchangeStrategy::new(vec![watched], HashMap::new(), Decimal::ZERO);
-        let changed = MarketEvent {
-            venue: Venue::new("a"),
-            symbol: other,
-            quote: quote("1", "1"),
-        };
+        strategy.on_quote(&Topic::quote(venue_a.clone(), symbol.clone()), &quote("100.0", "100.5"));
+        strategy.on_quote(&Topic::quote(venue_b.clone(), symbol.clone()), &quote("102.0", "102.5"));
 
-        let view = view_with(&cache);
-        assert!(strategy.on_update(&view, &changed).is_empty());
+        let latest = strategy.latest.lock().unwrap();
+        let symbol_quotes = &latest[&symbol];
+        let profit_bps = compute_profit_bps(
+            symbol_quotes[&venue_a].ask,
+            strategy.fee_for(&venue_a),
+            symbol_quotes[&venue_b].bid,
+            strategy.fee_for(&venue_b),
+        )
+        .unwrap();
+        assert!(profit_bps > Decimal::from(1));
     }
 
     #[test]
@@ -189,19 +228,25 @@ mod tests {
         let symbol = Symbol::new("BTC", "USDT");
         let venue_a = Venue::new("a");
         let venue_b = Venue::new("b");
-        let cache: DashMap<(Venue, Symbol), Quote> = DashMap::new();
-        cache.insert((venue_a.clone(), symbol.clone()), quote("100.0", "100.1"));
-        cache.insert((venue_b.clone(), symbol.clone()), quote("100.05", "100.15"));
+        let strategy = CrossExchangeStrategy::new(
+            vec![symbol.clone()],
+            fees_for(&[&venue_a, &venue_b]),
+            Decimal::from(50),
+            Arc::new(TopicBus::new()),
+        );
 
-        let strategy =
-            CrossExchangeStrategy::new(vec![symbol.clone()], HashMap::new(), Decimal::from(50));
-        let changed = MarketEvent {
-            venue: venue_b,
-            symbol,
-            quote: quote("100.05", "100.15"),
-        };
+        strategy.on_quote(&Topic::quote(venue_a.clone(), symbol.clone()), &quote("100.0", "100.1"));
+        strategy.on_quote(&Topic::quote(venue_b.clone(), symbol.clone()), &quote("100.05", "100.15"));
 
-        let view = view_with(&cache);
-        assert!(strategy.on_update(&view, &changed).is_empty());
+        let latest = strategy.latest.lock().unwrap();
+        let symbol_quotes = &latest[&symbol];
+        let profit_bps = compute_profit_bps(
+            symbol_quotes[&venue_a].ask,
+            strategy.fee_for(&venue_a),
+            symbol_quotes[&venue_b].bid,
+            strategy.fee_for(&venue_b),
+        )
+        .unwrap();
+        assert!(profit_bps < Decimal::from(50));
     }
 }

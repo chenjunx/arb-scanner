@@ -95,7 +95,7 @@ mod tests {
         Order {
             order_id: OrderId::new(id),
             request: OrderRequest {
-                strategy_name: "test".to_string(),
+                strategy_id: "test".to_string(),
                 venue: Venue::new("binance_spot"),
                 symbol: Symbol::new("BTC", "USDT"),
                 side: OrderSide::Buy,
@@ -103,6 +103,7 @@ mod tests {
                 client_order_id: None,
                 group_id: None,
                 metadata: None,
+                order_id: None,
             },
             status,
             filled_qty: Decimal::ZERO,

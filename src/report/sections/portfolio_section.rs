@@ -41,11 +41,13 @@ impl ReportSection for PortfolioSection {
             let pnl = self.portfolio_manager.asset_pnl(&asset);
             let valuation = self.portfolio_manager.asset_valuation(&asset);
             lines.push(format!(
-                "{asset}: net_qty={} market_value={} realized_pnl={} fees_paid={} funding_pnl={} unrealized_pnl={} net_pnl={}",
+                "{asset}: net_qty={} market_value={} realized_pnl={} fees_paid={} fees_paid_usdt={}{} funding_pnl={} unrealized_pnl={} net_pnl={}",
                 valuation.net_qty,
                 fmt_opt(valuation.market_value),
                 pnl.realized_pnl,
                 pnl.fees_paid,
+                pnl.fees_paid_usdt,
+                if pnl.fees_usdt_incomplete { "(部分未换算)" } else { "" },
                 pnl.funding_pnl,
                 fmt_opt(pnl.unrealized_pnl),
                 pnl.net_pnl,
@@ -96,8 +98,8 @@ mod tests {
         ));
         let venue = Venue::new("binance_spot");
         let symbol = Symbol::new("BTC", "USDT");
-        pm.on_filled(&venue, &symbol, OrderSide::Buy, Decimal::ONE, Some(Decimal::new(50000, 0)), 1);
-        portfolio.record_fill(&venue, &symbol, Decimal::ONE, Some(Decimal::new(50000, 0)), Some(Decimal::new(5, 0)), Decimal::new(100, 0), 1);
+        pm.on_filled(&venue, &symbol, OrderSide::Buy, Decimal::ONE, Some(Decimal::new(50000, 0)), None, None, None, 1);
+        portfolio.record_fill(&venue, &symbol, Decimal::ONE, Some(Decimal::new(50000, 0)), Some(Decimal::new(5, 0)), None, Decimal::new(100, 0), 1);
 
         let section = PortfolioSection::new(pm, portfolio);
         let body = section.render();

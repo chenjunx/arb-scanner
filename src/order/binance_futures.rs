@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
@@ -10,7 +11,6 @@ use log::{debug, warn};
 use ring::signature::Ed25519KeyPair;
 use rust_decimal::Decimal;
 use serde::Deserialize;
-use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
@@ -18,6 +18,7 @@ use crate::accounting::provider::FundingIncomeRecord;
 use crate::market_data::now_ms;
 use crate::net::connect_tcp;
 use crate::order_manager::stream::{ExchangeOrderUpdate, OrderStreamSource};
+use crate::order_manager::OrderManager;
 use crate::types::{Symbol, Venue};
 
 use super::OrderProvider;
@@ -108,7 +109,7 @@ impl BinanceFuturesOrderProvider {
         start_time_ms: Option<u64>,
     ) -> anyhow::Result<Vec<FundingIncomeRecord>> {
         let mut params = vec![
-            ("symbol".to_string(), Self::binance_symbol(symbol)),
+            ("symbol".to_string(), binance_symbol(symbol)),
             ("incomeType".to_string(), "FUNDING_FEE".to_string()),
             ("limit".to_string(), "1000".to_string()),
         ];
@@ -118,10 +119,16 @@ impl BinanceFuturesOrderProvider {
         let text = self.signed_request(reqwest::Method::GET, "/fapi/v1/income", params).await?;
         parse_funding_income(&text, symbol)
     }
+}
 
-    fn binance_symbol(symbol: &Symbol) -> String {
-        format!("{}{}", symbol.base, symbol.quote).to_ascii_uppercase()
-    }
+fn binance_symbol(symbol: &Symbol) -> String {
+    format!("{}{}", symbol.base, symbol.quote).to_ascii_uppercase()
+}
+
+/// 从已知的 symbols 列表构建 "BTCUSDT" -> Symbol 反查表，供解析 User Data
+/// Stream 推送时把交易所的拼接式 symbol 还原成结构化的 `Symbol`。
+fn binance_futures_symbol_map(symbols: &[Symbol]) -> HashMap<String, Symbol> {
+    symbols.iter().map(|s| (binance_symbol(s), s.clone())).collect()
 }
 
 #[async_trait]
@@ -135,7 +142,7 @@ impl OrderProvider for BinanceFuturesOrderProvider {
             anyhow::bail!("{} does not support quote-amount market orders", self.venue());
         };
         let mut params = vec![
-            ("symbol".to_string(), Self::binance_symbol(&req.symbol)),
+            ("symbol".to_string(), binance_symbol(&req.symbol)),
             ("side".to_string(), map_side(req.side).to_string()),
             ("type".to_string(), "MARKET".to_string()),
             ("quantity".to_string(), quantity.to_string()),
@@ -159,7 +166,7 @@ impl OrderProvider for BinanceFuturesOrderProvider {
     /// 兜底核对，以及 `reconcile-order` 命令。
     async fn query_order(&self, symbol: &Symbol, exchange_order_id: &str) -> anyhow::Result<OrderResult> {
         let params = vec![
-            ("symbol".to_string(), Self::binance_symbol(symbol)),
+            ("symbol".to_string(), binance_symbol(symbol)),
             ("orderId".to_string(), exchange_order_id.to_string()),
         ];
         let text = self.signed_request(reqwest::Method::GET, "/fapi/v1/order", params).await?;
@@ -181,6 +188,16 @@ impl OrderProvider for BinanceFuturesOrderProvider {
 
         Ok(result)
     }
+
+    /// `GET /fapi/v1/ticker/price?symbol={ASSET}USDT`，公开行情接口不需要签名。
+    async fn quote_usdt_price(&self, asset: &str) -> anyhow::Result<Decimal> {
+        let symbol = format!("{}USDT", asset.to_ascii_uppercase());
+        let url = format!("{}/fapi/v1/ticker/price?symbol={symbol}", self.host);
+        crate::ratelimit::throttle(self.host).await;
+        let resp = self.http.get(&url).send().await.context("binance futures ticker price request failed")?;
+        let text = resp.text().await.context("failed to read binance futures ticker price response body")?;
+        parse_ticker_price(&text)
+    }
 }
 
 impl BinanceFuturesOrderProvider {
@@ -192,7 +209,7 @@ impl BinanceFuturesOrderProvider {
         exchange_order_id: &str,
     ) -> anyhow::Result<(Option<Decimal>, Option<String>)> {
         let params = vec![
-            ("symbol".to_string(), Self::binance_symbol(symbol)),
+            ("symbol".to_string(), binance_symbol(symbol)),
             ("orderId".to_string(), exchange_order_id.to_string()),
         ];
         let text = self.signed_request(reqwest::Method::GET, "/fapi/v1/userTrades", params).await?;
@@ -211,10 +228,17 @@ pub struct BinanceFuturesUserDataStream {
     ws_port: u16,
     http: reqwest::Client,
     proxy: Option<String>,
+    symbols: Vec<Symbol>,
 }
 
 impl BinanceFuturesUserDataStream {
-    pub fn new(venue: Venue, api_key: String, testnet: bool, proxy: Option<&str>) -> anyhow::Result<Self> {
+    pub fn new(
+        venue: Venue,
+        api_key: String,
+        testnet: bool,
+        proxy: Option<&str>,
+        symbols: Vec<Symbol>,
+    ) -> anyhow::Result<Self> {
         let http = build_http_client(proxy)?;
         let (host, ws_host) = if testnet { (TESTNET_HOST, TESTNET_WS_HOST) } else { (MAINNET_HOST, MAINNET_WS_HOST) };
         Ok(Self {
@@ -225,14 +249,15 @@ impl BinanceFuturesUserDataStream {
             ws_port: WS_PORT,
             http,
             proxy: proxy.map(str::to_string),
+            symbols,
         })
     }
 
     /// 从环境变量读取凭证，和 `BinanceFuturesOrderProvider::from_env` 复用同一个
     /// `BINANCE_API_KEY`（listenKey 接口不需要 API secret/签名）。
-    pub fn from_env(venue: Venue, testnet: bool, proxy: Option<&str>) -> anyhow::Result<Self> {
+    pub fn from_env(venue: Venue, testnet: bool, proxy: Option<&str>, symbols: Vec<Symbol>) -> anyhow::Result<Self> {
         let api_key = std::env::var("BINANCE_API_KEY").context("BINANCE_API_KEY not set")?;
-        Self::new(venue, api_key, testnet, proxy)
+        Self::new(venue, api_key, testnet, proxy, symbols)
     }
 
     async fn create_listen_key(&self) -> anyhow::Result<String> {
@@ -276,8 +301,9 @@ impl OrderStreamSource for BinanceFuturesUserDataStream {
         self.venue.clone()
     }
 
-    fn spawn(self: Box<Self>, tx: mpsc::Sender<ExchangeOrderUpdate>) -> crate::order_manager::stream::StreamHandle {
+    fn spawn(self: Box<Self>, order_manager: Arc<OrderManager>) -> crate::order_manager::stream::StreamHandle {
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let symbol_map = binance_futures_symbol_map(&self.symbols);
         let join = tokio::spawn(async move {
             let mut backoff = MIN_BACKOFF;
             let mut ready_tx = Some(ready_tx);
@@ -338,10 +364,8 @@ impl OrderStreamSource for BinanceFuturesUserDataStream {
                                 }
                             };
                             let Message::Text(text) = msg else { continue };
-                            let Some(update) = parse_order_trade_update(&text, &self.venue) else { continue };
-                            if tx.send(update).await.is_err() {
-                                return;
-                            }
+                            let Some(update) = parse_order_trade_update(&text, &self.venue, &symbol_map) else { continue };
+                            order_manager.handle_exchange_update(update).await;
                         }
                     }
                 }
@@ -465,6 +489,8 @@ struct UserDataEventEnvelope {
 
 #[derive(Debug, Deserialize)]
 struct OrderTradeUpdateOrder {
+    #[serde(rename = "s")]
+    symbol: String,
     #[serde(rename = "c")]
     client_order_id: String,
     #[serde(rename = "i")]
@@ -496,7 +522,11 @@ struct OrderTradeUpdateEvent {
 /// 解析一条 User Data Stream 消息，只关心 `ORDER_TRADE_UPDATE` 事件(其它如
 /// `ACCOUNT_UPDATE`/`MARGIN_CALL` 直接忽略)。纯函数，不依赖真实 WebSocket
 /// 连接，便于单元测试。
-fn parse_order_trade_update(text: &str, venue: &Venue) -> Option<ExchangeOrderUpdate> {
+fn parse_order_trade_update(
+    text: &str,
+    venue: &Venue,
+    symbol_map: &HashMap<String, Symbol>,
+) -> Option<ExchangeOrderUpdate> {
     let envelope: UserDataEventEnvelope = match serde_json::from_str(text) {
         Ok(envelope) => envelope,
         Err(err) => {
@@ -515,10 +545,15 @@ fn parse_order_trade_update(text: &str, venue: &Venue) -> Option<ExchangeOrderUp
         }
     };
     let order = event.order;
+    let Some(symbol) = symbol_map.get(&order.symbol) else {
+        warn!("binance futures user data stream: unmapped symbol {}, dropping update", order.symbol);
+        return None;
+    };
     let avg_price = (order.avg_price > Decimal::ZERO).then_some(order.avg_price);
 
     Some(ExchangeOrderUpdate {
         venue: venue.clone(),
+        symbol: symbol.clone(),
         client_order_id: Some(order.client_order_id).filter(|s| !s.is_empty()),
         exchange_order_id: Some(order.exchange_order_id.to_string()),
         status: map_status(&order.order_status),
@@ -596,6 +631,20 @@ fn parse_user_trades_response(text: &str) -> anyhow::Result<(Option<Decimal>, Op
 }
 
 #[derive(Debug, Deserialize)]
+struct TickerPriceResponse {
+    price: Decimal,
+}
+
+fn parse_ticker_price(text: &str) -> anyhow::Result<Decimal> {
+    if let Ok(err) = serde_json::from_str::<ErrorResponse>(text) {
+        anyhow::bail!("binance futures error {}: {}", err.code, err.msg);
+    }
+    let resp: TickerPriceResponse = serde_json::from_str(text)
+        .with_context(|| format!("failed to parse binance futures ticker price response, raw body: {text}"))?;
+    Ok(resp.price)
+}
+
+#[derive(Debug, Deserialize)]
 struct IncomeEntry {
     #[serde(rename = "incomeType")]
     income_type: String,
@@ -631,6 +680,12 @@ mod tests {
     use super::*;
     use ring::rand::SystemRandom;
     use ring::signature::{KeyPair, UnparsedPublicKey};
+
+    fn map_with(symbol: Symbol) -> HashMap<String, Symbol> {
+        let mut map = HashMap::new();
+        map.insert(binance_symbol(&symbol), symbol);
+        map
+    }
 
     fn generate_test_pem() -> (String, Ed25519KeyPair) {
         let rng = SystemRandom::new();
@@ -762,6 +817,8 @@ mod tests {
     #[test]
     fn parses_order_trade_update_partial_fill() {
         let venue = Venue::new("binance_futures");
+        let symbol = Symbol::new("BTC", "USDT");
+        let map = map_with(symbol.clone());
         let text = r#"{
             "e": "ORDER_TRADE_UPDATE",
             "E": 1700000000123,
@@ -777,8 +834,9 @@ mod tests {
                 "l": "0.40000000"
             }
         }"#;
-        let update = parse_order_trade_update(text, &venue).expect("should parse");
+        let update = parse_order_trade_update(text, &venue, &map).expect("should parse");
         assert_eq!(update.venue, venue);
+        assert_eq!(update.symbol, symbol);
         assert_eq!(update.client_order_id, Some("ORD-000000000001".to_string()));
         assert_eq!(update.exchange_order_id, Some("123456".to_string()));
         assert_eq!(update.status, OrderStatus::PartiallyFilled);
@@ -792,6 +850,7 @@ mod tests {
     #[test]
     fn parses_order_trade_update_with_commission() {
         let venue = Venue::new("binance_futures");
+        let map = map_with(Symbol::new("BTC", "USDT"));
         let text = r#"{
             "e": "ORDER_TRADE_UPDATE",
             "E": 1700000000123,
@@ -809,7 +868,7 @@ mod tests {
                 "N": "USDT"
             }
         }"#;
-        let update = parse_order_trade_update(text, &venue).expect("should parse");
+        let update = parse_order_trade_update(text, &venue, &map).expect("should parse");
         assert_eq!(update.fee, Some("0.016".parse().unwrap()));
         assert_eq!(update.fee_asset, Some("USDT".to_string()));
     }
@@ -817,6 +876,7 @@ mod tests {
     #[test]
     fn parses_order_trade_update_new_order_without_fill() {
         let venue = Venue::new("binance_futures");
+        let map = map_with(Symbol::new("BTC", "USDT"));
         let text = r#"{
             "e": "ORDER_TRADE_UPDATE",
             "E": 1700000000000,
@@ -832,7 +892,7 @@ mod tests {
                 "l": "0"
             }
         }"#;
-        let update = parse_order_trade_update(text, &venue).expect("should parse");
+        let update = parse_order_trade_update(text, &venue, &map).expect("should parse");
         assert_eq!(update.status, OrderStatus::New);
         assert_eq!(update.filled_qty, Decimal::ZERO);
         assert_eq!(update.avg_price, None);
@@ -843,14 +903,38 @@ mod tests {
     #[test]
     fn ignores_non_order_trade_update_events() {
         let venue = Venue::new("binance_futures");
+        let map = map_with(Symbol::new("BTC", "USDT"));
         let text = r#"{"e":"ACCOUNT_UPDATE","E":1700000000000,"a":{}}"#;
-        assert!(parse_order_trade_update(text, &venue).is_none());
+        assert!(parse_order_trade_update(text, &venue, &map).is_none());
+    }
+
+    #[test]
+    fn ignores_order_trade_update_for_unmapped_symbol() {
+        let venue = Venue::new("binance_futures");
+        let map = map_with(Symbol::new("ETH", "USDT"));
+        let text = r#"{
+            "e": "ORDER_TRADE_UPDATE",
+            "E": 1700000000123,
+            "o": {
+                "s": "BTCUSDT",
+                "c": "ORD-000000000001",
+                "S": "SELL",
+                "o": "MARKET",
+                "X": "PARTIALLY_FILLED",
+                "i": 123456,
+                "z": "0.40000000",
+                "ap": "40000",
+                "l": "0.40000000"
+            }
+        }"#;
+        assert!(parse_order_trade_update(text, &venue, &map).is_none());
     }
 
     #[test]
     fn ignores_malformed_user_data_stream_message() {
         let venue = Venue::new("binance_futures");
-        assert!(parse_order_trade_update("not json", &venue).is_none());
+        let map = map_with(Symbol::new("BTC", "USDT"));
+        assert!(parse_order_trade_update("not json", &venue, &map).is_none());
     }
 
     #[test]
@@ -894,6 +978,20 @@ mod tests {
         assert_eq!(records[0].tran_id, 111111);
         assert_eq!(records[1].income, "0.00800000".parse().unwrap());
         assert_eq!(records[1].tran_id, 333333);
+    }
+
+    #[test]
+    fn parses_ticker_price_response() {
+        let text = r#"{"symbol":"BTCUSDT","price":"40000.50"}"#;
+        let price = parse_ticker_price(text).expect("should parse");
+        assert_eq!(price, "40000.50".parse().unwrap());
+    }
+
+    #[test]
+    fn parse_ticker_price_surfaces_error_response() {
+        let text = r#"{"code":-1121,"msg":"Invalid symbol."}"#;
+        let err = parse_ticker_price(text).unwrap_err();
+        assert!(err.to_string().contains("Invalid symbol"));
     }
 
     #[test]

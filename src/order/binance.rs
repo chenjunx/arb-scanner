@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
@@ -10,13 +11,13 @@ use log::{debug, warn};
 use ring::signature::Ed25519KeyPair;
 use rust_decimal::Decimal;
 use serde::Deserialize;
-use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 use crate::market_data::now_ms;
 use crate::net::connect_tcp;
 use crate::order_manager::stream::{ExchangeOrderUpdate, OrderStreamSource};
+use crate::order_manager::OrderManager;
 use crate::types::{Symbol, Venue};
 
 use super::OrderProvider;
@@ -96,9 +97,14 @@ impl BinanceOrderProvider {
         Ok(text)
     }
 
-    fn binance_symbol(symbol: &Symbol) -> String {
-        format!("{}{}", symbol.base, symbol.quote).to_ascii_uppercase()
-    }
+}
+
+fn binance_symbol(symbol: &Symbol) -> String {
+    format!("{}{}", symbol.base, symbol.quote).to_ascii_uppercase()
+}
+
+fn binance_symbol_map(symbols: &[Symbol]) -> HashMap<String, Symbol> {
+    symbols.iter().map(|s| (binance_symbol(s), s.clone())).collect()
 }
 
 #[async_trait]
@@ -109,7 +115,7 @@ impl OrderProvider for BinanceOrderProvider {
 
     async fn place_market_order_raw(&self, req: &MarketOrderRequest) -> anyhow::Result<OrderResult> {
         let mut params = vec![
-            ("symbol".to_string(), Self::binance_symbol(&req.symbol)),
+            ("symbol".to_string(), binance_symbol(&req.symbol)),
             ("side".to_string(), map_side(req.side).to_string()),
             ("type".to_string(), "MARKET".to_string()),
         ];
@@ -134,7 +140,7 @@ impl OrderProvider for BinanceOrderProvider {
     /// 用于 `wait_for_fill` 的 REST 兜底核对，以及 `reconcile-order` 命令。
     async fn query_order(&self, symbol: &Symbol, exchange_order_id: &str) -> anyhow::Result<OrderResult> {
         let params = vec![
-            ("symbol".to_string(), Self::binance_symbol(symbol)),
+            ("symbol".to_string(), binance_symbol(symbol)),
             ("orderId".to_string(), exchange_order_id.to_string()),
         ];
         let text = self.signed_request(reqwest::Method::GET, "/api/v3/order", params).await?;
@@ -156,6 +162,16 @@ impl OrderProvider for BinanceOrderProvider {
 
         Ok(result)
     }
+
+    /// `GET /api/v3/ticker/price?symbol={ASSET}USDT`，公开行情接口不需要签名。
+    async fn quote_usdt_price(&self, asset: &str) -> anyhow::Result<Decimal> {
+        let symbol = format!("{}USDT", asset.to_ascii_uppercase());
+        let url = format!("{}/api/v3/ticker/price?symbol={symbol}", self.host);
+        crate::ratelimit::throttle(self.host).await;
+        let resp = self.http.get(&url).send().await.context("binance ticker price request failed")?;
+        let text = resp.text().await.context("failed to read binance ticker price response body")?;
+        parse_ticker_price(&text)
+    }
 }
 
 impl BinanceOrderProvider {
@@ -167,7 +183,7 @@ impl BinanceOrderProvider {
         exchange_order_id: &str,
     ) -> anyhow::Result<(Option<Decimal>, Option<String>)> {
         let params = vec![
-            ("symbol".to_string(), Self::binance_symbol(symbol)),
+            ("symbol".to_string(), binance_symbol(symbol)),
             ("orderId".to_string(), exchange_order_id.to_string()),
         ];
         let text = self.signed_request(reqwest::Method::GET, "/api/v3/myTrades", params).await?;
@@ -235,7 +251,7 @@ fn map_status(status: &str) -> OrderStatus {
         "FILLED" => OrderStatus::Filled,
         "PARTIALLY_FILLED" => OrderStatus::PartiallyFilled,
         "REJECTED" => OrderStatus::Rejected,
-        "EXPIRED" | "EXPIRED_IN_MATCH" => OrderStatus::Expired,
+        "EXPIRED" | "EXPIRED_IN_MATCH" | "CANCELED" => OrderStatus::Expired,
         _ => OrderStatus::New,
     }
 }
@@ -315,6 +331,22 @@ fn parse_my_trades_response(text: &str) -> anyhow::Result<(Option<Decimal>, Opti
     Ok(sum_fee_by_asset(&fills))
 }
 
+#[derive(Debug, Deserialize)]
+struct TickerPriceResponse {
+    price: Decimal,
+}
+
+/// `GET /api/v3/ticker/price`(现货)与 `GET /fapi/v1/ticker/price`(合约)响应
+/// 形状一致，只有一个字符串 `price` 字段，两个 provider 共用这个解析函数。
+fn parse_ticker_price(text: &str) -> anyhow::Result<Decimal> {
+    if let Ok(err) = serde_json::from_str::<ErrorResponse>(text) {
+        anyhow::bail!("binance error {}: {}", err.code, err.msg);
+    }
+    let resp: TickerPriceResponse = serde_json::from_str(text)
+        .with_context(|| format!("failed to parse binance ticker price response, raw body: {text}"))?;
+    Ok(resp.price)
+}
+
 /// 币安现货 User Data Stream 客户端：在 WS API 连接内做 `session.logon`
 /// (Ed25519 签名鉴权) + `userDataStream.subscribe`，把推送的 `executionReport`
 /// 转换成 `ExchangeOrderUpdate`。2026-02-20 起旧的 listenKey REST 接口
@@ -326,10 +358,18 @@ pub struct BinanceUserDataStream {
     ws_host: &'static str,
     ws_port: u16,
     proxy: Option<String>,
+    symbols: Vec<Symbol>,
 }
 
 impl BinanceUserDataStream {
-    pub fn new(venue: Venue, api_key: String, private_key_pem: &str, testnet: bool, proxy: Option<&str>) -> anyhow::Result<Self> {
+    pub fn new(
+        venue: Venue,
+        api_key: String,
+        private_key_pem: &str,
+        testnet: bool,
+        proxy: Option<&str>,
+        symbols: Vec<Symbol>,
+    ) -> anyhow::Result<Self> {
         let key_pair = load_ed25519_key(private_key_pem)?;
         let ws_host = if testnet { WS_API_TESTNET_HOST } else { WS_API_MAINNET_HOST };
         Ok(Self {
@@ -339,16 +379,17 @@ impl BinanceUserDataStream {
             ws_host,
             ws_port: WS_API_PORT,
             proxy: proxy.map(str::to_string),
+            symbols,
         })
     }
 
     /// 从环境变量读取凭证，和 `BinanceOrderProvider::from_env` 复用同一套
     /// `BINANCE_API_KEY` + `BINANCE_API_SECRET`：session.logon 需要用私钥签名，
     /// 不再是 listenKey 时代只需要 API Key 的轻量鉴权。
-    pub fn from_env(venue: Venue, testnet: bool, proxy: Option<&str>) -> anyhow::Result<Self> {
+    pub fn from_env(venue: Venue, testnet: bool, proxy: Option<&str>, symbols: Vec<Symbol>) -> anyhow::Result<Self> {
         let api_key = std::env::var("BINANCE_API_KEY").context("BINANCE_API_KEY not set")?;
         let private_key_pem = std::env::var("BINANCE_API_SECRET").context("BINANCE_API_SECRET not set")?;
-        Self::new(venue, api_key, &private_key_pem, testnet, proxy)
+        Self::new(venue, api_key, &private_key_pem, testnet, proxy, symbols)
     }
 
     async fn connect(&self) -> anyhow::Result<WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>> {
@@ -401,9 +442,10 @@ impl OrderStreamSource for BinanceUserDataStream {
         self.venue.clone()
     }
 
-    fn spawn(self: Box<Self>, tx: mpsc::Sender<ExchangeOrderUpdate>) -> crate::order_manager::stream::StreamHandle {
+    fn spawn(self: Box<Self>, order_manager: Arc<OrderManager>) -> crate::order_manager::stream::StreamHandle {
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
         let join = tokio::spawn(async move {
+            let symbol_map = binance_symbol_map(&self.symbols);
             let mut backoff = MIN_BACKOFF;
             let mut ready_tx = Some(ready_tx);
 
@@ -463,10 +505,8 @@ impl OrderStreamSource for BinanceUserDataStream {
                             }
                         }
                         Message::Text(text) => {
-                            let Some(update) = parse_execution_report(&text, &self.venue) else { continue };
-                            if tx.send(update).await.is_err() {
-                                return;
-                            }
+                            let Some(update) = parse_execution_report(&text, &self.venue, &symbol_map) else { continue };
+                            order_manager.handle_exchange_update(update).await;
                         }
                         _ => {}
                     }
@@ -551,6 +591,8 @@ struct UserDataEventEnvelope {
 
 #[derive(Debug, Deserialize)]
 struct ExecutionReport {
+    #[serde(rename = "s")]
+    symbol: String,
     #[serde(rename = "c")]
     client_order_id: String,
     #[serde(rename = "i")]
@@ -576,9 +618,11 @@ struct ExecutionReport {
 /// 解析一条 User Data Stream 消息，只关心 `executionReport` 事件(其它如
 /// `outboundAccountPosition`/`balanceUpdate`，以及 WS API 请求响应，直接忽略)。
 /// WS API 订阅推送把原始事件包了一层 `{"subscriptionId":N,"event":{...}}`，
-/// 先取出内层 `event`(取不到就把原文当兜底，兼容旧格式测试数据)。纯函数，
-/// 不依赖真实 WebSocket 连接，便于单元测试。
-fn parse_execution_report(text: &str, venue: &Venue) -> Option<ExchangeOrderUpdate> {
+/// 先取出内层 `event`(取不到就把原文当兜底，兼容旧格式测试数据)。`symbol_map`
+/// 按拼接式 ticker(如 `"BTCUSDT"`)反查内部 `Symbol`，查不到就丢弃这条更新
+/// (账户级流不像行情源那样天然只收到订阅过的品种)。纯函数，不依赖真实
+/// WebSocket 连接，便于单元测试。
+fn parse_execution_report(text: &str, venue: &Venue, symbol_map: &HashMap<String, Symbol>) -> Option<ExchangeOrderUpdate> {
     let raw: serde_json::Value = match serde_json::from_str(text) {
         Ok(raw) => raw,
         Err(err) => {
@@ -599,12 +643,17 @@ fn parse_execution_report(text: &str, venue: &Venue) -> Option<ExchangeOrderUpda
             return None;
         }
     };
+    let Some(symbol) = symbol_map.get(&report.symbol) else {
+        warn!("binance execution report for unknown symbol: {}", report.symbol);
+        return None;
+    };
 
     let avg_price = (report.cumulative_filled_qty > Decimal::ZERO)
         .then(|| report.cumulative_quote_qty / report.cumulative_filled_qty);
 
     Some(ExchangeOrderUpdate {
         venue: venue.clone(),
+        symbol: symbol.clone(),
         client_order_id: Some(report.client_order_id).filter(|s| !s.is_empty()),
         exchange_order_id: Some(report.exchange_order_id.to_string()),
         status: map_status(&report.order_status),
@@ -621,6 +670,12 @@ mod tests {
     use super::*;
     use ring::rand::SystemRandom;
     use ring::signature::{KeyPair, UnparsedPublicKey};
+
+    fn map_with(symbol: Symbol) -> HashMap<String, Symbol> {
+        let mut map = HashMap::new();
+        map.insert(binance_symbol(&symbol), symbol);
+        map
+    }
 
     fn generate_test_pem() -> (String, Ed25519KeyPair) {
         let rng = SystemRandom::new();
@@ -681,6 +736,7 @@ mod tests {
         assert_eq!(map_status("NEW"), OrderStatus::New);
         assert_eq!(map_status("REJECTED"), OrderStatus::Rejected);
         assert_eq!(map_status("EXPIRED"), OrderStatus::Expired);
+        assert_eq!(map_status("CANCELED"), OrderStatus::Expired);
     }
 
     #[test]
@@ -817,6 +873,20 @@ mod tests {
     }
 
     #[test]
+    fn parses_ticker_price_response() {
+        let text = r#"{"symbol":"BNBUSDT","price":"600.12000000"}"#;
+        let price = parse_ticker_price(text).expect("should parse");
+        assert_eq!(price, "600.12000000".parse().unwrap());
+    }
+
+    #[test]
+    fn parse_ticker_price_surfaces_error_response() {
+        let text = r#"{"code":-1121,"msg":"Invalid symbol."}"#;
+        let err = parse_ticker_price(text).unwrap_err();
+        assert!(err.to_string().contains("Invalid symbol"));
+    }
+
+    #[test]
     fn percent_encodes_reserved_characters() {
         assert_eq!(percent_encode("abcXYZ019-_.~"), "abcXYZ019-_.~");
         assert_eq!(percent_encode("a+b/c=d"), "a%2Bb%2Fc%3Dd");
@@ -848,6 +918,8 @@ mod tests {
     #[test]
     fn parses_execution_report_partial_fill() {
         let venue = Venue::new("binance");
+        let symbol = Symbol::new("BTC", "USDT");
+        let map = map_with(symbol.clone());
         let text = r#"{
             "subscriptionId": 0,
             "event": {
@@ -863,8 +935,9 @@ mod tests {
                 "Z": "16000.00000000"
             }
         }"#;
-        let update = parse_execution_report(text, &venue).expect("should parse");
+        let update = parse_execution_report(text, &venue, &map).expect("should parse");
         assert_eq!(update.venue, venue);
+        assert_eq!(update.symbol, symbol);
         assert_eq!(update.client_order_id, Some("ORD-000000000001".to_string()));
         assert_eq!(update.exchange_order_id, Some("123456".to_string()));
         assert_eq!(update.status, OrderStatus::PartiallyFilled);
@@ -878,6 +951,7 @@ mod tests {
     #[test]
     fn parses_execution_report_with_commission() {
         let venue = Venue::new("binance");
+        let map = map_with(Symbol::new("BTC", "USDT"));
         let text = r#"{
             "subscriptionId": 0,
             "event": {
@@ -895,7 +969,7 @@ mod tests {
                 "N": "BTC"
             }
         }"#;
-        let update = parse_execution_report(text, &venue).expect("should parse");
+        let update = parse_execution_report(text, &venue, &map).expect("should parse");
         assert_eq!(update.fee, Some("0.0004".parse().unwrap()));
         assert_eq!(update.fee_asset, Some("BTC".to_string()));
     }
@@ -903,6 +977,7 @@ mod tests {
     #[test]
     fn parses_execution_report_new_order_without_fill() {
         let venue = Venue::new("binance");
+        let map = map_with(Symbol::new("BTC", "USDT"));
         let text = r#"{
             "subscriptionId": 0,
             "event": {
@@ -918,7 +993,7 @@ mod tests {
                 "Z": "0.00000000"
             }
         }"#;
-        let update = parse_execution_report(text, &venue).expect("should parse");
+        let update = parse_execution_report(text, &venue, &map).expect("should parse");
         assert_eq!(update.status, OrderStatus::New);
         assert_eq!(update.filled_qty, Decimal::ZERO);
         assert_eq!(update.avg_price, None);
@@ -927,22 +1002,47 @@ mod tests {
     }
 
     #[test]
+    fn ignores_execution_report_for_unmapped_symbol() {
+        let venue = Venue::new("binance");
+        let map = map_with(Symbol::new("ETH", "USDT"));
+        let text = r#"{
+            "subscriptionId": 0,
+            "event": {
+                "e": "executionReport",
+                "E": 1700000000123,
+                "s": "BTCUSDT",
+                "c": "ORD-000000000001",
+                "S": "BUY",
+                "o": "MARKET",
+                "X": "PARTIALLY_FILLED",
+                "i": 123456,
+                "z": "0.40000000",
+                "Z": "16000.00000000"
+            }
+        }"#;
+        assert!(parse_execution_report(text, &venue, &map).is_none());
+    }
+
+    #[test]
     fn ignores_non_execution_report_events() {
         let venue = Venue::new("binance");
+        let map = map_with(Symbol::new("BTC", "USDT"));
         let text = r#"{"subscriptionId":0,"event":{"e":"outboundAccountPosition","E":1700000000000,"u":1700000000000,"B":[]}}"#;
-        assert!(parse_execution_report(text, &venue).is_none());
+        assert!(parse_execution_report(text, &venue, &map).is_none());
     }
 
     #[test]
     fn ignores_ws_api_response_messages_in_execution_report_parsing() {
         let venue = Venue::new("binance");
+        let map = map_with(Symbol::new("BTC", "USDT"));
         let text = r#"{"id":"logon","status":200,"result":{}}"#;
-        assert!(parse_execution_report(text, &venue).is_none());
+        assert!(parse_execution_report(text, &venue, &map).is_none());
     }
 
     #[test]
     fn ignores_malformed_user_data_stream_message() {
         let venue = Venue::new("binance");
-        assert!(parse_execution_report("not json", &venue).is_none());
+        let map = map_with(Symbol::new("BTC", "USDT"));
+        assert!(parse_execution_report("not json", &venue, &map).is_none());
     }
 }

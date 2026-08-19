@@ -37,10 +37,14 @@ impl PositionManager {
         side: OrderSide,
         filled_qty_delta: Decimal,
         fill_price: Option<Decimal>,
+        fee: Option<Decimal>,
+        fee_asset: Option<String>,
+        fee_usdt: Option<Decimal>,
         ts_ms: u64,
     ) -> FillOutcome {
         let venue_for_closure = venue.clone();
         let symbol_for_closure = symbol.clone();
+        let fee_asset_for_closure = fee_asset.clone();
         let realized_pnl_slot = Arc::new(Mutex::new(Decimal::ZERO));
         let slot = realized_pnl_slot.clone();
 
@@ -91,13 +95,64 @@ impl PositionManager {
                         }
                     }
                 };
+
+                // 累加手续费
+                if let (Some(fee_amt), Some(asset)) = (fee, fee_asset_for_closure.as_ref()) {
+                    *pos.total_fees.entry(asset.clone()).or_insert(Decimal::ZERO) += fee_amt;
+                }
+                if let Some(usdt) = fee_usdt {
+                    pos.total_fees_usdt += usdt;
+                }
+
                 pos.net_qty = new_qty;
                 pos.updated_at_ms = ts_ms;
                 pos
             }),
         );
 
-        FillOutcome { realized_pnl: *realized_pnl_slot.lock().unwrap() }
+        FillOutcome {
+            realized_pnl: *realized_pnl_slot.lock().unwrap(),
+            fee: match (fee, fee_asset) {
+                (Some(amt), Some(asset)) => Some((amt, asset)),
+                _ => None,
+            },
+            fee_usdt,
+        }
+    }
+
+    /// 后台异步查价(`pricing::FeeUsdtConverter::query_async`)成功后调用，
+    /// 把换算出的 USDT 等值补记到 `total_fees_usdt`。与 `on_filled` 走独立的
+    /// 原子 `store.update`，因为查价结果回来时这笔成交早已经处理完。
+    pub fn apply_fee_usdt(&self, venue: &Venue, symbol: &Symbol, amount_usdt: Decimal) {
+        let venue_for_closure = venue.clone();
+        let symbol_for_closure = symbol.clone();
+        self.store.update(
+            venue,
+            symbol,
+            Box::new(move |current: Option<VenuePosition>| {
+                let mut pos =
+                    current.unwrap_or_else(|| VenuePosition::flat(venue_for_closure.clone(), symbol_for_closure.clone()));
+                pos.total_fees_usdt += amount_usdt;
+                pos
+            }),
+        );
+    }
+
+    /// 后台异步查价失败，或找不到对应 venue 的 `OrderProvider` 时调用，标记
+    /// 这个 (venue, symbol) 的 `total_fees_usdt` 可能不完整，不当 0 处理。
+    pub fn mark_fee_usdt_incomplete(&self, venue: &Venue, symbol: &Symbol) {
+        let venue_for_closure = venue.clone();
+        let symbol_for_closure = symbol.clone();
+        self.store.update(
+            venue,
+            symbol,
+            Box::new(move |current: Option<VenuePosition>| {
+                let mut pos =
+                    current.unwrap_or_else(|| VenuePosition::flat(venue_for_closure.clone(), symbol_for_closure.clone()));
+                pos.fees_usdt_incomplete = true;
+                pos
+            }),
+        );
     }
 
     /// 单个 venue+symbol 的净数量 (正=多头，负=空头)。
@@ -131,6 +186,17 @@ impl PositionManager {
             venues,
         }
     }
+
+    /// 汇总所有持仓的手续费，按币种分组
+    pub fn total_fees_by_asset(&self) -> std::collections::HashMap<String, Decimal> {
+        let mut totals = std::collections::HashMap::new();
+        for pos in self.store.all() {
+            for (asset, amount) in pos.total_fees {
+                *totals.entry(asset).or_insert(Decimal::ZERO) += amount;
+            }
+        }
+        totals
+    }
 }
 
 #[cfg(test)]
@@ -148,7 +214,7 @@ mod tests {
         let venue = Venue::new("binance_spot");
         let symbol = Symbol::new("BTC", "USDT");
 
-        pm.on_filled(&venue, &symbol, OrderSide::Buy, Decimal::new(5, 1), Some(Decimal::new(50000, 0)), 1);
+        pm.on_filled(&venue, &symbol, OrderSide::Buy, Decimal::new(5, 1), Some(Decimal::new(50000, 0)), None, None, None, 1);
 
         let pos = pm.venue_position(&venue, &symbol).unwrap();
         assert_eq!(pos.net_qty, Decimal::new(5, 1));
@@ -162,9 +228,9 @@ mod tests {
         let symbol = Symbol::new("BTC", "USDT");
 
         // 0.5 BTC @ 50000
-        pm.on_filled(&venue, &symbol, OrderSide::Buy, Decimal::new(5, 1), Some(Decimal::new(50000, 0)), 1);
+        pm.on_filled(&venue, &symbol, OrderSide::Buy, Decimal::new(5, 1), Some(Decimal::new(50000, 0)), None, None, None, 1);
         // + 0.5 BTC @ 60000 -> avg = (50000*0.5 + 60000*0.5) / 1.0 = 55000
-        pm.on_filled(&venue, &symbol, OrderSide::Buy, Decimal::new(5, 1), Some(Decimal::new(60000, 0)), 2);
+        pm.on_filled(&venue, &symbol, OrderSide::Buy, Decimal::new(5, 1), Some(Decimal::new(60000, 0)), None, None, None, 2);
 
         let pos = pm.venue_position(&venue, &symbol).unwrap();
         assert_eq!(pos.net_qty, Decimal::ONE);
@@ -177,8 +243,8 @@ mod tests {
         let venue = Venue::new("binance_spot");
         let symbol = Symbol::new("BTC", "USDT");
 
-        pm.on_filled(&venue, &symbol, OrderSide::Buy, Decimal::ONE, Some(Decimal::new(50000, 0)), 1);
-        pm.on_filled(&venue, &symbol, OrderSide::Sell, Decimal::new(4, 1), Some(Decimal::new(70000, 0)), 2);
+        pm.on_filled(&venue, &symbol, OrderSide::Buy, Decimal::ONE, Some(Decimal::new(50000, 0)), None, None, None, 1);
+        pm.on_filled(&venue, &symbol, OrderSide::Sell, Decimal::new(4, 1), Some(Decimal::new(70000, 0)), None, None, None, 2);
 
         let pos = pm.venue_position(&venue, &symbol).unwrap();
         assert_eq!(pos.net_qty, Decimal::new(6, 1));
@@ -191,8 +257,8 @@ mod tests {
         let venue = Venue::new("binance_spot");
         let symbol = Symbol::new("BTC", "USDT");
 
-        pm.on_filled(&venue, &symbol, OrderSide::Buy, Decimal::ONE, Some(Decimal::new(50000, 0)), 1);
-        pm.on_filled(&venue, &symbol, OrderSide::Sell, Decimal::ONE, Some(Decimal::new(70000, 0)), 2);
+        pm.on_filled(&venue, &symbol, OrderSide::Buy, Decimal::ONE, Some(Decimal::new(50000, 0)), None, None, None, 1);
+        pm.on_filled(&venue, &symbol, OrderSide::Sell, Decimal::ONE, Some(Decimal::new(70000, 0)), None, None, None, 2);
 
         let pos = pm.venue_position(&venue, &symbol).unwrap();
         assert_eq!(pos.net_qty, Decimal::ZERO);
@@ -206,9 +272,9 @@ mod tests {
         let symbol = Symbol::new("BTC", "USDT");
 
         // 多 1.0 BTC @ 50000
-        pm.on_filled(&venue, &symbol, OrderSide::Buy, Decimal::ONE, Some(Decimal::new(50000, 0)), 1);
+        pm.on_filled(&venue, &symbol, OrderSide::Buy, Decimal::ONE, Some(Decimal::new(50000, 0)), None, None, None, 1);
         // 卖 1.5 BTC @ 60000 -> net_qty 从 +1.0 变成 -0.5，穿零反向
-        pm.on_filled(&venue, &symbol, OrderSide::Sell, Decimal::new(15, 1), Some(Decimal::new(60000, 0)), 2);
+        pm.on_filled(&venue, &symbol, OrderSide::Sell, Decimal::new(15, 1), Some(Decimal::new(60000, 0)), None, None, None, 2);
 
         let pos = pm.venue_position(&venue, &symbol).unwrap();
         assert_eq!(pos.net_qty, Decimal::new(-5, 1));
@@ -221,8 +287,8 @@ mod tests {
         let venue = Venue::new("binance_spot");
         let symbol = Symbol::new("BTC", "USDT");
 
-        pm.on_filled(&venue, &symbol, OrderSide::Buy, Decimal::ONE, Some(Decimal::new(50000, 0)), 1);
-        pm.on_filled(&venue, &symbol, OrderSide::Buy, Decimal::new(5, 1), None, 2);
+        pm.on_filled(&venue, &symbol, OrderSide::Buy, Decimal::ONE, Some(Decimal::new(50000, 0)), None, None, None, 1);
+        pm.on_filled(&venue, &symbol, OrderSide::Buy, Decimal::new(5, 1), None, None, None, None, 2);
 
         let pos = pm.venue_position(&venue, &symbol).unwrap();
         assert_eq!(pos.net_qty, Decimal::new(15, 1));
@@ -235,11 +301,11 @@ mod tests {
         let symbol = Symbol::new("BTC", "USDT");
 
         // Binance 现货买入 1.0 BTC
-        pm.on_filled(&Venue::new("binance_spot"), &symbol, OrderSide::Buy, Decimal::ONE, Some(Decimal::new(50000, 0)), 1);
+        pm.on_filled(&Venue::new("binance_spot"), &symbol, OrderSide::Buy, Decimal::ONE, Some(Decimal::new(50000, 0)), None, None, None, 1);
         // Binance 合约卖出开空 0.5 BTC
-        pm.on_filled(&Venue::new("binance_futures"), &symbol, OrderSide::Sell, Decimal::new(5, 1), Some(Decimal::new(50000, 0)), 2);
+        pm.on_filled(&Venue::new("binance_futures"), &symbol, OrderSide::Sell, Decimal::new(5, 1), Some(Decimal::new(50000, 0)), None, None, None, 2);
         // Kraken 现货买入 0.5 BTC (转仓过去的另一半)
-        pm.on_filled(&Venue::new("kraken_spot"), &symbol, OrderSide::Buy, Decimal::new(5, 1), Some(Decimal::new(50000, 0)), 3);
+        pm.on_filled(&Venue::new("kraken_spot"), &symbol, OrderSide::Buy, Decimal::new(5, 1), Some(Decimal::new(50000, 0)), None, None, None, 3);
 
         let exposure = pm.asset_exposure("BTC");
         assert_eq!(exposure.net_qty, Decimal::ONE); // 1.0 + (-0.5) + 0.5 = 1.0，只有合约那条腿对冲了一半
@@ -255,7 +321,7 @@ mod tests {
     fn asset_exposure_is_case_insensitive() {
         let pm = manager();
         let symbol = Symbol::new("BTC", "USDT");
-        pm.on_filled(&Venue::new("binance_spot"), &symbol, OrderSide::Buy, Decimal::ONE, Some(Decimal::new(50000, 0)), 1);
+        pm.on_filled(&Venue::new("binance_spot"), &symbol, OrderSide::Buy, Decimal::ONE, Some(Decimal::new(50000, 0)), None, None, None, 1);
 
         assert_eq!(pm.asset_exposure("btc").net_qty, Decimal::ONE);
     }
@@ -266,7 +332,7 @@ mod tests {
         let venue = Venue::new("binance_spot");
         let symbol = Symbol::new("BTC", "USDT");
 
-        let outcome = pm.on_filled(&venue, &symbol, OrderSide::Buy, Decimal::new(5, 1), Some(Decimal::new(50000, 0)), 1);
+        let outcome = pm.on_filled(&venue, &symbol, OrderSide::Buy, Decimal::new(5, 1), Some(Decimal::new(50000, 0)), None, None, None, 1);
         assert_eq!(outcome.realized_pnl, Decimal::ZERO);
     }
 
@@ -276,8 +342,8 @@ mod tests {
         let venue = Venue::new("binance_spot");
         let symbol = Symbol::new("BTC", "USDT");
 
-        pm.on_filled(&venue, &symbol, OrderSide::Buy, Decimal::new(5, 1), Some(Decimal::new(50000, 0)), 1);
-        let outcome = pm.on_filled(&venue, &symbol, OrderSide::Buy, Decimal::new(5, 1), Some(Decimal::new(60000, 0)), 2);
+        pm.on_filled(&venue, &symbol, OrderSide::Buy, Decimal::new(5, 1), Some(Decimal::new(50000, 0)), None, None, None, 1);
+        let outcome = pm.on_filled(&venue, &symbol, OrderSide::Buy, Decimal::new(5, 1), Some(Decimal::new(60000, 0)), None, None, None, 2);
         assert_eq!(outcome.realized_pnl, Decimal::ZERO);
     }
 
@@ -288,9 +354,9 @@ mod tests {
         let symbol = Symbol::new("BTC", "USDT");
 
         // 多 1.0 BTC @ 50000
-        pm.on_filled(&venue, &symbol, OrderSide::Buy, Decimal::ONE, Some(Decimal::new(50000, 0)), 1);
+        pm.on_filled(&venue, &symbol, OrderSide::Buy, Decimal::ONE, Some(Decimal::new(50000, 0)), None, None, None, 1);
         // 卖 0.4 BTC @ 70000 -> 已实现盈亏 = 0.4 * (70000 - 50000) * 1 = 8000
-        let outcome = pm.on_filled(&venue, &symbol, OrderSide::Sell, Decimal::new(4, 1), Some(Decimal::new(70000, 0)), 2);
+        let outcome = pm.on_filled(&venue, &symbol, OrderSide::Sell, Decimal::new(4, 1), Some(Decimal::new(70000, 0)), None, None, None, 2);
         assert_eq!(outcome.realized_pnl, Decimal::new(8000, 0));
     }
 
@@ -301,10 +367,10 @@ mod tests {
         let symbol = Symbol::new("BTC", "USDT");
 
         // 多 1.0 BTC @ 50000
-        pm.on_filled(&venue, &symbol, OrderSide::Buy, Decimal::ONE, Some(Decimal::new(50000, 0)), 1);
+        pm.on_filled(&venue, &symbol, OrderSide::Buy, Decimal::ONE, Some(Decimal::new(50000, 0)), None, None, None, 1);
         // 卖 1.5 BTC @ 60000 -> 只有平掉旧仓位的 1.0 部分计已实现盈亏 = 1.0 * (60000-50000) * 1 = 10000，
         // 反向新开的 0.5 空头不计入。
-        let outcome = pm.on_filled(&venue, &symbol, OrderSide::Sell, Decimal::new(15, 1), Some(Decimal::new(60000, 0)), 2);
+        let outcome = pm.on_filled(&venue, &symbol, OrderSide::Sell, Decimal::new(15, 1), Some(Decimal::new(60000, 0)), None, None, None, 2);
         assert_eq!(outcome.realized_pnl, Decimal::new(10000, 0));
     }
 
@@ -314,8 +380,147 @@ mod tests {
         let venue = Venue::new("binance_spot");
         let symbol = Symbol::new("BTC", "USDT");
 
-        pm.on_filled(&venue, &symbol, OrderSide::Buy, Decimal::ONE, Some(Decimal::new(50000, 0)), 1);
-        let outcome = pm.on_filled(&venue, &symbol, OrderSide::Sell, Decimal::new(5, 1), None, 2);
+        pm.on_filled(&venue, &symbol, OrderSide::Buy, Decimal::ONE, Some(Decimal::new(50000, 0)), None, None, None, 1);
+        let outcome = pm.on_filled(&venue, &symbol, OrderSide::Sell, Decimal::new(5, 1), None, None, None, None, 2);
         assert_eq!(outcome.realized_pnl, Decimal::ZERO);
+    }
+
+    #[test]
+    fn accumulates_fees_by_asset() {
+        let pm = manager();
+        let venue = Venue::new("binance_spot");
+        let symbol = Symbol::new("BTC", "USDT");
+
+        // 第一笔成交，手续费 0.001 BNB
+        let outcome1 = pm.on_filled(
+            &venue,
+            &symbol,
+            OrderSide::Buy,
+            Decimal::new(5, 1),
+            Some(Decimal::new(50000, 0)),
+            Some(Decimal::new(1, 3)),
+            Some("BNB".to_string()),
+            None,
+            1,
+        );
+        assert_eq!(outcome1.fee, Some((Decimal::new(1, 3), "BNB".to_string())));
+
+        // 第二笔成交，手续费 0.002 BNB
+        let outcome2 = pm.on_filled(
+            &venue,
+            &symbol,
+            OrderSide::Buy,
+            Decimal::new(5, 1),
+            Some(Decimal::new(60000, 0)),
+            Some(Decimal::new(2, 3)),
+            Some("BNB".to_string()),
+            None,
+            2,
+        );
+        assert_eq!(outcome2.fee, Some((Decimal::new(2, 3), "BNB".to_string())));
+
+        // 检查持仓中累计的手续费
+        let pos = pm.venue_position(&venue, &symbol).unwrap();
+        assert_eq!(pos.total_fees.get("BNB"), Some(&Decimal::new(3, 3))); // 0.001 + 0.002 = 0.003
+    }
+
+    #[test]
+    fn accumulates_fees_for_multiple_assets() {
+        let pm = manager();
+        let venue = Venue::new("binance_spot");
+        let symbol = Symbol::new("BTC", "USDT");
+
+        // BNB 手续费
+        pm.on_filled(
+            &venue,
+            &symbol,
+            OrderSide::Buy,
+            Decimal::ONE,
+            Some(Decimal::new(50000, 0)),
+            Some(Decimal::new(1, 3)),
+            Some("BNB".to_string()),
+            None,
+            1,
+        );
+
+        // USDT 手续费
+        pm.on_filled(
+            &venue,
+            &symbol,
+            OrderSide::Sell,
+            Decimal::new(5, 1),
+            Some(Decimal::new(60000, 0)),
+            Some(Decimal::new(30, 0)),
+            Some("USDT".to_string()),
+            None,
+            2,
+        );
+
+        // 再次 BNB 手续费
+        pm.on_filled(
+            &venue,
+            &symbol,
+            OrderSide::Buy,
+            Decimal::new(3, 1),
+            Some(Decimal::new(55000, 0)),
+            Some(Decimal::new(2, 3)),
+            Some("BNB".to_string()),
+            None,
+            3,
+        );
+
+        let pos = pm.venue_position(&venue, &symbol).unwrap();
+        assert_eq!(pos.total_fees.get("BNB"), Some(&Decimal::new(3, 3))); // 0.001 + 0.002
+        assert_eq!(pos.total_fees.get("USDT"), Some(&Decimal::new(30, 0))); // 30
+    }
+
+    #[test]
+    fn total_fees_by_asset_aggregates_across_positions() {
+        let pm = manager();
+        let btc_symbol = Symbol::new("BTC", "USDT");
+        let eth_symbol = Symbol::new("ETH", "USDT");
+
+        // BTC 持仓，BNB 手续费
+        pm.on_filled(
+            &Venue::new("binance_spot"),
+            &btc_symbol,
+            OrderSide::Buy,
+            Decimal::ONE,
+            Some(Decimal::new(50000, 0)),
+            Some(Decimal::new(1, 3)),
+            Some("BNB".to_string()),
+            None,
+            1,
+        );
+
+        // ETH 持仓，BNB 手续费
+        pm.on_filled(
+            &Venue::new("binance_spot"),
+            &eth_symbol,
+            OrderSide::Buy,
+            Decimal::new(10, 0),
+            Some(Decimal::new(3000, 0)),
+            Some(Decimal::new(2, 3)),
+            Some("BNB".to_string()),
+            None,
+            2,
+        );
+
+        // BTC 持仓，USDT 手续费
+        pm.on_filled(
+            &Venue::new("kraken_spot"),
+            &btc_symbol,
+            OrderSide::Buy,
+            Decimal::new(5, 1),
+            Some(Decimal::new(50000, 0)),
+            Some(Decimal::new(25, 0)),
+            Some("USDT".to_string()),
+            None,
+            3,
+        );
+
+        let totals = pm.total_fees_by_asset();
+        assert_eq!(totals.get("BNB"), Some(&Decimal::new(3, 3))); // 0.001 + 0.002
+        assert_eq!(totals.get("USDT"), Some(&Decimal::new(25, 0))); // 25
     }
 }

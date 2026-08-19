@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
@@ -10,12 +11,12 @@ use log::{debug, warn};
 use rust_decimal::Decimal;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
-use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 use crate::market_data::now_ms;
 use crate::net::connect_tcp;
+use crate::order_manager::OrderManager;
 use crate::order_manager::stream::{ExchangeOrderUpdate, OrderStreamSource};
 use crate::types::{Symbol, Venue};
 
@@ -95,6 +96,17 @@ impl OrderProvider for KrakenOrderProvider {
         let text = self.private_request("/0/private/AddOrder", params).await?;
         parse_add_order_result(&text)
     }
+
+    /// `GET /0/public/Ticker?pair={ASSET}USD`(查 USD 不是 USDT：Kraken 山寨币
+    /// 现货对多是 `*USD`，本系统里 USD 按 1:1 近似当 USDT 用，见
+    /// `pricing::is_usdt_equivalent`)。公开行情接口不需要签名。`KFEE` 等没有
+    /// 可交易对的资产查询会在 `unwrap_result` 里自然报错，交给调用方按失败
+    /// 兜底处理，不特殊硬编码。
+    async fn quote_usdt_price(&self, asset: &str) -> anyhow::Result<Decimal> {
+        let pair = format!("{}USD", asset.to_ascii_uppercase());
+        let text = kraken_public_get(&self.http, "/0/public/Ticker", vec![("pair".to_string(), pair)]).await?;
+        parse_ticker_price(&text)
+    }
 }
 
 /// 签名并发起一次 Kraken 私有 POST 请求。抽成自由函数是因为
@@ -122,6 +134,17 @@ async fn kraken_private_request(
         .await
         .context("kraken order request failed")?;
     resp.text().await.context("failed to read kraken order response body")
+}
+
+/// 不需要签名的 Kraken 公开接口请求。抽成自由函数而不是挂在
+/// `KrakenOrderProvider` 上，是因为它只需要 `http` 客户端，不涉及签名/凭证，
+/// 和 `kraken_private_request` 的抽取理由一致。
+async fn kraken_public_get(http: &reqwest::Client, path: &str, params: Vec<(String, String)>) -> anyhow::Result<String> {
+    let query = params.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join("&");
+    let url = if query.is_empty() { format!("{HOST}{path}") } else { format!("{HOST}{path}?{query}") };
+    crate::ratelimit::throttle(HOST).await;
+    let resp = http.get(url).send().await.context("kraken public request failed")?;
+    resp.text().await.context("failed to read kraken public response body")
 }
 
 fn build_http_client(proxy: Option<&str>) -> anyhow::Result<reqwest::Client> {
@@ -215,6 +238,29 @@ fn parse_add_order_result(text: &str) -> anyhow::Result<OrderResult> {
     })
 }
 
+#[derive(Debug, Deserialize)]
+struct TickerEntry {
+    /// 最近成交 `[价格, 量]`，只取价格。
+    c: Vec<Decimal>,
+}
+
+/// `GET /0/public/Ticker` 响应的 `result` 是按 Kraken 内部资产代码(如
+/// `XXBTZUSD`)为 key 的 map，和 `exchange_info::kraken::parse_trading_fee`
+/// 同样的原因(不是按请求传入的 pair 字符串做 key)，用 `.into_values().next()`
+/// 取唯一的那个值，不按 key 精确匹配。
+fn parse_ticker_price(text: &str) -> anyhow::Result<Decimal> {
+    let result: HashMap<String, TickerEntry> = unwrap_result(text)?;
+    let entry = result
+        .into_values()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("kraken Ticker response has no entries"))?;
+    entry
+        .c
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("kraken Ticker response missing last trade price"))
+}
+
 /// Kraken 私有订单流客户端：通过 `GetWebSocketsToken` 拿到鉴权 token，连接
 /// WebSocket v2 `wss://ws-auth.kraken.com/v2` 并订阅 `executions` channel。
 /// 和 Binance 的 listenKey 不同，token 一旦用于建立连接就在整个会话期间有效，
@@ -281,7 +327,7 @@ impl OrderStreamSource for KrakenPrivateOrderStream {
         self.venue.clone()
     }
 
-    fn spawn(self: Box<Self>, tx: mpsc::Sender<ExchangeOrderUpdate>) -> crate::order_manager::stream::StreamHandle {
+    fn spawn(self: Box<Self>, order_manager: Arc<OrderManager>) -> crate::order_manager::stream::StreamHandle {
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
         let join = tokio::spawn(async move {
             let mut backoff = MIN_BACKOFF;
@@ -329,9 +375,7 @@ impl OrderStreamSource for KrakenPrivateOrderStream {
                     };
                     let Message::Text(text) = msg else { continue };
                     for update in parse_kraken_execution(&text, &self.venue) {
-                        if tx.send(update).await.is_err() {
-                            return;
-                        }
+                        order_manager.handle_exchange_update(update).await;
                     }
                 }
 
@@ -392,6 +436,8 @@ struct KrakenExecutionData {
     order_id: String,
     #[serde(default)]
     cl_ord_id: Option<String>,
+    #[serde(default)]
+    symbol: Option<String>,
     order_status: String,
     /// 累计成交量(不是本次推送的增量)；pending_new 阶段可能整个字段都不存在。
     #[serde(default)]
@@ -421,6 +467,16 @@ fn sum_kraken_fees(fees: &[KrakenFee]) -> (Option<Decimal>, Option<String>) {
     }
 }
 
+/// Kraken 用 `"BTC/USD"` 这种带分隔符的格式表示交易对，不像 Binance 那样需要
+/// 反查表——直接按 `/` 切分成 base/quote 即可。
+fn parse_kraken_symbol(raw: &str) -> Option<Symbol> {
+    let (base, quote) = raw.split_once('/')?;
+    if base.is_empty() || quote.is_empty() {
+        return None;
+    }
+    Some(Symbol::new(base, quote))
+}
+
 /// 解析一条 WebSocket v2 消息，只关心 `channel: "executions"` 的推送(心跳、
 /// 订阅确认等消息直接忽略)。一条消息可能携带多笔订单的更新，因此返回
 /// `Vec`。纯函数，不依赖真实 WebSocket 连接，便于单元测试。
@@ -448,10 +504,18 @@ fn parse_kraken_execution(text: &str, venue: &Venue) -> Vec<ExchangeOrderUpdate>
     let ts_ms = now_ms();
     full.data
         .into_iter()
-        .map(|item| {
+        .filter_map(|item| {
+            let Some(symbol) = item.symbol.as_deref().and_then(parse_kraken_symbol) else {
+                warn!(
+                    "kraken private order stream: missing/malformed symbol {:?}, dropping update",
+                    item.symbol
+                );
+                return None;
+            };
             let (fee, fee_asset) = sum_kraken_fees(&item.fees);
-            ExchangeOrderUpdate {
+            Some(ExchangeOrderUpdate {
                 venue: venue.clone(),
+                symbol,
                 client_order_id: item.cl_ord_id.filter(|s| !s.is_empty()),
                 exchange_order_id: Some(item.order_id),
                 status: map_kraken_ws_status(&item.order_status),
@@ -460,7 +524,7 @@ fn parse_kraken_execution(text: &str, venue: &Venue) -> Vec<ExchangeOrderUpdate>
                 fee,
                 fee_asset,
                 ts_ms,
-            }
+            })
         })
         .collect()
 }
@@ -523,6 +587,35 @@ mod tests {
     }
 
     #[test]
+    fn parses_ticker_price_response() {
+        let text = r#"{
+            "error": [],
+            "result": {
+                "XXBTZUSD": {
+                    "a": ["30306.10000", "1", "1.000"],
+                    "b": ["30305.90000", "1", "1.000"],
+                    "c": ["30306.10000", "0.00067643"],
+                    "v": ["4083.67001100", "4412.73601799"],
+                    "p": ["30297.50968", "30310.75658"],
+                    "t": [23329, 25344],
+                    "l": ["29868.30000", "29868.30000"],
+                    "h": ["30720.70000", "30820.50000"],
+                    "o": "30502.30000"
+                }
+            }
+        }"#;
+        let price = parse_ticker_price(text).expect("should parse");
+        assert_eq!(price, "30306.10000".parse().unwrap());
+    }
+
+    #[test]
+    fn parse_ticker_price_surfaces_error_response() {
+        let text = r#"{"error": ["EQuery:Unknown asset pair"], "result": null}"#;
+        let err = parse_ticker_price(text).unwrap_err();
+        assert!(err.to_string().contains("Unknown asset pair"));
+    }
+
+    #[test]
     fn parses_ws_token() {
         let text = r#"{"error": [], "result": {"token": "anF3heJR/CGYRq1L3Bwtoa/gGB..."}}"#;
         assert_eq!(parse_ws_token(text).expect("should parse"), "anF3heJR/CGYRq1L3Bwtoa/gGB...");
@@ -569,6 +662,7 @@ mod tests {
         assert_eq!(updates.len(), 1);
         let update = &updates[0];
         assert_eq!(update.venue, venue);
+        assert_eq!(update.symbol, Symbol::new("BTC", "USD"));
         assert_eq!(update.client_order_id, Some("ORD-000000000001".to_string()));
         assert_eq!(update.exchange_order_id, Some("OK4GJX-KSTLS-7DZZO5".to_string()));
         assert_eq!(update.status, OrderStatus::PartiallyFilled);
@@ -601,6 +695,7 @@ mod tests {
         let updates = parse_kraken_execution(text, &venue);
         assert_eq!(updates.len(), 1);
         let update = &updates[0];
+        assert_eq!(update.symbol, Symbol::new("BTC", "USD"));
         assert_eq!(update.fee, Some("4.16".parse().unwrap()));
         assert_eq!(update.fee_asset, Some("USD".to_string()));
     }
@@ -627,6 +722,7 @@ mod tests {
         let updates = parse_kraken_execution(text, &venue);
         assert_eq!(updates.len(), 1);
         let update = &updates[0];
+        assert_eq!(update.symbol, Symbol::new("BTC", "USD"));
         assert_eq!(update.fee, None);
         assert_eq!(update.fee_asset, None);
     }
@@ -652,12 +748,44 @@ mod tests {
         let updates = parse_kraken_execution(text, &venue);
         assert_eq!(updates.len(), 1);
         let update = &updates[0];
+        assert_eq!(update.symbol, Symbol::new("BTC", "USD"));
         assert_eq!(update.client_order_id, None);
         assert_eq!(update.status, OrderStatus::New);
         assert_eq!(update.filled_qty, Decimal::ZERO);
         assert_eq!(update.avg_price, None);
         assert_eq!(update.fee, None);
         assert_eq!(update.fee_asset, None);
+    }
+
+    #[test]
+    fn drops_execution_with_missing_symbol_without_affecting_rest_of_batch() {
+        let venue = Venue::new("kraken");
+        let text = r#"{
+            "channel": "executions",
+            "type": "update",
+            "data": [
+                {
+                    "order_id": "OK4GJX-KSTLS-7DZZO5",
+                    "order_status": "partially_filled",
+                    "cum_qty": 0.4,
+                    "cum_cost": 16000.0,
+                    "timestamp": "2023-09-22T10:33:05.709950Z"
+                },
+                {
+                    "order_id": "OK4GJX-KSTLS-7DZZO6",
+                    "symbol": "ETH/USD",
+                    "order_status": "filled",
+                    "cum_qty": 1.0,
+                    "cum_cost": 3000.0,
+                    "timestamp": "2023-09-22T10:33:05.709950Z"
+                }
+            ],
+            "sequence": 8
+        }"#;
+        let updates = parse_kraken_execution(text, &venue);
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].exchange_order_id, Some("OK4GJX-KSTLS-7DZZO6".to_string()));
+        assert_eq!(updates[0].symbol, Symbol::new("ETH", "USD"));
     }
 
     #[test]

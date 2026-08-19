@@ -50,6 +50,7 @@ impl PortfolioManager {
         filled_qty_delta: Decimal,
         fill_price: Option<Decimal>,
         real_fee: Option<Decimal>,
+        fee_usdt: Option<Decimal>,
         realized_pnl: Decimal,
         ts_ms: u64,
     ) {
@@ -75,9 +76,47 @@ impl PortfolioManager {
                     current.unwrap_or_else(|| VenuePnl::flat(venue_for_closure.clone(), symbol_for_closure.clone()));
                 pnl.realized_pnl += realized_pnl;
                 pnl.fees_paid += fee;
+                if let Some(usdt) = fee_usdt {
+                    pnl.fees_paid_usdt += usdt;
+                }
                 pnl.fee_is_estimated = pnl.fee_is_estimated || is_estimated;
                 pnl.trade_count += 1;
                 pnl.updated_at_ms = ts_ms;
+                pnl
+            }),
+        );
+    }
+
+    /// 后台异步查价(`pricing::FeeUsdtConverter::query_async`)成功后调用，
+    /// 把换算出的 USDT 等值补记到 `fees_paid_usdt`。与 `record_fill` 走独立的
+    /// 原子 `pnl_store.update`，因为查价结果回来时这笔成交早已经处理完。
+    pub fn apply_fee_usdt(&self, venue: &Venue, symbol: &Symbol, amount_usdt: Decimal) {
+        let venue_for_closure = venue.clone();
+        let symbol_for_closure = symbol.clone();
+        self.pnl_store.update(
+            venue,
+            symbol,
+            Box::new(move |current| {
+                let mut pnl =
+                    current.unwrap_or_else(|| VenuePnl::flat(venue_for_closure.clone(), symbol_for_closure.clone()));
+                pnl.fees_paid_usdt += amount_usdt;
+                pnl
+            }),
+        );
+    }
+
+    /// 后台异步查价失败，或找不到对应 venue 的 `OrderProvider` 时调用，标记
+    /// 这个 (venue, symbol) 的 `fees_paid_usdt` 可能不完整，不当 0 处理。
+    pub fn mark_fee_usdt_incomplete(&self, venue: &Venue, symbol: &Symbol) {
+        let venue_for_closure = venue.clone();
+        let symbol_for_closure = symbol.clone();
+        self.pnl_store.update(
+            venue,
+            symbol,
+            Box::new(move |current| {
+                let mut pnl =
+                    current.unwrap_or_else(|| VenuePnl::flat(venue_for_closure.clone(), symbol_for_closure.clone()));
+                pnl.fees_usdt_incomplete = true;
                 pnl
             }),
         );
@@ -110,14 +149,23 @@ impl PortfolioManager {
     /// 的浮动盈亏。`unrealized_pnl` 缺行情时为 `None`，`net_pnl` 仍然给出不含
     /// 浮动部分的值。
     pub fn asset_pnl(&self, asset: &str) -> AssetPnlSummary {
-        let (realized_pnl, fees_paid, funding_pnl) = self
+        let (realized_pnl, fees_paid, fees_paid_usdt, fees_usdt_incomplete, funding_pnl) = self
             .pnl_store
             .all()
             .into_iter()
             .filter(|p| p.symbol.base.as_ref().eq_ignore_ascii_case(asset))
-            .fold((Decimal::ZERO, Decimal::ZERO, Decimal::ZERO), |(realized, fees, funding), p| {
-                (realized + p.realized_pnl, fees + p.fees_paid, funding + p.funding_pnl)
-            });
+            .fold(
+                (Decimal::ZERO, Decimal::ZERO, Decimal::ZERO, false, Decimal::ZERO),
+                |(realized, fees, fees_usdt, incomplete, funding), p| {
+                    (
+                        realized + p.realized_pnl,
+                        fees + p.fees_paid,
+                        fees_usdt + p.fees_paid_usdt,
+                        incomplete || p.fees_usdt_incomplete,
+                        funding + p.funding_pnl,
+                    )
+                },
+            );
 
         let unrealized_pnl = self.asset_valuation(asset).unrealized_pnl;
         let net_pnl = realized_pnl - fees_paid + funding_pnl + unrealized_pnl.unwrap_or(Decimal::ZERO);
@@ -126,6 +174,8 @@ impl PortfolioManager {
             asset: asset.to_string(),
             realized_pnl,
             fees_paid,
+            fees_paid_usdt,
+            fees_usdt_incomplete,
             funding_pnl,
             unrealized_pnl,
             net_pnl,
@@ -238,6 +288,7 @@ mod tests {
             Decimal::ONE,
             Some(Decimal::new(50000, 0)),
             Some(Decimal::new(5, 0)),
+            None,
             Decimal::ZERO,
             1,
         );
@@ -260,7 +311,7 @@ mod tests {
         );
 
         // 1.0 BTC @ 50000, 10 bps -> fee = 1.0 * 50000 * 10 / 10000 = 50
-        portfolio.record_fill(&venue(), &symbol(), Decimal::ONE, Some(Decimal::new(50000, 0)), None, Decimal::ZERO, 1);
+        portfolio.record_fill(&venue(), &symbol(), Decimal::ONE, Some(Decimal::new(50000, 0)), None, None, Decimal::ZERO, 1);
 
         let pnl = portfolio.venue_pnl(&venue(), &symbol()).unwrap();
         assert_eq!(pnl.fees_paid, Decimal::new(50, 0));
@@ -270,8 +321,8 @@ mod tests {
     #[test]
     fn record_fill_estimation_stays_sticky_after_real_fee_seen_later() {
         let (portfolio, _pm) = manager();
-        portfolio.record_fill(&venue(), &symbol(), Decimal::ONE, Some(Decimal::new(50000, 0)), None, Decimal::ZERO, 1);
-        portfolio.record_fill(&venue(), &symbol(), Decimal::ONE, Some(Decimal::new(50000, 0)), Some(Decimal::new(5, 0)), Decimal::ZERO, 2);
+        portfolio.record_fill(&venue(), &symbol(), Decimal::ONE, Some(Decimal::new(50000, 0)), None, None, Decimal::ZERO, 1);
+        portfolio.record_fill(&venue(), &symbol(), Decimal::ONE, Some(Decimal::new(50000, 0)), Some(Decimal::new(5, 0)), None, Decimal::ZERO, 2);
 
         let pnl = portfolio.venue_pnl(&venue(), &symbol()).unwrap();
         assert!(pnl.fee_is_estimated);
@@ -281,7 +332,7 @@ mod tests {
     #[test]
     fn record_fill_without_real_fee_or_price_records_zero_fee() {
         let (portfolio, _pm) = manager();
-        portfolio.record_fill(&venue(), &symbol(), Decimal::ONE, None, None, Decimal::ZERO, 1);
+        portfolio.record_fill(&venue(), &symbol(), Decimal::ONE, None, None, None, Decimal::ZERO, 1);
 
         let pnl = portfolio.venue_pnl(&venue(), &symbol()).unwrap();
         assert_eq!(pnl.fees_paid, Decimal::ZERO);
@@ -291,8 +342,8 @@ mod tests {
     #[test]
     fn record_fill_accumulates_realized_pnl_across_multiple_fills() {
         let (portfolio, _pm) = manager();
-        portfolio.record_fill(&venue(), &symbol(), Decimal::ONE, Some(Decimal::new(50000, 0)), None, Decimal::new(100, 0), 1);
-        portfolio.record_fill(&venue(), &symbol(), Decimal::ONE, Some(Decimal::new(50000, 0)), None, Decimal::new(50, 0), 2);
+        portfolio.record_fill(&venue(), &symbol(), Decimal::ONE, Some(Decimal::new(50000, 0)), None, None, Decimal::new(100, 0), 1);
+        portfolio.record_fill(&venue(), &symbol(), Decimal::ONE, Some(Decimal::new(50000, 0)), None, None, Decimal::new(50, 0), 2);
 
         let pnl = portfolio.venue_pnl(&venue(), &symbol()).unwrap();
         assert_eq!(pnl.realized_pnl, Decimal::new(150, 0));
@@ -307,7 +358,7 @@ mod tests {
     #[test]
     fn venue_valuation_marks_all_fields_none_without_quote() {
         let (portfolio, pm) = manager();
-        pm.on_filled(&venue(), &symbol(), OrderSide::Buy, Decimal::ONE, Some(Decimal::new(50000, 0)), 1);
+        pm.on_filled(&venue(), &symbol(), OrderSide::Buy, Decimal::ONE, Some(Decimal::new(50000, 0)), None, None, None, 1);
 
         let valuation = portfolio.venue_valuation(&venue(), &symbol()).unwrap();
         assert_eq!(valuation.net_qty, Decimal::ONE);
@@ -323,7 +374,7 @@ mod tests {
         let quote_cache = Arc::new(DashMap::new());
         let portfolio = PortfolioManager::new(pm.clone(), Arc::new(InMemoryPnlStore::new()), quote_cache.clone(), HashMap::new());
 
-        pm.on_filled(&venue(), &symbol(), OrderSide::Buy, Decimal::ONE, Some(Decimal::new(50000, 0)), 1);
+        pm.on_filled(&venue(), &symbol(), OrderSide::Buy, Decimal::ONE, Some(Decimal::new(50000, 0)), None, None, None, 1);
         quote_cache.insert(
             (venue(), symbol()),
             Quote {
@@ -347,7 +398,7 @@ mod tests {
         let quote_cache = Arc::new(DashMap::new());
         let portfolio = PortfolioManager::new(pm.clone(), Arc::new(InMemoryPnlStore::new()), quote_cache.clone(), HashMap::new());
 
-        pm.on_filled(&venue(), &symbol(), OrderSide::Sell, Decimal::ONE, Some(Decimal::new(50000, 0)), 1);
+        pm.on_filled(&venue(), &symbol(), OrderSide::Sell, Decimal::ONE, Some(Decimal::new(50000, 0)), None, None, None, 1);
         quote_cache.insert(
             (venue(), symbol()),
             Quote {
@@ -375,8 +426,8 @@ mod tests {
 
         let binance = Venue::new("binance_spot");
         let kraken = Venue::new("kraken_spot");
-        pm.on_filled(&binance, &symbol(), OrderSide::Buy, Decimal::ONE, Some(Decimal::new(50000, 0)), 1);
-        pm.on_filled(&kraken, &symbol(), OrderSide::Buy, Decimal::new(5, 1), Some(Decimal::new(50000, 0)), 2);
+        pm.on_filled(&binance, &symbol(), OrderSide::Buy, Decimal::ONE, Some(Decimal::new(50000, 0)), None, None, None, 1);
+        pm.on_filled(&kraken, &symbol(), OrderSide::Buy, Decimal::new(5, 1), Some(Decimal::new(50000, 0)), None, None, None, 2);
         for v in [&binance, &kraken] {
             quote_cache.insert(
                 (v.clone(), symbol()),
@@ -404,8 +455,8 @@ mod tests {
 
         let binance = Venue::new("binance_spot");
         let kraken = Venue::new("kraken_spot");
-        pm.on_filled(&binance, &symbol(), OrderSide::Buy, Decimal::ONE, Some(Decimal::new(50000, 0)), 1);
-        pm.on_filled(&kraken, &symbol(), OrderSide::Buy, Decimal::new(5, 1), Some(Decimal::new(50000, 0)), 2);
+        pm.on_filled(&binance, &symbol(), OrderSide::Buy, Decimal::ONE, Some(Decimal::new(50000, 0)), None, None, None, 1);
+        pm.on_filled(&kraken, &symbol(), OrderSide::Buy, Decimal::new(5, 1), Some(Decimal::new(50000, 0)), None, None, None, 2);
         quote_cache.insert(
             (binance.clone(), symbol()),
             Quote {
@@ -428,8 +479,8 @@ mod tests {
         let (portfolio, _pm) = manager();
         let binance = Venue::new("binance_spot");
         let kraken = Venue::new("kraken_spot");
-        portfolio.record_fill(&binance, &symbol(), Decimal::ONE, Some(Decimal::new(50000, 0)), Some(Decimal::new(5, 0)), Decimal::new(100, 0), 1);
-        portfolio.record_fill(&kraken, &symbol(), Decimal::ONE, Some(Decimal::new(50000, 0)), Some(Decimal::new(3, 0)), Decimal::new(50, 0), 2);
+        portfolio.record_fill(&binance, &symbol(), Decimal::ONE, Some(Decimal::new(50000, 0)), Some(Decimal::new(5, 0)), None, Decimal::new(100, 0), 1);
+        portfolio.record_fill(&kraken, &symbol(), Decimal::ONE, Some(Decimal::new(50000, 0)), Some(Decimal::new(3, 0)), None, Decimal::new(50, 0), 2);
 
         let summary = portfolio.asset_pnl("BTC");
         assert_eq!(summary.realized_pnl, Decimal::new(150, 0));
@@ -458,7 +509,7 @@ mod tests {
         let (portfolio, _pm) = manager();
         let binance = Venue::new("binance_spot");
         let futures = Venue::new("binance_futures");
-        portfolio.record_fill(&binance, &symbol(), Decimal::ONE, Some(Decimal::new(50000, 0)), Some(Decimal::new(5, 0)), Decimal::new(100, 0), 1);
+        portfolio.record_fill(&binance, &symbol(), Decimal::ONE, Some(Decimal::new(50000, 0)), Some(Decimal::new(5, 0)), None, Decimal::new(100, 0), 1);
         portfolio.record_funding_fee(&futures, &symbol(), Decimal::new(-15, 1), 2);
 
         let summary = portfolio.asset_pnl("BTC");

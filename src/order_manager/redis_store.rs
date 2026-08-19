@@ -5,7 +5,7 @@ use log::warn;
 use redis::Commands;
 
 use super::id_allocator::OrderIdAllocator;
-use super::store::OrderStore;
+use super::store::{OrderStore, OrderUpdateOutcome};
 use super::types::{Order, OrderId};
 
 const ORDERS_KEY: &str = "arb_scanner:orders";
@@ -74,6 +74,48 @@ impl OrderStore for RedisOrderStore {
         if let Err(err) = result {
             warn!("RedisOrderStore: failed to write order_id={}: {err}", order.order_id);
         }
+    }
+
+    /// 持有连接锁完成整个 HGET → 修改 → HSET，避免 `get()` 后再 `upsert()`
+    /// 两步之间被另一个并发调用者(`ExecutionService`/`OrderManager`)插入写入。
+    fn update(&self, order_id: &OrderId, f: Box<dyn FnOnce(&mut Order) -> bool + Send + '_>) -> OrderUpdateOutcome {
+        let mut conn = self.conn.lock().unwrap();
+
+        let value: Option<String> = match conn.hget(ORDERS_KEY, order_id.to_string()) {
+            Ok(value) => value,
+            Err(err) => {
+                warn!("RedisOrderStore: failed to read order_id={order_id} for update: {err}");
+                return OrderUpdateOutcome::NotFound;
+            }
+        };
+        let Some(value) = value else {
+            return OrderUpdateOutcome::NotFound;
+        };
+        let mut order: Order = match serde_json::from_str(&value) {
+            Ok(order) => order,
+            Err(err) => {
+                warn!("RedisOrderStore: failed to deserialize order_id={order_id} for update: {err}");
+                return OrderUpdateOutcome::NotFound;
+            }
+        };
+
+        if !f(&mut order) {
+            return OrderUpdateOutcome::Skipped;
+        }
+
+        let json = match serde_json::to_string(&order) {
+            Ok(json) => json,
+            Err(err) => {
+                warn!("RedisOrderStore: failed to serialize order_id={} for update: {err}", order.order_id);
+                return OrderUpdateOutcome::NotFound;
+            }
+        };
+        let result: redis::RedisResult<()> = conn.hset(ORDERS_KEY, order.order_id.to_string(), json);
+        if let Err(err) = result {
+            warn!("RedisOrderStore: failed to write order_id={} for update: {err}", order.order_id);
+            return OrderUpdateOutcome::NotFound;
+        }
+        OrderUpdateOutcome::Applied(order)
     }
 }
 

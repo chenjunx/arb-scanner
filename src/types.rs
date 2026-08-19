@@ -56,10 +56,3 @@ pub struct Quote {
     pub ts_ms: u64,
 }
 
-/// 行情更新事件，由 MarketDataSource 产生，驱动引擎与策略。
-#[derive(Debug, Clone)]
-pub struct MarketEvent {
-    pub venue: Venue,
-    pub symbol: Symbol,
-    pub quote: Quote,
-}

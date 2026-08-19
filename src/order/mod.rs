@@ -54,6 +54,15 @@ pub trait OrderProvider: Send + Sync {
     async fn query_order(&self, _symbol: &Symbol, _exchange_order_id: &str) -> anyhow::Result<OrderResult> {
         anyhow::bail!("query_order not supported for venue {}", self.venue())
     }
+
+    /// 查询 `asset` 相对 USDT(或等值稳定币)的现价，用于把非 base/quote 币种
+    /// (如 Binance 现货的 BNB、Kraken 的 KFEE)支付的手续费换算成 USDT 计价。
+    /// 只在 `pricing::FeeUsdtConverter::query_async` 里按需调用，是公开行情
+    /// 查询，不需要签名。默认实现是报错，交易所没有合适的报价对时不需要改动，
+    /// 由调用方按失败处理。
+    async fn quote_usdt_price(&self, _asset: &str) -> anyhow::Result<Decimal> {
+        anyhow::bail!("quote_usdt_price not supported for venue {}", self.venue())
+    }
 }
 
 #[cfg(test)]

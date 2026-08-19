@@ -26,7 +26,7 @@ impl std::fmt::Display for OrderId {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrderRequest {
     /// 策略名称，用于跟踪和风控
-    pub strategy_name: String,
+    pub strategy_id: String,
     /// 目标交易所
     pub venue: Venue,
     /// 交易对
@@ -41,6 +41,11 @@ pub struct OrderRequest {
     pub group_id: Option<String>,
     /// 策略附加元数据
     pub metadata: Option<String>,
+    /// 内部订单ID，由 RiskService 在风控通过、转发给 ExecutionService 之前
+    /// 填入；策略提交时始终为 None。ExecutionService/OrderManager 发布
+    /// OrderEvent 时都必须使用这个 ID，保证策略拿到的事件和自己提交的这笔
+    /// 请求能对上号。
+    pub order_id: Option<OrderId>,
 }
 
 /// 经过 OrderManager 增强后的内部订单

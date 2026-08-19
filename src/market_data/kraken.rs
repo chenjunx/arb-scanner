@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
@@ -6,13 +7,13 @@ use futures_util::{SinkExt, StreamExt};
 use log::{debug, warn};
 use rust_decimal::Decimal;
 use serde::Deserialize;
-use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 use crate::net::connect_tcp;
-use crate::types::{MarketEvent, Quote, Symbol, Venue};
+use crate::topic::{Topic, TopicBus};
+use crate::types::{Quote, Symbol, Venue};
 
 use super::{MarketDataSource, now_ms};
 
@@ -73,7 +74,7 @@ impl MarketDataSource for KrakenSpotSource {
         self.venue.clone()
     }
 
-    fn spawn(self: Box<Self>, tx: mpsc::Sender<MarketEvent>) -> JoinHandle<()> {
+    fn spawn(self: Box<Self>, bus: Arc<TopicBus>) -> JoinHandle<()> {
         tokio::spawn(async move {
             let symbol_map = self.symbol_map();
             let subscribe_msg = self.subscribe_message();
@@ -118,14 +119,7 @@ impl MarketDataSource for KrakenSpotSource {
                         continue;
                     };
                     for (symbol, quote) in parse_ticker_message(&text, &symbol_map) {
-                        let event = MarketEvent {
-                            venue: self.venue.clone(),
-                            symbol,
-                            quote,
-                        };
-                        if tx.send(event).await.is_err() {
-                            return;
-                        }
+                        bus.publish(Topic::quote(self.venue.clone(), symbol), quote);
                     }
                 }
 

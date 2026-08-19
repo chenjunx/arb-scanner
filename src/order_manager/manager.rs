@@ -1,262 +1,82 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use log::{info, warn};
+use log::warn;
 use rust_decimal::Decimal;
-use tokio::sync::{mpsc, oneshot};
 
 use crate::order::types::OrderStatus;
 use crate::portfolio::PortfolioManager;
+use crate::position::PositionManager;
+use crate::pricing::FeeUsdtConverter;
+use crate::topic::{Topic, TopicBus};
 
-use super::execution::ExecutionEngine;
-use super::id_allocator::OrderIdAllocator;
-use super::risk::RiskEngine;
-use super::store::OrderStore;
+use super::store::{OrderStore, OrderUpdateOutcome};
 use super::stream::ExchangeOrderUpdate;
-use super::types::{Order, OrderEvent, OrderId, OrderRequest, OrderResponse, RiskCheckResult};
+use super::types::{Order, OrderEvent, OrderId};
 
-/// 订单管理器：统筹订单生命周期，负责分配订单ID、调用风控引擎、
-/// 委托执行引擎下单、维护订单状态、发布事件通知策略。
+/// 订单管理器（重构后）：只负责处理交易所 WS 推送的订单更新，
+/// 是订单成交状态的唯一权威来源。订单初始创建由 RiskService 写入 Redis，
+/// ExecutionService REST 下单后也直接更新 Redis 写入 exchange_order_id，
+/// OrderManager 只负责：WS 更新 → 读 Redis → 更新 → 写回 Redis → 更新仓位/账本 → 发布事件。
+/// 仓位是成交的直接结果，因此由 OrderManager 直接写入 `PositionManager`——
+/// `RiskService` 只在下单前读仓位做限额检查，不再经手写入，避免读写分家。
 pub struct OrderManager {
-    risk_engine: Arc<RiskEngine>,
-    execution_engine: Arc<ExecutionEngine>,
+    bus: Arc<TopicBus>,
+    position_manager: Arc<PositionManager>,
     portfolio: Arc<PortfolioManager>,
-    /// 跨进程共享的订单序号分配器（见 `id_allocator.rs`）
-    order_id_allocator: Arc<dyn OrderIdAllocator>,
-    /// `order_id_allocator` 不可用时的本地兜底计数器，与时间戳组合生成订单ID
-    /// 以降低跨进程碰撞概率（见 `generate_order_id`）
-    fallback_order_seq: AtomicU64,
-    /// 订单状态存储，key=OrderId。用 `Arc` 包装以便后台执行任务共享同一份存储。
-    orders: Arc<Mutex<HashMap<OrderId, Order>>>,
-    /// 下单时透传给交易所的 client_order_id -> 内部 OrderId，用于交易所私有 WS
-    /// 推送订单更新时反查订单（见 `handle_exchange_update`）。
+    /// client_order_id → OrderId 索引，按需从 Redis 懒加载
     client_order_index: Arc<Mutex<HashMap<String, OrderId>>>,
-    /// 交易所自己的订单号 -> 内部 OrderId，REST 下单响应拿到 exchange_order_id
-    /// 后写入，作为 client_order_id 关联失败时的兜底。
+    /// exchange_order_id → OrderId 索引，按需从 Redis 懒加载
     exchange_order_index: Arc<Mutex<HashMap<String, OrderId>>>,
-    /// 事件发布通道，策略通过订阅这个通道接收订单事件
-    event_tx: mpsc::Sender<OrderEvent>,
-    /// 订单历史持久化，每次 `orders` map 更新后同步 upsert 一份。
+    /// 订单历史持久化（Redis 或内存）
     order_store: Arc<dyn OrderStore>,
+    /// 手续费统一换算为 USDT 计价的服务；没有活跃 provider 注册表的低频场景
+    /// （如 `reconcile-order --confirm` 人工回补）传 `None`，不接入实时换算。
+    fee_converter: Option<Arc<FeeUsdtConverter>>,
 }
 
 impl OrderManager {
     pub fn new(
-        risk_engine: Arc<RiskEngine>,
-        execution_engine: Arc<ExecutionEngine>,
+        bus: Arc<TopicBus>,
+        position_manager: Arc<PositionManager>,
         portfolio: Arc<PortfolioManager>,
-        event_tx: mpsc::Sender<OrderEvent>,
         order_store: Arc<dyn OrderStore>,
-        order_id_allocator: Arc<dyn OrderIdAllocator>,
+        fee_converter: Option<Arc<FeeUsdtConverter>>,
     ) -> Self {
         Self {
-            risk_engine,
-            execution_engine,
+            bus,
+            position_manager,
             portfolio,
-            order_id_allocator,
-            fallback_order_seq: AtomicU64::new(1),
-            orders: Arc::new(Mutex::new(HashMap::new())),
             client_order_index: Arc::new(Mutex::new(HashMap::new())),
             exchange_order_index: Arc::new(Mutex::new(HashMap::new())),
-            event_tx,
             order_store,
+            fee_converter,
         }
     }
 
-    /// 策略提交订单的入口。返回立即生成的订单ID和用于接收提交结果的 oneshot 通道
-    /// (风控通过并成功发送到交易所，或被风控/交易所拒绝；不代表已经成交——成交
-    /// 结果只由交易所私有 WS 通过 `handle_exchange_update` 驱动，见该方法说明)。
-    pub async fn submit_order(&self, mut request: OrderRequest) -> OrderResponse {
-        let order_id = self.generate_order_id();
-        let (result_tx, result_rx) = oneshot::channel();
-
-        // 确定透传给交易所的 client_order_id：策略指定了就用策略的，否则用
-        // order_id 本身(同时满足 Binance newClientOrderId 和 Kraken cl_ord_id
-        // 的长度限制)。记入索引，供后续 WS 推送反查订单。
-        let client_order_id = request
-            .client_order_id
-            .clone()
-            .unwrap_or_else(|| order_id.to_string());
-        request.client_order_id = Some(client_order_id.clone());
-        self.client_order_index
-            .lock()
-            .unwrap()
-            .insert(client_order_id, order_id.clone());
-
-        info!(
-            "OrderManager: submit order_id={} strategy={} venue={} symbol={} side={:?} amount={:?}",
-            order_id, request.strategy_name, request.venue, request.symbol, request.side, request.amount
-        );
-
-        // 创建内部订单对象
-        let order = Order {
-            order_id: order_id.clone(),
-            request: request.clone(),
-            status: OrderStatus::New,
-            filled_qty: rust_decimal::Decimal::ZERO,
-            avg_price: None,
-            exchange_order_id: None,
-            created_at_ms: current_timestamp_ms(),
-            updated_at_ms: current_timestamp_ms(),
-            reject_reason: None,
-        };
-
-        // 存储订单状态
-        self.orders.lock().unwrap().insert(order_id.clone(), order.clone());
-        self.order_store.upsert(order.clone());
-
-        // 发送 Submitted 事件
-        let _ = self.event_tx.send(OrderEvent::Submitted {
-            order_id: order_id.clone(),
-        }).await;
-
-        // 在后台任务中执行风控检查和订单提交
-        let risk_engine = self.risk_engine.clone();
-        let execution_engine = self.execution_engine.clone();
-        let orders = self.orders.clone();
-        let exchange_order_index = self.exchange_order_index.clone();
-        let event_tx = self.event_tx.clone();
-        let order_store = self.order_store.clone();
-
-        tokio::spawn(async move {
-            let result = Self::process_order(
-                order,
-                risk_engine,
-                execution_engine,
-                orders,
-                exchange_order_index,
-                event_tx,
-                order_store,
-            ).await;
-            let _ = result_tx.send(result);
-        });
-
-        OrderResponse {
-            order_id,
-            result_rx,
-        }
-    }
-
-    /// 后台任务：执行风控检查 -> 执行引擎提交 -> 更新状态
-    async fn process_order(
-        order: Order,
-        risk_engine: Arc<RiskEngine>,
-        execution_engine: Arc<ExecutionEngine>,
-        orders: Arc<Mutex<HashMap<OrderId, Order>>>,
-        exchange_order_index: Arc<Mutex<HashMap<String, OrderId>>>,
-        event_tx: mpsc::Sender<OrderEvent>,
-        order_store: Arc<dyn OrderStore>,
-    ) -> Result<Order, String> {
-        // 1. 风控检查
-        let risk_result = risk_engine.check(
-            &order.request.venue,
-            &order.request.symbol,
-            order.request.side,
-            &order.request.amount,
-        );
-
-        match risk_result {
-            RiskCheckResult::Rejected { reason } => {
-                info!("OrderManager: order_id={} rejected by risk: {}", order.order_id, reason);
-
-                let mut updated_order = order;
-                updated_order.status = OrderStatus::Rejected;
-                updated_order.reject_reason = Some(reason.clone());
-                updated_order.updated_at_ms = current_timestamp_ms();
-
-                // 更新存储
-                orders.lock().unwrap().insert(updated_order.order_id.clone(), updated_order.clone());
-                order_store.upsert(updated_order.clone());
-
-                // 发送拒绝事件
-                let _ = event_tx.send(OrderEvent::RejectedByRisk {
-                    order_id: updated_order.order_id.clone(),
-                    reason: reason.clone(),
-                }).await;
-
-                return Err(reason);
-            }
-            RiskCheckResult::Approved => {
-                info!("OrderManager: order_id={} passed risk check", order.order_id);
-            }
-        }
-
-        // 2. 提交到执行引擎。注意：这里只处理"提交是否被交易所立即拒绝"，
-        // 不会再把 REST 响应当成成交结果——两个交易所的成交都统一由交易所私有
-        // WS 通过 `handle_exchange_update` 驱动，见该方法说明。
-        let executed_order = execution_engine.execute(order).await;
-
-        if executed_order.status == OrderStatus::Rejected {
-            // 订单被拒绝，释放风控预占用的额度
-            risk_engine.release(&executed_order.request.venue, &executed_order.request.symbol);
-        }
-
-        // 3. 记录 exchange_order_id -> OrderId，供 WS 推送在 client_order_id
-        // 关联失败时兜底反查（例如推送先于 REST 响应到达时，client_order_id 已
-        // 经能关联上，这里只是让后续以 exchange_order_id 为键的推送也能查到）。
-        if let Some(exchange_order_id) = &executed_order.exchange_order_id {
-            exchange_order_index
-                .lock()
-                .unwrap()
-                .entry(exchange_order_id.clone())
-                .or_insert_with(|| executed_order.order_id.clone());
-        }
-
-        // 4. 合并回订单状态存储：只补 execute() 真正有权威性的字段
-        // (exchange_order_id，以及被交易所同步拒绝时的 status/reject_reason)，
-        // 不触碰 status/filled_qty/avg_price——这几个字段的唯一权威来源必须
-        // 始终是 handle_exchange_update。这里绝不能用 executed_order 整个
-        // 覆盖存储的订单：市价单常常在这个后台任务处理 REST 响应之前就已经
-        // 通过交易所私有 WS 推送成交并被 handle_exchange_update 正确写入，
-        // 一旦在这里无条件覆盖，就会把刚写入的 Filled 状态"改回" New
-        // (历史上真实发生过的生产事故，见 handle_exchange_update 的文档)。
-        let result_order = {
-            let mut orders_guard = orders.lock().unwrap();
-            let stored = orders_guard
-                .entry(executed_order.order_id.clone())
-                .or_insert_with(|| executed_order.clone());
-            if stored.exchange_order_id.is_none() {
-                stored.exchange_order_id = executed_order.exchange_order_id.clone();
-            }
-            if executed_order.status == OrderStatus::Rejected {
-                stored.status = OrderStatus::Rejected;
-                stored.reject_reason = executed_order.reject_reason.clone();
-                stored.updated_at_ms = executed_order.updated_at_ms;
-            }
-            stored.clone()
-        };
-        order_store.upsert(result_order.clone());
-
-        if result_order.status == OrderStatus::Rejected {
-            Err(result_order.reject_reason.unwrap_or_else(|| "unknown rejection".to_string()))
-        } else {
-            Ok(result_order)
-        }
-    }
-
-    /// 消费交易所私有 WS 推送的一条订单更新，是订单成交状态的唯一权威来源
-    /// (REST 下单响应只负责"提交是否被立即拒绝"，见 `process_order`)。
+    /// 消费交易所私有 WS 推送的一条订单更新，是订单成交状态的唯一权威来源。
     ///
-    /// 关联顺序：先按 `client_order_id` 查，查不到再退化按 `exchange_order_id`
-    /// 查(应对推送先于 REST 响应到达、或推送没回显 client_order_id 的情况)。
-    /// 关联不上或对应订单未知则丢弃并打日志，不会 panic。
-    ///
-    /// 幂等/防倒退：`filled_qty` 比已存储的还小的推送视为过期重放直接丢弃；
-    /// 已经是终态(Filled/Rejected/Expired)且这次推送没有带来新信息的重复推送
-    /// 也会被忽略。只有成交量增加的部分才会计入风控持仓(`RiskEngine::on_filled`
-    /// 按增量记账，累计值不能直接传)。
+    /// 流程：
+    /// 1. 通过 client_order_id / exchange_order_id 从索引查 OrderId
+    /// 2. 如果索引没有，尝试从 Redis 加载订单并建立索引
+    /// 3. 从 Redis 读取订单当前状态
+    /// 4. 应用更新（幂等、防倒退）
+    /// 5. 写回 Redis
+    /// 6. 更新风控持仓 + 账本
+    /// 7. 发布 OrderEvent
     pub async fn handle_exchange_update(&self, update: ExchangeOrderUpdate) {
-        let Some(order_id) = self.resolve_order_id(&update) else {
-            warn!(
-                "OrderManager: exchange update from venue={} could not be correlated to any order (client_order_id={:?}, exchange_order_id={:?})",
-                update.venue, update.client_order_id, update.exchange_order_id
-            );
-            return;
+        let order_id = match self.resolve_order_id(&update) {
+            Some(id) => id,
+            None => {
+                warn!(
+                    "OrderManager: exchange update from venue={} could not be correlated to any order (client_order_id={:?}, exchange_order_id={:?})",
+                    update.venue, update.client_order_id, update.exchange_order_id
+                );
+                return;
+            }
         };
 
-        // 补录 exchange_order_id -> OrderId，方便后续没有回显 client_order_id
-        // 的推送也能关联上。
+        // 补录 exchange_order_id 索引
         if let Some(exchange_order_id) = &update.exchange_order_id {
             self.exchange_order_index
                 .lock()
@@ -265,68 +85,121 @@ impl OrderManager {
                 .or_insert_with(|| order_id.clone());
         }
 
-        let applied = {
-            let mut orders = self.orders.lock().unwrap();
-            let Some(order) = orders.get_mut(&order_id) else {
-                warn!("OrderManager: exchange update for unknown order_id={order_id}");
-                return;
-            };
-
-            if update.filled_qty < order.filled_qty {
-                warn!(
-                    "OrderManager: ignoring stale exchange update for order_id={order_id}: update filled_qty {} < stored {}",
-                    update.filled_qty, order.filled_qty
+        // 幂等检查(防倒退/重复)和字段更新放在同一次 `OrderStore::update` 调用
+        // 里原子完成，避免像 get()+upsert() 那样两步之间被 ExecutionService
+        // 并发写 exchange_order_id 的操作插入，导致互相覆盖丢失更新。
+        let mut fill_delta = Decimal::ZERO;
+        let new_filled_qty = update.filled_qty;
+        let new_status = update.status;
+        let new_avg_price = update.avg_price;
+        let new_exchange_order_id = &update.exchange_order_id;
+        let new_ts_ms = update.ts_ms;
+        let outcome = self.order_store.update(
+            &order_id,
+            Box::new(|order| {
+                if new_filled_qty < order.filled_qty {
+                    warn!(
+                        "OrderManager: ignoring stale exchange update for order_id={order_id}: update filled_qty {} < stored {}",
+                        new_filled_qty, order.filled_qty
+                    );
+                    return false;
+                }
+                let already_terminal = matches!(
+                    order.status,
+                    OrderStatus::Filled | OrderStatus::Rejected | OrderStatus::Expired
                 );
+                if already_terminal && new_filled_qty == order.filled_qty && new_status == order.status {
+                    return false;
+                }
+
+                fill_delta = new_filled_qty - order.filled_qty;
+                order.status = new_status;
+                order.filled_qty = new_filled_qty;
+                if new_avg_price.is_some() {
+                    order.avg_price = new_avg_price;
+                }
+                if let Some(exchange_order_id) = new_exchange_order_id {
+                    order.exchange_order_id = Some(exchange_order_id.clone());
+                }
+                order.updated_at_ms = new_ts_ms;
+                true
+            }),
+        );
+
+        let order = match outcome {
+            OrderUpdateOutcome::NotFound => {
+                warn!("OrderManager: exchange update for unknown order_id={order_id} (not found in Redis)");
                 return;
             }
-            let already_terminal = matches!(
-                order.status,
-                OrderStatus::Filled | OrderStatus::Rejected | OrderStatus::Expired
-            );
-            if already_terminal && update.filled_qty == order.filled_qty && update.status == order.status {
-                return;
-            }
-
-            let fill_delta = update.filled_qty - order.filled_qty;
-
-            order.status = update.status;
-            order.filled_qty = update.filled_qty;
-            if update.avg_price.is_some() {
-                order.avg_price = update.avg_price;
-            }
-            if let Some(exchange_order_id) = &update.exchange_order_id {
-                order.exchange_order_id = Some(exchange_order_id.clone());
-            }
-            order.updated_at_ms = update.ts_ms;
-
-            (
-                order.request.venue.clone(),
-                order.request.symbol.clone(),
-                order.request.side,
-                fill_delta,
-                order.status,
-                order.filled_qty,
-                order.avg_price,
-                order.clone(),
-            )
+            OrderUpdateOutcome::Skipped => return,
+            OrderUpdateOutcome::Applied(order) => order,
         };
 
-        let (venue, symbol, side, fill_delta, status, filled_qty, avg_price, updated_order) = applied;
-        self.order_store.upsert(updated_order);
+        let venue = order.request.venue.clone();
+        let symbol = order.request.symbol.clone();
+        let side = order.request.side;
+        let strategy_id = order.request.strategy_id.clone();
+        let status = order.status;
+        let filled_qty = order.filled_qty;
+        let avg_price = order.avg_price;
 
+        // 更新持仓 + 账本
         if fill_delta > Decimal::ZERO {
-            let outcome = self.risk_engine.on_filled(&venue, &symbol, side, fill_delta, avg_price, update.ts_ms);
+            let fee_usdt_sync = match (update.fee, update.fee_asset.as_deref(), &self.fee_converter) {
+                (Some(amount), Some(asset), Some(converter)) => {
+                    converter.try_resolve_sync(&symbol, amount, asset, avg_price)
+                }
+                _ => None,
+            };
+
+            let outcome = self.position_manager.on_filled(
+                &venue,
+                &symbol,
+                side,
+                fill_delta,
+                avg_price,
+                update.fee,
+                update.fee_asset.clone(),
+                fee_usdt_sync,
+                update.ts_ms,
+            );
             self.portfolio.record_fill(
                 &venue,
                 &symbol,
                 fill_delta,
                 avg_price,
                 update.fee,
+                fee_usdt_sync,
                 outcome.realized_pnl,
                 update.ts_ms,
             );
+
+            // 同步解不出来但确实有手续费 → 后台异步查价，不阻塞下面的事件发布
+            if fee_usdt_sync.is_none() {
+                if let (Some(amount), Some(asset), Some(converter)) =
+                    (update.fee, update.fee_asset.clone(), self.fee_converter.clone())
+                {
+                    let venue = venue.clone();
+                    let symbol = symbol.clone();
+                    let position_manager = self.position_manager.clone();
+                    let portfolio = self.portfolio.clone();
+                    tokio::spawn(async move {
+                        match converter.query_async(&venue, &asset, amount).await {
+                            Some(usdt) => {
+                                position_manager.apply_fee_usdt(&venue, &symbol, usdt);
+                                portfolio.apply_fee_usdt(&venue, &symbol, usdt);
+                            }
+                            None => {
+                                position_manager.mark_fee_usdt_incomplete(&venue, &symbol);
+                                portfolio.mark_fee_usdt_incomplete(&venue, &symbol);
+                            }
+                        }
+                    });
+                }
+            }
         }
 
+        // 发布事件
         let event = match status {
             OrderStatus::PartiallyFilled => Some(OrderEvent::PartiallyFilled {
                 order_id: order_id.clone(),
@@ -346,11 +219,12 @@ impl OrderManager {
         };
 
         if let Some(event) = event {
-            let _ = self.event_tx.send(event).await;
+            self.bus.publish(Topic::order_event(&strategy_id), event);
         }
     }
 
     fn resolve_order_id(&self, update: &ExchangeOrderUpdate) -> Option<OrderId> {
+        // 先查内存索引
         if let Some(client_order_id) = &update.client_order_id {
             if let Some(order_id) = self.client_order_index.lock().unwrap().get(client_order_id).cloned() {
                 return Some(order_id);
@@ -361,19 +235,62 @@ impl OrderManager {
                 return Some(order_id);
             }
         }
+
+        // 内存索引没有，尝试从 Redis 扫描构建索引（慢路径，仅在重启后首次 WS 推送时触发）
+        self.rebuild_index_from_redis(update)
+    }
+
+    fn rebuild_index_from_redis(&self, update: &ExchangeOrderUpdate) -> Option<OrderId> {
+        // 从 Redis 加载所有订单，匹配 client_order_id 或 exchange_order_id
+        let all_orders = self.order_store.all();
+        for order in all_orders {
+            // 构建索引
+            if let Some(cid) = &order.request.client_order_id {
+                self.client_order_index.lock().unwrap().insert(cid.clone(), order.order_id.clone());
+            }
+            if let Some(eid) = &order.exchange_order_id {
+                self.exchange_order_index.lock().unwrap().insert(eid.clone(), order.order_id.clone());
+            }
+
+            // 匹配当前 update
+            if let Some(cid) = &update.client_order_id {
+                if order.request.client_order_id.as_ref() == Some(cid) {
+                    return Some(order.order_id.clone());
+                }
+            }
+            if let Some(eid) = &update.exchange_order_id {
+                if order.exchange_order_id.as_ref() == Some(eid) {
+                    return Some(order.order_id.clone());
+                }
+            }
+        }
         None
     }
 
-    /// 查询订单状态
+    /// 查询订单状态（从 Redis 读取）
     pub fn get_order(&self, order_id: &OrderId) -> Option<Order> {
-        self.orders.lock().unwrap().get(order_id).cloned()
+        self.order_store.get(order_id)
     }
 
-    /// 把一笔从 Redis 读出来的历史订单塞进内存状态(`orders` map + 两个索引)，
-    /// 仅用于一次性核对/修正历史卡单的恢复流程(见 `main.rs` 的
-    /// `reconcile-order` 子命令)：正常下单路径由 `submit_order` 负责建立这些
-    /// 索引，这里只是让 `handle_exchange_update`/`query_order` 回填结果时能
-    /// 找到这笔订单，不会触发任何事件或风控/账本记账。
+    /// 按 client_order_id 反查订单（先查内存索引，查不到从 Redis 扫描）
+    pub fn find_by_client_order_id(&self, client_order_id: &str) -> Option<Order> {
+        if let Some(order_id) = self.client_order_index.lock().unwrap().get(client_order_id).cloned() {
+            return self.order_store.get(&order_id);
+        }
+
+        // 内存索引没有，从 Redis 扫描
+        let all_orders = self.order_store.all();
+        for order in all_orders {
+            if order.request.client_order_id.as_deref() == Some(client_order_id) {
+                // 顺便建立索引
+                self.client_order_index.lock().unwrap().insert(client_order_id.to_string(), order.order_id.clone());
+                return Some(order);
+            }
+        }
+        None
+    }
+
+    /// 把一笔从 Redis 读出来的历史订单加载到内存索引，仅用于 reconcile-order 命令
     pub fn seed_order(&self, order: Order) {
         if let Some(client_order_id) = &order.request.client_order_id {
             self.client_order_index
@@ -387,455 +304,9 @@ impl OrderManager {
                 .unwrap()
                 .insert(exchange_order_id.clone(), order.order_id.clone());
         }
-        self.orders.lock().unwrap().insert(order.order_id.clone(), order);
     }
 
-    /// 获取所有订单（用于监控和调试）
     pub fn all_orders(&self) -> Vec<Order> {
-        self.orders.lock().unwrap().values().cloned().collect()
-    }
-
-    /// 生成全局唯一的订单ID。ID 里始终带生成时的毫秒时间戳——即使 Redis 的
-    /// `order_id_allocator` 计数器因为重启/未持久化/被清空而从头计数，新订单
-    /// 的时间戳也和历史订单不同，不会撞上 `RedisOrderStore` 里已有的 Hash
-    /// field 而覆盖历史记录（这才是真正要防的碰撞，而不是序号本身单调）。
-    /// 序号只用来消歧同一毫秒内提交的多笔订单：优先用 `order_id_allocator`
-    /// （跨进程共享，通常是 Redis INCR）；分配失败（如 Redis 断连）时退化为
-    /// 本地计数器。
-    fn generate_order_id(&self) -> OrderId {
-        let ts = current_timestamp_ms();
-        match self.order_id_allocator.next() {
-            Some(seq) => OrderId::new(format!("ORD-{ts}-{seq:06}")),
-            None => {
-                let local_seq = self.fallback_order_seq.fetch_add(1, Ordering::SeqCst);
-                OrderId::new(format!("ORD-{ts}-F{local_seq:04}"))
-            }
-        }
-    }
-}
-
-fn current_timestamp_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::order::types::{OrderAmount, OrderResult, OrderSide, OrderStatus};
-    use crate::order::OrderProvider;
-    use crate::order_manager::execution::ExchangeAdapter;
-    use crate::order_manager::id_allocator::InMemoryOrderIdAllocator;
-    use crate::order_manager::risk::RiskLimits;
-    use crate::order_manager::store::InMemoryOrderStore;
-    use crate::portfolio::{InMemoryPnlStore, PortfolioManager};
-    use crate::position::{InMemoryPositionStore, PositionManager};
-    use crate::types::{Symbol, Venue};
-    use async_trait::async_trait;
-    use dashmap::DashMap;
-    use rust_decimal::Decimal;
-    use std::sync::atomic::AtomicBool;
-
-    struct FakeOrderProvider {
-        venue: Venue,
-        should_fail: AtomicBool,
-    }
-
-    #[async_trait]
-    impl OrderProvider for FakeOrderProvider {
-        fn venue(&self) -> Venue {
-            self.venue.clone()
-        }
-
-        async fn place_market_order_raw(
-            &self,
-            req: &crate::order::types::MarketOrderRequest,
-        ) -> anyhow::Result<OrderResult> {
-            if self.should_fail.load(Ordering::SeqCst) {
-                anyhow::bail!("simulated exchange failure");
-            }
-            let qty = match req.amount {
-                OrderAmount::Base(q) => q,
-                OrderAmount::Quote(q) => q / Decimal::new(50000, 0), // assume BTC price 50k
-            };
-            Ok(OrderResult {
-                order_id: "exchange-123".to_string(),
-                status: OrderStatus::Filled,
-                filled_qty: qty,
-                avg_price: Some(Decimal::new(50000, 0)),
-                fee: None,
-                fee_asset: None,
-            })
-        }
-    }
-
-    /// 提交 REST 请求前会先等待外部 notify 的 provider，用来在测试里精确控制
-    /// "WS 更新先到、REST 响应后到" 这个顺序（现实中市价单常见的时序）。
-    struct DelayedOrderProvider {
-        venue: Venue,
-        notify: Arc<tokio::sync::Notify>,
-    }
-
-    #[async_trait]
-    impl OrderProvider for DelayedOrderProvider {
-        fn venue(&self) -> Venue {
-            self.venue.clone()
-        }
-
-        async fn place_market_order_raw(
-            &self,
-            req: &crate::order::types::MarketOrderRequest,
-        ) -> anyhow::Result<OrderResult> {
-            self.notify.notified().await;
-            let qty = match req.amount {
-                OrderAmount::Base(q) => q,
-                OrderAmount::Quote(q) => q / Decimal::new(50000, 0),
-            };
-            Ok(OrderResult {
-                order_id: "exchange-123".to_string(),
-                status: OrderStatus::Filled,
-                filled_qty: qty,
-                avg_price: Some(Decimal::new(50000, 0)),
-                fee: None,
-                fee_asset: None,
-            })
-        }
-    }
-
-    fn setup_manager() -> (Arc<OrderManager>, mpsc::Receiver<OrderEvent>, Arc<RiskEngine>) {
-        let venue = Venue::new("test-venue");
-        let provider = Arc::new(FakeOrderProvider {
-            venue: venue.clone(),
-            should_fail: AtomicBool::new(false),
-        });
-        setup_manager_with_provider(provider)
-    }
-
-    fn setup_manager_with_provider(
-        provider: Arc<dyn OrderProvider>,
-    ) -> (Arc<OrderManager>, mpsc::Receiver<OrderEvent>, Arc<RiskEngine>) {
-        let venue = Venue::new("test-venue");
-        let symbol = Symbol::new("BTC", "USDT");
-
-        let mut risk_limits = HashMap::new();
-        risk_limits.insert(
-            (venue.clone(), symbol.clone()),
-            RiskLimits {
-                max_order_amount: Decimal::new(10, 0),
-                max_position: Decimal::new(100, 0),
-                max_orders_per_window: 10,
-            },
-        );
-
-        let position_manager = Arc::new(PositionManager::new(Arc::new(InMemoryPositionStore::new())));
-        let risk_engine = Arc::new(RiskEngine::new(risk_limits, position_manager.clone()));
-        let portfolio = Arc::new(PortfolioManager::new(
-            position_manager,
-            Arc::new(InMemoryPnlStore::new()),
-            Arc::new(DashMap::new()),
-            HashMap::new(),
-        ));
-
-        let (event_tx, event_rx) = mpsc::channel(100);
-
-        let adapter = Arc::new(ExchangeAdapter::new(venue.clone(), provider));
-        let mut adapters = HashMap::new();
-        adapters.insert(venue.clone(), adapter);
-
-        let execution_engine = Arc::new(ExecutionEngine::new(adapters, event_tx.clone()));
-        let order_store = Arc::new(InMemoryOrderStore::new());
-        let order_id_allocator = Arc::new(InMemoryOrderIdAllocator::new());
-        let manager = Arc::new(OrderManager::new(
-            risk_engine.clone(),
-            execution_engine,
-            portfolio,
-            event_tx,
-            order_store,
-            order_id_allocator,
-        ));
-
-        (manager, event_rx, risk_engine)
-    }
-
-    fn sample_request() -> OrderRequest {
-        OrderRequest {
-            strategy_name: "test-strategy".to_string(),
-            venue: Venue::new("test-venue"),
-            symbol: Symbol::new("BTC", "USDT"),
-            side: OrderSide::Buy,
-            amount: OrderAmount::Base(Decimal::ONE),
-            client_order_id: None,
-            group_id: None,
-            metadata: None,
-        }
-    }
-
-    #[tokio::test]
-    async fn submit_order_stays_new_until_ws_confirms() {
-        let (manager, mut event_rx, _risk_engine) = setup_manager();
-
-        let response = manager.submit_order(sample_request()).await;
-        let order_id = response.order_id.clone();
-        let result = response.result_rx.await.unwrap();
-
-        // REST 提交路径不再是成交结果的来源：即使 FakeOrderProvider 同步返回了
-        // Filled，订单在这里应该仍是 New/未成交，等交易所私有 WS 推送确认。
-        assert!(result.is_ok());
-        let order = result.unwrap();
-        assert_eq!(order.status, OrderStatus::New);
-        assert_eq!(order.filled_qty, Decimal::ZERO);
-
-        let events: Vec<OrderEvent> = vec![event_rx.recv().await.unwrap(), event_rx.recv().await.unwrap()];
-        assert!(matches!(events[0], OrderEvent::Submitted { .. }));
-        assert!(matches!(events[1], OrderEvent::Accepted { .. }));
-
-        assert_eq!(manager.get_order(&order_id).unwrap().status, OrderStatus::New);
-    }
-
-    #[tokio::test]
-    async fn ws_updates_drive_fill_events_and_incremental_risk_credit() {
-        let (manager, mut event_rx, risk_engine) = setup_manager();
-
-        let response = manager.submit_order(sample_request()).await;
-        let order_id = response.order_id.clone();
-        let order = response.result_rx.await.unwrap().unwrap();
-        let client_order_id = order.request.client_order_id.clone().unwrap();
-
-        // 消费掉 Submitted/Accepted
-        event_rx.recv().await.unwrap();
-        event_rx.recv().await.unwrap();
-
-        let venue = Venue::new("test-venue");
-        let symbol = Symbol::new("BTC", "USDT");
-
-        manager
-            .handle_exchange_update(ExchangeOrderUpdate {
-                venue: venue.clone(),
-                client_order_id: Some(client_order_id.clone()),
-                exchange_order_id: Some("exchange-123".to_string()),
-                status: OrderStatus::PartiallyFilled,
-                filled_qty: Decimal::new(4, 1), // 0.4
-                avg_price: Some(Decimal::new(50000, 0)),
-                fee: None,
-                fee_asset: None,
-                ts_ms: 1,
-            })
-            .await;
-
-        manager
-            .handle_exchange_update(ExchangeOrderUpdate {
-                venue,
-                client_order_id: Some(client_order_id),
-                exchange_order_id: Some("exchange-123".to_string()),
-                status: OrderStatus::Filled,
-                filled_qty: Decimal::ONE,
-                avg_price: Some(Decimal::new(50000, 0)),
-                fee: None,
-                fee_asset: None,
-                ts_ms: 2,
-            })
-            .await;
-
-        let updated = manager.get_order(&order_id).unwrap();
-        assert_eq!(updated.status, OrderStatus::Filled);
-        assert_eq!(updated.filled_qty, Decimal::ONE);
-        // 两次推送的 filled_qty 都是累计值(0.4 然后 1.0)，风控只应按增量记账，
-        // 不能把 0.4 + 1.0 都算上。
-        assert_eq!(risk_engine.position(&Venue::new("test-venue"), &symbol), Decimal::ONE);
-
-        let partial = event_rx.recv().await.unwrap();
-        let filled = event_rx.recv().await.unwrap();
-        assert!(matches!(partial, OrderEvent::PartiallyFilled { .. }));
-        assert!(matches!(filled, OrderEvent::Filled { .. }));
-    }
-
-    #[tokio::test]
-    async fn stale_or_regressed_update_is_ignored() {
-        let (manager, mut event_rx, risk_engine) = setup_manager();
-
-        let response = manager.submit_order(sample_request()).await;
-        let order_id = response.order_id.clone();
-        let order = response.result_rx.await.unwrap().unwrap();
-        let client_order_id = order.request.client_order_id.clone().unwrap();
-        event_rx.recv().await.unwrap();
-        event_rx.recv().await.unwrap();
-
-        let venue = Venue::new("test-venue");
-        let symbol = Symbol::new("BTC", "USDT");
-
-        manager
-            .handle_exchange_update(ExchangeOrderUpdate {
-                venue: venue.clone(),
-                client_order_id: Some(client_order_id.clone()),
-                exchange_order_id: Some("exchange-123".to_string()),
-                status: OrderStatus::Filled,
-                filled_qty: Decimal::ONE,
-                avg_price: Some(Decimal::new(50000, 0)),
-                fee: None,
-                fee_asset: None,
-                ts_ms: 1,
-            })
-            .await;
-        event_rx.recv().await.unwrap(); // Filled
-
-        // 过期重放/倒退的推送(比如乱序到达的旧快照)必须被忽略，不能覆盖已有状态、
-        // 不能重复记账、也不能重复发事件。
-        manager
-            .handle_exchange_update(ExchangeOrderUpdate {
-                venue,
-                client_order_id: Some(client_order_id),
-                exchange_order_id: Some("exchange-123".to_string()),
-                status: OrderStatus::PartiallyFilled,
-                filled_qty: Decimal::new(5, 1),
-                avg_price: Some(Decimal::new(50000, 0)),
-                fee: None,
-                fee_asset: None,
-                ts_ms: 2,
-            })
-            .await;
-
-        let updated = manager.get_order(&order_id).unwrap();
-        assert_eq!(updated.status, OrderStatus::Filled);
-        assert_eq!(updated.filled_qty, Decimal::ONE);
-        assert_eq!(risk_engine.position(&Venue::new("test-venue"), &symbol), Decimal::ONE);
-        assert!(event_rx.try_recv().is_err());
-    }
-
-    #[tokio::test]
-    async fn update_for_unknown_order_is_dropped_without_panic() {
-        let (manager, mut event_rx, _risk_engine) = setup_manager();
-
-        manager
-            .handle_exchange_update(ExchangeOrderUpdate {
-                venue: Venue::new("test-venue"),
-                client_order_id: Some("does-not-exist".to_string()),
-                exchange_order_id: None,
-                status: OrderStatus::Filled,
-                filled_qty: Decimal::ONE,
-                avg_price: None,
-                fee: None,
-                fee_asset: None,
-                ts_ms: 1,
-            })
-            .await;
-
-        assert!(event_rx.try_recv().is_err());
-    }
-
-    #[tokio::test]
-    async fn ws_confirmation_before_rest_response_is_not_overwritten() {
-        let venue = Venue::new("test-venue");
-        let notify = Arc::new(tokio::sync::Notify::new());
-        let provider = Arc::new(DelayedOrderProvider {
-            venue: venue.clone(),
-            notify: notify.clone(),
-        });
-        let (manager, mut event_rx, _risk_engine) = setup_manager_with_provider(provider);
-
-        let response = manager.submit_order(sample_request()).await;
-        let order_id = response.order_id.clone();
-        let client_order_id = manager
-            .get_order(&order_id)
-            .unwrap()
-            .request
-            .client_order_id
-            .clone()
-            .unwrap();
-
-        // 等 Submitted/Accepted 两个事件都出现，确保后台的 process_order 任务
-        // 已经真正跑到 ExecutionEngine::execute 内部、卡在
-        // DelayedOrderProvider::place_market_order_raw 等 notify 的那一行——
-        // 也就是"已经提交给交易所、REST 响应还没回来"这个真实存在的时间窗口。
-        assert!(matches!(event_rx.recv().await.unwrap(), OrderEvent::Submitted { .. }));
-        assert!(matches!(event_rx.recv().await.unwrap(), OrderEvent::Accepted { .. }));
-
-        // WS 先到：直接把成交推送喂给 handle_exchange_update。
-        manager
-            .handle_exchange_update(ExchangeOrderUpdate {
-                venue: venue.clone(),
-                client_order_id: Some(client_order_id),
-                exchange_order_id: Some("exchange-123".to_string()),
-                status: OrderStatus::Filled,
-                filled_qty: Decimal::ONE,
-                avg_price: Some(Decimal::new(50000, 0)),
-                fee: None,
-                fee_asset: None,
-                ts_ms: 1,
-            })
-            .await;
-
-        assert_eq!(manager.get_order(&order_id).unwrap().status, OrderStatus::Filled);
-        assert!(matches!(event_rx.recv().await.unwrap(), OrderEvent::Filled { .. }));
-
-        // 现在放行 REST 响应，process_order 里的合并逻辑必须不覆盖已经是
-        // Filled 的状态——这是这次真正要防住的回归。
-        notify.notify_one();
-        let result = response.result_rx.await.unwrap();
-        assert!(result.is_ok());
-
-        let final_order = manager.get_order(&order_id).unwrap();
-        assert_eq!(final_order.status, OrderStatus::Filled);
-        assert_eq!(final_order.filled_qty, Decimal::ONE);
-        assert_eq!(final_order.exchange_order_id, Some("exchange-123".to_string()));
-
-        // process_order 走到 Ok 分支，不会再发别的事件。
-        assert!(event_rx.try_recv().is_err());
-    }
-
-    #[tokio::test]
-    async fn seed_order_makes_order_reachable_by_client_and_exchange_id() {
-        let (manager, mut event_rx, _risk_engine) = setup_manager();
-
-        let venue = Venue::new("test-venue");
-        let order_id = OrderId::new("ORD-seeded-000001".to_string());
-        let mut request = sample_request();
-        request.client_order_id = Some("seeded-client-id".to_string());
-        let seeded = Order {
-            order_id: order_id.clone(),
-            request: request.clone(),
-            status: OrderStatus::New,
-            filled_qty: Decimal::ZERO,
-            avg_price: None,
-            exchange_order_id: Some("seeded-exchange-id".to_string()),
-            created_at_ms: 1,
-            updated_at_ms: 1,
-            reject_reason: None,
-        };
-
-        manager.seed_order(seeded);
-        assert_eq!(manager.get_order(&order_id).unwrap().status, OrderStatus::New);
-
-        // 只提供 exchange_order_id(不提供 client_order_id)也应该能关联上，
-        // 验证 seed_order 补齐的 exchange_order_index 生效。
-        manager
-            .handle_exchange_update(ExchangeOrderUpdate {
-                venue,
-                client_order_id: None,
-                exchange_order_id: Some("seeded-exchange-id".to_string()),
-                status: OrderStatus::Filled,
-                filled_qty: Decimal::ONE,
-                avg_price: Some(Decimal::new(50000, 0)),
-                fee: None,
-                fee_asset: None,
-                ts_ms: 2,
-            })
-            .await;
-
-        let updated = manager.get_order(&order_id).unwrap();
-        assert_eq!(updated.status, OrderStatus::Filled);
-        assert_eq!(updated.filled_qty, Decimal::ONE);
-        assert!(matches!(event_rx.recv().await.unwrap(), OrderEvent::Filled { .. }));
-    }
-
-    #[tokio::test]
-    async fn generates_unique_order_ids() {
-        let (manager, _event_rx, _risk_engine) = setup_manager();
-
-        let resp1 = manager.submit_order(sample_request()).await;
-        let resp2 = manager.submit_order(sample_request()).await;
-
-        assert_ne!(resp1.order_id, resp2.order_id);
+        self.order_store.all()
     }
 }

@@ -81,6 +81,9 @@ mod tests {
                     symbol: Symbol::new("BTC", "USDT"),
                     net_qty: Decimal::ONE,
                     avg_price: Some(Decimal::new(50000, 0)),
+                    total_fees: std::collections::HashMap::new(),
+                    total_fees_usdt: Decimal::ZERO,
+                    fees_usdt_incomplete: false,
                     updated_at_ms: 1,
                 }
             }),

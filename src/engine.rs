@@ -1,76 +1,35 @@
 use std::sync::Arc;
 
-use dashmap::DashMap;
-use tokio::sync::mpsc;
+use futures_util::StreamExt;
 
-use crate::sink::OpportunitySink;
 use crate::strategy::Strategy;
-use crate::types::{MarketEvent, Quote, Symbol, Venue};
+use crate::topic::TopicBus;
 
-/// (venue, symbol) -> 最新 Quote 缓存的只读视图，供策略在 on_update 中查询
-/// 当前已知的全部行情快照（例如跨交易所比价时需要看到其它 venue 的最新价格）。
-pub struct MarketView<'a> {
-    cache: &'a DashMap<(Venue, Symbol), Quote>,
-}
-
-impl<'a> MarketView<'a> {
-    pub(crate) fn new(cache: &'a DashMap<(Venue, Symbol), Quote>) -> Self {
-        Self { cache }
-    }
-
-    pub fn get(&self, venue: &Venue, symbol: &Symbol) -> Option<Quote> {
-        self.cache
-            .get(&(venue.clone(), symbol.clone()))
-            .map(|entry| *entry.value())
-    }
-
-    /// 返回某个 symbol 在所有已知 venue 上的最新报价。
-    pub fn quotes_for_symbol(&self, symbol: &Symbol) -> Vec<(Venue, Quote)> {
-        self.cache
-            .iter()
-            .filter(|entry| &entry.key().1 == symbol)
-            .map(|entry| (entry.key().0.clone(), *entry.value()))
-            .collect()
-    }
-}
-
-/// 套利引擎：消费行情事件，维护最新快照缓存，驱动所有注册的策略，
-/// 并将产出的套利机会分发给所有注册的 sink。
+/// 套利引擎：编排器。为每个策略按其 `subscriptions()` 向 `TopicBus` 订阅，
+/// 各自独立跑一个 tokio task，收到行情后调用策略的 `on_quote` 回调。
+/// 策略自己维护内部状态并在发现机会时打日志，引擎本身不做业务逻辑。
 pub struct ArbitrageEngine {
-    cache: Arc<DashMap<(Venue, Symbol), Quote>>,
     strategies: Vec<Box<dyn Strategy>>,
-    sinks: Vec<Box<dyn OpportunitySink>>,
 }
 
 impl ArbitrageEngine {
-    pub fn new(strategies: Vec<Box<dyn Strategy>>, sinks: Vec<Box<dyn OpportunitySink>>) -> Self {
-        Self {
-            cache: Arc::new(DashMap::new()),
-            strategies,
-            sinks,
-        }
+    pub fn new(strategies: Vec<Box<dyn Strategy>>) -> Self {
+        Self { strategies }
     }
 
-    /// 拿到行情缓存的共享句柄，供 `run()` 事件循环之外的代码(如 `monitor` 子命令的
-    /// periodic 定时任务)主动读取当前快照。必须在 `run(self, rx)` 之前调用，因为
-    /// `run` 会按值消费 `self`。
-    pub fn shared_cache(&self) -> Arc<DashMap<(Venue, Symbol), Quote>> {
-        self.cache.clone()
-    }
-
-    pub async fn run(self, mut rx: mpsc::Receiver<MarketEvent>) {
-        while let Some(event) = rx.recv().await {
-            self.cache
-                .insert((event.venue.clone(), event.symbol.clone()), event.quote);
-
-            let view = MarketView::new(&self.cache);
-            for strategy in &self.strategies {
-                for opportunity in strategy.on_update(&view, &event) {
-                    for sink in &self.sinks {
-                        sink.handle(&opportunity);
-                    }
+    pub async fn run(self, bus: Arc<TopicBus>) {
+        let mut strategy_handles = Vec::new();
+        for strategy in self.strategies {
+            let mut quotes = bus.subscribe_many(strategy.subscriptions());
+            strategy_handles.push(tokio::spawn(async move {
+                while let Some((topic, quote)) = quotes.next().await {
+                    strategy.on_quote(&topic, &quote);
                 }
-            }
+            }));
+        }
+
+        for handle in strategy_handles {
+            let _ = handle.await;
         }
     }
 }

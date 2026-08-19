@@ -1,12 +1,13 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 use rand::Rng;
 use rust_decimal::Decimal;
 use rust_decimal::prelude::FromPrimitive;
-use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use crate::types::{MarketEvent, Quote, Symbol, Venue};
+use crate::topic::{Topic, TopicBus};
+use crate::types::{Quote, Symbol, Venue};
 
 use super::{MarketDataSource, now_ms};
 
@@ -61,7 +62,7 @@ impl MarketDataSource for MockSource {
         self.venue.clone()
     }
 
-    fn spawn(self: Box<Self>, tx: mpsc::Sender<MarketEvent>) -> JoinHandle<()> {
+    fn spawn(self: Box<Self>, bus: Arc<TopicBus>) -> JoinHandle<()> {
         tokio::spawn(async move {
             let mut mids: Vec<Decimal> =
                 self.symbols.iter().map(|cfg| cfg.initial_mid).collect();
@@ -71,14 +72,7 @@ impl MarketDataSource for MockSource {
                 let ts_ms = now_ms();
                 for (idx, cfg) in self.symbols.iter().enumerate() {
                     let quote = Self::next_quote(&mut mids[idx], cfg, ts_ms);
-                    let event = MarketEvent {
-                        venue: self.venue.clone(),
-                        symbol: cfg.symbol.clone(),
-                        quote,
-                    };
-                    if tx.send(event).await.is_err() {
-                        return;
-                    }
+                    bus.publish(Topic::quote(self.venue.clone(), cfg.symbol.clone()), quote);
                 }
             }
         })

@@ -17,7 +17,6 @@ use arb_scanner::exchange_info::PrecisionCache;
 use arb_scanner::exchange_info::binance::BinanceExchangeInfoProvider;
 use arb_scanner::exchange_info::kraken::KrakenExchangeInfoProvider;
 use arb_scanner::exchange_info::types::TradingFee;
-use arb_scanner::execution;
 use arb_scanner::logging;
 use arb_scanner::market_data::MarketDataSource;
 use arb_scanner::market_data::binance::BinanceSpotSource;
@@ -28,25 +27,30 @@ use arb_scanner::net;
 use arb_scanner::order::OrderProvider;
 use arb_scanner::order::binance::{BinanceOrderProvider, BinanceUserDataStream};
 use arb_scanner::order::binance_futures::{BinanceFuturesOrderProvider, BinanceFuturesUserDataStream};
-use arb_scanner::order::kraken::KrakenOrderProvider;
+use arb_scanner::order::kraken::{KrakenOrderProvider, KrakenPrivateOrderStream};
 use arb_scanner::order_manager::{
-    ExchangeAdapter, ExchangeOrderUpdate, ExecutionEngine, OrderManager, OrderStore, OrderStreamSource,
-    RedisOrderIdAllocator, RedisOrderStore, RiskEngine, RiskLimits,
+    ExchangeAdapter, ExchangeOrderUpdate, ExecutionService, InMemoryOrderStore, OrderManager, OrderStore,
+    OrderStreamSource, RedisOrderIdAllocator, RedisOrderStore, RiskService,
 };
+use arb_scanner::order_manager::risk_service::RiskLimits;
 use arb_scanner::order_manager::types::OrderId;
-use arb_scanner::portfolio::{PortfolioManager, RedisPnlStore};
-use arb_scanner::position::{PositionManager, PositionStore, RedisPositionStore, VenuePosition};
+use arb_scanner::portfolio::{InMemoryPnlStore, PortfolioManager, RedisPnlStore};
+use arb_scanner::position::{InMemoryPositionStore, PositionManager, PositionStore, RedisPositionStore, VenuePosition};
+use arb_scanner::pricing::FeeUsdtConverter;
 use arb_scanner::report::channels::LogChannel;
 use arb_scanner::report::{OrderSection, PortfolioSection, PositionSection, ReportChannel, ReportTracker};
 use arb_scanner::scan;
-use arb_scanner::sink::OpportunitySink;
-use arb_scanner::sink::log_sink::LogSink;
 use arb_scanner::strategy::cross_exchange::CrossExchangeStrategy;
+use arb_scanner::strategy::manual::{
+    ClosePositionParams, ManualStrategy, OpenPositionParams, RotateInventoryParams, open_hedged_position_dry_run,
+};
 use arb_scanner::strategy::triangular::{LegSide, TriangularLeg, TriangularPath, TriangularStrategy};
 use arb_scanner::strategy::{FeeSchedule, Strategy};
+use arb_scanner::topic::TopicBus;
 use arb_scanner::types::{Quote, Symbol, Venue};
 use arb_scanner::wallet::binance::BinanceWalletProvider;
 use arb_scanner::wallet::kraken::KrakenWalletProvider;
+use arb_scanner::wallet::transfer::{TransferHalfParams, transfer_half_to_kraken};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -106,7 +110,7 @@ async fn main() -> anyhow::Result<()> {
         None => info!("ARB_SCANNER_PROXY not set, connecting to exchanges directly"),
     }
 
-    let (tx, rx) = tokio::sync::mpsc::channel(1024);
+    let bus = Arc::new(TopicBus::new());
 
     let mock_symbol_configs: Vec<MockSymbolConfig> = config
         .symbols
@@ -145,9 +149,8 @@ async fn main() -> anyhow::Result<()> {
                 ))
             }
         };
-        source_handles.push(source.spawn(tx.clone()));
+        source_handles.push(source.spawn(bus.clone()));
     }
-    drop(tx);
 
     let triangular_paths: Vec<TriangularPath> = config
         .triangular_paths
@@ -177,18 +180,19 @@ async fn main() -> anyhow::Result<()> {
             symbols,
             fees.clone(),
             config.min_profit_bps,
+            bus.clone(),
         )),
         Box::new(TriangularStrategy::new(
             triangular_paths,
             fees,
             config.min_profit_bps,
+            bus.clone(),
         )),
     ];
-    let sinks: Vec<Box<dyn OpportunitySink>> = vec![Box::new(LogSink)];
 
     info!("arb-scanner engine starting");
-    let engine = ArbitrageEngine::new(strategies, sinks);
-    engine.run(rx).await;
+    let engine = ArbitrageEngine::new(strategies);
+    engine.run(bus).await;
 
     for handle in source_handles {
         let _ = handle.await;
@@ -201,9 +205,9 @@ async fn main() -> anyhow::Result<()> {
 /// 供 `open --live`/`monitor`/`accounting`/`report` 共用，避免各自重复一遍
 /// "连 Redis -> RedisPositionStore/RedisPnlStore -> PositionManager/PortfolioManager"
 /// 的引导代码。`quote_cache` 由调用方决定：不需要浮动盈亏(纯记账场景)传空
-/// `Arc::new(DashMap::new())`，需要 mark-to-market 就传接了实时行情的
-/// `ArbitrageEngine::shared_cache()`。手续费配置固定用空 `HashMap`(按
-/// `FeeConfig::default()` 估算)，目前没有命令需要自定义。
+/// `Arc::new(DashMap::new())`；手动开平仓/轮转这几个一次性命令不接实时行情，
+/// 同样传空 cache。手续费配置固定用空 `HashMap`(按 `FeeConfig::default()`
+/// 估算)，目前没有命令需要自定义。
 fn build_portfolio_stack(
     redis_url: &str,
     quote_cache: Arc<DashMap<(Venue, Symbol), Quote>>,
@@ -222,13 +226,83 @@ fn build_portfolio_stack(
     Ok((position_manager, portfolio_manager))
 }
 
+/// `open`/`rotate`/`close` 三个手动命令共用的 live 流水线：搭好
+/// RiskService/ExecutionService/OrderManager，为每条腿起对应的交易所私有
+/// WS 流并等它就绪，返回喂给 `ManualStrategy::new` 的 `order_manager`。
+/// `stream_handles` 只是为了在调用方 `.join.abort()`，`_risk_handle`/
+/// `_execution_handle` 不需要保留——`tokio::spawn` 返回的 `JoinHandle` drop
+/// 不会取消任务，这两个后台循环会随进程退出而结束，和现有 `open --live`
+/// 分支的行为一致。
+struct ManualPipeline {
+    order_manager: Arc<OrderManager>,
+    stream_handles: Vec<tokio::task::JoinHandle<()>>,
+}
+
+async fn build_manual_pipeline(
+    redis_url: &str,
+    bus: Arc<TopicBus>,
+    symbol: &Symbol,
+    legs: Vec<(Venue, Arc<dyn OrderProvider>, Box<dyn OrderStreamSource>, RiskLimits)>,
+) -> anyhow::Result<ManualPipeline> {
+    let order_store = Arc::new(RedisOrderStore::new(redis_url).context("failed to connect RedisOrderStore to redis")?);
+    let order_id_allocator =
+        RedisOrderIdAllocator::new(redis_url).context("failed to connect RedisOrderIdAllocator to redis")?;
+    let (position_manager, portfolio_manager) = build_portfolio_stack(redis_url, Arc::new(DashMap::new()))?;
+
+    let mut risk_limits = HashMap::new();
+    let mut adapters = HashMap::new();
+    let mut fee_providers = HashMap::new();
+    for (venue, provider, _stream, limits) in &legs {
+        risk_limits.insert((venue.clone(), symbol.clone()), limits.clone());
+        adapters.insert(venue.clone(), Arc::new(ExchangeAdapter::new(venue.clone(), provider.clone())));
+        fee_providers.insert(venue.clone(), provider.clone());
+    }
+    let fee_converter = Some(Arc::new(FeeUsdtConverter::new(fee_providers)));
+
+    let risk_service = Arc::new(RiskService::new(
+        bus.clone(),
+        Arc::new(order_id_allocator),
+        order_store.clone(),
+        risk_limits,
+        position_manager.clone(),
+    ));
+    let execution_service = Arc::new(ExecutionService::new(bus.clone(), adapters, order_store.clone()));
+    let order_manager = Arc::new(OrderManager::new(
+        bus.clone(),
+        position_manager,
+        portfolio_manager,
+        order_store,
+        fee_converter,
+    ));
+
+    let _risk_handle = risk_service.clone().start();
+    let _execution_handle = execution_service.clone().start();
+
+    // 等每条私有流真正建连+鉴权/订阅完成，再让调用方开始下单——否则市价单
+    // 可能在 WS 就绪前就已成交，导致成交推送被永久错过（WS API 不重放）。
+    const STREAM_READY_TIMEOUT: Duration = Duration::from_secs(20);
+    let mut stream_handles = Vec::new();
+    for (venue, _provider, stream, _limits) in legs {
+        let handle = stream.spawn(order_manager.clone());
+        tokio::time::timeout(STREAM_READY_TIMEOUT, handle.ready)
+            .await
+            .with_context(|| format!("等待 {venue} 私有 WS 就绪超时"))?
+            .with_context(|| format!("{venue} 私有 WS 未能就绪就退出了(检查 API Key/网络)"))?;
+        stream_handles.push(handle.join);
+    }
+
+    Ok(ManualPipeline { order_manager, stream_handles })
+}
+
 /// `open` 子命令：手动触发一次"币安现货按 USDT 金额买入 -> 币安 U 本位合约等量
-/// 做空对冲 -> 买入量的一半划转到 Kraken 现货"流程。不接入 engine 主循环，
-/// 也不读取 `config.toml`，参数全部来自命令行。
+/// 做空对冲"流程。不接入 engine 主循环，也不读取 `config.toml`，参数全部来自
+/// 命令行。
 ///
-/// 加 `--from-transfer` 时跳过前两步，只从"划转一半到 Kraken"这一步继续——
-/// 用于现货买入和合约对冲已经手动/之前跑过完成，只是划转步骤需要重跑的场景，
-/// 此时用 `--filled-qty` 传入原始现货成交量。
+/// 加 `--from-transfer` 时跳过开仓，只做"划转一半到 Kraken"这一步——用于现货
+/// 买入和合约对冲已经手动/之前跑过完成，只是划转步骤需要重跑的场景，此时用
+/// `--filled-qty` 传入原始现货成交量。**行为变化**：以前 `--live
+/// --transfer-to-kraken` 能一步做完开仓+划转，现在划转永远是单独一步——手动
+/// 策略(`ManualStrategy`)只管下单，钱包划转挪到了 `wallet::transfer`。
 async fn run_open_command(args: &[String]) -> anyhow::Result<()> {
     let mut symbol: Option<Symbol> = None;
     let mut amount: Option<Decimal> = None;
@@ -238,7 +312,6 @@ async fn run_open_command(args: &[String]) -> anyhow::Result<()> {
     let mut client_order_id_prefix: Option<String> = None;
     let mut from_transfer = false;
     let mut filled_qty: Option<Decimal> = None;
-    let mut transfer_to_kraken = false;
     let mut fill_timeout_secs: u64 = 60;
 
     let mut i = 0;
@@ -290,10 +363,6 @@ async fn run_open_command(args: &[String]) -> anyhow::Result<()> {
                 filled_qty = Some(v.parse().context("--filled-qty must be a valid decimal number")?);
                 i += 2;
             }
-            "--transfer-to-kraken" => {
-                transfer_to_kraken = true;
-                i += 1;
-            }
             "--fill-timeout-secs" => {
                 let v = args.get(i + 1).context("--fill-timeout-secs requires a value")?;
                 fill_timeout_secs = v.parse().context("--fill-timeout-secs must be a valid non-negative integer")?;
@@ -322,10 +391,10 @@ async fn run_open_command(args: &[String]) -> anyhow::Result<()> {
             info!("open --from-transfer: dry_run=true (default), pass --live to actually withdraw");
         }
 
-        let (transfer_qty, withdraw) = execution::transfer_half_to_kraken(
+        let (transfer_qty, withdraw) = transfer_half_to_kraken(
             &binance_wallet,
             &kraken_wallet,
-            execution::TransferHalfParams {
+            TransferHalfParams {
                 filled_qty,
                 transfer_asset,
                 dry_run,
@@ -340,7 +409,6 @@ async fn run_open_command(args: &[String]) -> anyhow::Result<()> {
 
     let symbol = symbol.context("--symbol is required, e.g. --symbol BTC/USDT")?;
     let quote_amount = amount.context("--amount is required, e.g. --amount 1000")?;
-    let transfer_asset = asset.unwrap_or_else(|| symbol.base.to_string());
     let spot_venue = Venue::new("binance_spot");
     let futures_venue = Venue::new("binance_futures");
 
@@ -349,8 +417,6 @@ async fn run_open_command(args: &[String]) -> anyhow::Result<()> {
         Arc::new(BinanceOrderProvider::from_env(spot_venue.clone(), testnet, proxy.as_deref())?);
     let futures: Arc<dyn OrderProvider> =
         Arc::new(BinanceFuturesOrderProvider::from_env(futures_venue.clone(), testnet, proxy.as_deref())?);
-    let binance_wallet = BinanceWalletProvider::from_env(Venue::new("binance"), testnet, proxy.as_deref())?;
-    let kraken_wallet = KrakenWalletProvider::from_env(Venue::new("kraken"), proxy.as_deref())?;
 
     // 启动时一次性加载合约下单精度缓存，凭证/网络问题在下单前就暴露（fail-fast），
     // 而不是现货腿已经成交了才发现；即使 dry_run 分支用不到它也没关系——一次性
@@ -360,21 +426,17 @@ async fn run_open_command(args: &[String]) -> anyhow::Result<()> {
         .await
         .context("failed to load futures market precision cache")?;
 
-    info!(
-        "open: symbol={symbol} amount={quote_amount} transfer_asset={transfer_asset} testnet={testnet} dry_run={dry_run} transfer_to_kraken={transfer_to_kraken}"
-    );
+    info!("open: symbol={symbol} amount={quote_amount} testnet={testnet} dry_run={dry_run}");
 
     if dry_run {
-        info!("open: dry_run=true (default), pass --live to actually place orders/withdraw");
-        let report = execution::open_hedged_position_dry_run(
+        info!("open: dry_run=true (default), pass --live to actually place orders");
+        let report = open_hedged_position_dry_run(
             spot.as_ref(),
-            execution::OpenPositionParams {
+            OpenPositionParams {
                 symbol,
                 quote_amount,
-                transfer_asset,
                 client_order_id_prefix,
                 dry_run,
-                transfer_to_kraken,
                 fill_timeout: Duration::from_secs(fill_timeout_secs),
             },
         )
@@ -388,97 +450,62 @@ async fn run_open_command(args: &[String]) -> anyhow::Result<()> {
     // Redis 连不上直接快速失败，不能等下单后才发现存不进去。
     let redis_url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379/".to_string());
     info!("open --live: connecting to redis at {redis_url}");
-    let order_store = RedisOrderStore::new(&redis_url).context("failed to connect RedisOrderStore to redis")?;
-    let order_id_allocator =
-        RedisOrderIdAllocator::new(&redis_url).context("failed to connect RedisOrderIdAllocator to redis")?;
-    let (position_manager, portfolio_manager) = build_portfolio_stack(&redis_url, Arc::new(DashMap::new()))?;
+    let bus = Arc::new(TopicBus::new());
 
-    let mut risk_limits = HashMap::new();
-    risk_limits.insert(
-        (spot_venue.clone(), symbol.clone()),
-        RiskLimits {
-            max_order_amount: quote_amount,
-            max_position: Decimal::MAX,
-            max_orders_per_window: 3,
-        },
-    );
-    risk_limits.insert(
-        (futures_venue.clone(), symbol.clone()),
-        RiskLimits {
-            max_order_amount: Decimal::MAX,
-            max_position: Decimal::MAX,
-            max_orders_per_window: 3,
-        },
-    );
-    let risk_engine = Arc::new(RiskEngine::new(risk_limits, position_manager));
-
-    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(100);
-    let mut adapters = HashMap::new();
-    adapters.insert(spot_venue.clone(), Arc::new(ExchangeAdapter::new(spot_venue.clone(), spot.clone())));
-    adapters.insert(futures_venue.clone(), Arc::new(ExchangeAdapter::new(futures_venue.clone(), futures.clone())));
-    let execution_engine = Arc::new(ExecutionEngine::new(adapters, event_tx.clone()));
-    let order_manager = Arc::new(OrderManager::new(
-        risk_engine,
-        execution_engine,
-        portfolio_manager,
-        event_tx,
-        Arc::new(order_store),
-        Arc::new(order_id_allocator),
-    ));
-
-    let (update_tx, mut update_rx) = tokio::sync::mpsc::channel(100);
-    let spot_stream = BinanceUserDataStream::from_env(spot_venue.clone(), testnet, proxy.as_deref())
+    let spot_stream = BinanceUserDataStream::from_env(spot_venue.clone(), testnet, proxy.as_deref(), vec![symbol.clone()])
         .context("failed to start binance spot user data stream")?;
-    let futures_stream = BinanceFuturesUserDataStream::from_env(futures_venue.clone(), testnet, proxy.as_deref())
-        .context("failed to start binance futures user data stream")?;
-    let spot_handle = Box::new(spot_stream).spawn(update_tx.clone());
-    let futures_handle = Box::new(futures_stream).spawn(update_tx.clone());
-    drop(update_tx);
+    let futures_stream =
+        BinanceFuturesUserDataStream::from_env(futures_venue.clone(), testnet, proxy.as_deref(), vec![symbol.clone()])
+            .context("failed to start binance futures user data stream")?;
 
-    // 等两条私有流真正建连+鉴权/订阅完成，再开始下单——否则市价单可能在
-    // WS 就绪前就已成交，导致 executionReport 被永久错过（WS API 不重放）。
-    const STREAM_READY_TIMEOUT: Duration = Duration::from_secs(20);
-    tokio::time::timeout(STREAM_READY_TIMEOUT, spot_handle.ready)
-        .await
-        .context("等待现货私有 WS 就绪超时")?
-        .context("现货私有 WS 未能就绪就退出了(检查 API Key/网络)")?;
-    tokio::time::timeout(STREAM_READY_TIMEOUT, futures_handle.ready)
-        .await
-        .context("等待合约私有 WS 就绪超时")?
-        .context("合约私有 WS 未能就绪就退出了(检查 API Key/网络)")?;
-
-    let forward_handle = {
-        let order_manager = order_manager.clone();
-        tokio::spawn(async move {
-            while let Some(update) = update_rx.recv().await {
-                order_manager.handle_exchange_update(update).await;
-            }
-        })
-    };
-
-    let live_result = execution::open_hedged_position_live(
-        spot.as_ref(),
-        futures.as_ref(),
-        &binance_wallet,
-        &kraken_wallet,
-        order_manager.as_ref(),
-        &mut event_rx,
-        &futures_precision,
-        execution::OpenPositionParams {
-            symbol,
-            quote_amount,
-            transfer_asset,
-            client_order_id_prefix,
-            dry_run,
-            transfer_to_kraken,
-            fill_timeout: Duration::from_secs(fill_timeout_secs),
-        },
+    let pipeline = build_manual_pipeline(
+        &redis_url,
+        bus.clone(),
+        &symbol,
+        vec![
+            (
+                spot_venue.clone(),
+                spot.clone(),
+                Box::new(spot_stream) as Box<dyn OrderStreamSource>,
+                RiskLimits {
+                    max_order_amount: quote_amount,
+                    max_position: Decimal::MAX,
+                    max_orders_per_window: 3,
+                },
+            ),
+            (
+                futures_venue.clone(),
+                futures.clone(),
+                Box::new(futures_stream) as Box<dyn OrderStreamSource>,
+                RiskLimits {
+                    max_order_amount: Decimal::MAX,
+                    max_position: Decimal::MAX,
+                    max_orders_per_window: 3,
+                },
+            ),
+        ],
     )
-    .await;
+    .await?;
 
-    spot_handle.join.abort();
-    futures_handle.join.abort();
-    forward_handle.abort();
+    let strategy = ManualStrategy::new(bus, pipeline.order_manager);
+    let live_result = strategy
+        .open_hedged_position_live(
+            spot.as_ref(),
+            futures.as_ref(),
+            &futures_precision,
+            OpenPositionParams {
+                symbol,
+                quote_amount,
+                client_order_id_prefix,
+                dry_run,
+                fill_timeout: Duration::from_secs(fill_timeout_secs),
+            },
+        )
+        .await;
+
+    for h in pipeline.stream_handles {
+        h.abort();
+    }
 
     let report = live_result?;
     println!("{report:#?}");
@@ -522,9 +549,8 @@ async fn run_reconcile_order_command(args: &[String]) -> anyhow::Result<()> {
 
     let redis_url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379/".to_string());
     info!("reconcile-order: connecting to redis at {redis_url}");
-    let order_store = RedisOrderStore::new(&redis_url).context("failed to connect RedisOrderStore to redis")?;
-    let order_id_allocator =
-        RedisOrderIdAllocator::new(&redis_url).context("failed to connect RedisOrderIdAllocator to redis")?;
+    let order_store = Arc::new(RedisOrderStore::new(&redis_url).context("failed to connect RedisOrderStore to redis")?);
+    let bus = Arc::new(TopicBus::new());
     let (position_manager, portfolio_manager) = build_portfolio_stack(&redis_url, Arc::new(DashMap::new()))?;
 
     let order = order_store
@@ -571,31 +597,12 @@ async fn run_reconcile_order_command(args: &[String]) -> anyhow::Result<()> {
 
     info!("reconcile-order: --confirm 已指定，写入 handle_exchange_update 落库");
 
-    let mut risk_limits = HashMap::new();
-    risk_limits.insert(
-        (order.request.venue.clone(), order.request.symbol.clone()),
-        RiskLimits {
-            max_order_amount: Decimal::MAX,
-            max_position: Decimal::MAX,
-            max_orders_per_window: 3,
-        },
-    );
-    let risk_engine = Arc::new(RiskEngine::new(risk_limits, position_manager));
-
-    let (event_tx, _event_rx) = tokio::sync::mpsc::channel(100);
-    let mut adapters = HashMap::new();
-    adapters.insert(
-        order.request.venue.clone(),
-        Arc::new(ExchangeAdapter::new(order.request.venue.clone(), provider.clone())),
-    );
-    let execution_engine = Arc::new(ExecutionEngine::new(adapters, event_tx.clone()));
     let order_manager = Arc::new(OrderManager::new(
-        risk_engine,
-        execution_engine,
+        bus.clone(),
+        position_manager,
         portfolio_manager,
-        event_tx,
-        Arc::new(order_store),
-        Arc::new(order_id_allocator),
+        order_store,
+        None,
     ));
 
     order_manager.seed_order(order.clone());
@@ -608,6 +615,7 @@ async fn run_reconcile_order_command(args: &[String]) -> anyhow::Result<()> {
     order_manager
         .handle_exchange_update(ExchangeOrderUpdate {
             venue: order.request.venue.clone(),
+            symbol: order.request.symbol.clone(),
             client_order_id: order.request.client_order_id.clone(),
             exchange_order_id: Some(exchange_order_id),
             status: result.status,
@@ -713,6 +721,9 @@ async fn run_set_position_command(args: &[String]) -> anyhow::Result<()> {
             symbol: symbol_for_write,
             net_qty: qty,
             avg_price,
+            total_fees: std::collections::HashMap::new(),
+            total_fees_usdt: Decimal::ZERO,
+            fees_usdt_incomplete: false,
             updated_at_ms: ts_ms,
         }),
     );
@@ -737,6 +748,7 @@ async fn run_rotate_command(args: &[String]) -> anyhow::Result<()> {
     let mut testnet = false;
     let mut dry_run = true;
     let mut client_order_id_prefix: Option<String> = None;
+    let mut fill_timeout_secs: u64 = 60;
 
     let mut i = 0;
     while i < args.len() {
@@ -782,41 +794,82 @@ async fn run_rotate_command(args: &[String]) -> anyhow::Result<()> {
                 );
                 i += 2;
             }
+            "--fill-timeout-secs" => {
+                let v = args.get(i + 1).context("--fill-timeout-secs requires a value")?;
+                fill_timeout_secs = v.parse().context("--fill-timeout-secs must be a valid non-negative integer")?;
+                i += 2;
+            }
             other => anyhow::bail!("unknown argument '{other}' for 'rotate' subcommand"),
         }
     }
 
     let symbol = symbol.context("--symbol is required, e.g. --symbol BTC/USDT")?;
     let qty = qty.context("--qty is required, e.g. --qty 0.5")?;
-    let sell_venue = sell_venue.context("--sell is required, e.g. --sell binance")?;
-    let buy_venue = buy_venue.context("--buy is required, e.g. --buy kraken")?;
-    if sell_venue == buy_venue {
-        anyhow::bail!("--sell and --buy must be different venues, got '{sell_venue}' for both");
+    let sell_venue_name = sell_venue.context("--sell is required, e.g. --sell binance")?;
+    let buy_venue_name = buy_venue.context("--buy is required, e.g. --buy kraken")?;
+    if sell_venue_name == buy_venue_name {
+        anyhow::bail!("--sell and --buy must be different venues, got '{sell_venue_name}' for both");
     }
 
     let proxy = net::proxy_from_env();
-    let sell_provider = build_order_provider(&sell_venue, testnet, proxy.as_deref())?;
-    let buy_provider = build_order_provider(&buy_venue, testnet, proxy.as_deref())?;
+    let sell_provider = build_order_provider(&sell_venue_name, testnet, proxy.as_deref())?;
+    let buy_provider = build_order_provider(&buy_venue_name, testnet, proxy.as_deref())?;
 
     info!(
-        "rotate: symbol={symbol} qty={qty} sell={sell_venue} buy={buy_venue} testnet={testnet} dry_run={dry_run}"
+        "rotate: symbol={symbol} qty={qty} sell={sell_venue_name} buy={buy_venue_name} testnet={testnet} dry_run={dry_run}"
     );
+
+    let params = RotateInventoryParams {
+        symbol: symbol.clone(),
+        qty,
+        client_order_id_prefix,
+        dry_run,
+        fill_timeout: Duration::from_secs(fill_timeout_secs),
+    };
+
     if dry_run {
         info!("rotate: dry_run=true (default), pass --live to actually place orders");
+        let strategy = bare_manual_strategy();
+        let report = strategy.rotate_inventory(sell_provider.as_ref(), buy_provider.as_ref(), params).await?;
+        println!("{report:#?}");
+        return Ok(());
     }
 
-    let report = execution::rotate_inventory(
-        sell_provider.as_ref(),
-        buy_provider.as_ref(),
-        execution::RotateInventoryParams {
-            symbol,
-            qty,
-            client_order_id_prefix,
-            dry_run,
-        },
+    // --live：两条腿都要走完整的 OrderManager 流水线，成交结果才会真正落进
+    // PositionManager/PortfolioManager，和 `open --live` 一致。
+    let redis_url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379/".to_string());
+    info!("rotate --live: connecting to redis at {redis_url}");
+    let bus = Arc::new(TopicBus::new());
+
+    let sell_stream = build_order_stream_source(&sell_venue_name, testnet, proxy.as_deref(), &symbol)
+        .with_context(|| format!("failed to start {sell_venue_name} private order stream"))?;
+    let buy_stream = build_order_stream_source(&buy_venue_name, testnet, proxy.as_deref(), &symbol)
+        .with_context(|| format!("failed to start {buy_venue_name} private order stream"))?;
+
+    let default_limits = RiskLimits {
+        max_order_amount: Decimal::MAX,
+        max_position: Decimal::MAX,
+        max_orders_per_window: 3,
+    };
+    let pipeline = build_manual_pipeline(
+        &redis_url,
+        bus.clone(),
+        &symbol,
+        vec![
+            (sell_provider.venue(), sell_provider.clone(), sell_stream, default_limits.clone()),
+            (buy_provider.venue(), buy_provider.clone(), buy_stream, default_limits),
+        ],
     )
     .await?;
 
+    let strategy = ManualStrategy::new(bus, pipeline.order_manager);
+    let live_result = strategy.rotate_inventory(sell_provider.as_ref(), buy_provider.as_ref(), params).await;
+
+    for h in pipeline.stream_handles {
+        h.abort();
+    }
+
+    let report = live_result?;
     println!("{report:#?}");
     Ok(())
 }
@@ -836,6 +889,7 @@ async fn run_close_command(args: &[String]) -> anyhow::Result<()> {
     let mut testnet = false;
     let mut dry_run = true;
     let mut client_order_id_prefix: Option<String> = None;
+    let mut fill_timeout_secs: u64 = 60;
 
     let mut i = 0;
     while i < args.len() {
@@ -883,6 +937,11 @@ async fn run_close_command(args: &[String]) -> anyhow::Result<()> {
                 );
                 i += 2;
             }
+            "--fill-timeout-secs" => {
+                let v = args.get(i + 1).context("--fill-timeout-secs requires a value")?;
+                fill_timeout_secs = v.parse().context("--fill-timeout-secs must be a valid non-negative integer")?;
+                i += 2;
+            }
             other => anyhow::bail!("unknown argument '{other}' for 'close' subcommand"),
         }
     }
@@ -895,41 +954,103 @@ async fn run_close_command(args: &[String]) -> anyhow::Result<()> {
     }
 
     let proxy = net::proxy_from_env();
-    let binance_spot = binance_spot_qty
+    let binance_spot: Option<Arc<dyn OrderProvider>> = binance_spot_qty
         .is_some()
         .then(|| BinanceOrderProvider::from_env(Venue::new("binance_spot"), testnet, proxy.as_deref()))
-        .transpose()?;
-    let kraken_spot = kraken_spot_qty
+        .transpose()?
+        .map(|p| Arc::new(p) as Arc<dyn OrderProvider>);
+    let kraken_spot: Option<Arc<dyn OrderProvider>> = kraken_spot_qty
         .is_some()
         .then(|| KrakenOrderProvider::from_env(Venue::new("kraken_spot"), proxy.as_deref()))
-        .transpose()?;
-    let binance_futures = futures_qty
+        .transpose()?
+        .map(|p| Arc::new(p) as Arc<dyn OrderProvider>);
+    let binance_futures: Option<Arc<dyn OrderProvider>> = futures_qty
         .is_some()
         .then(|| BinanceFuturesOrderProvider::from_env(Venue::new("binance_futures"), testnet, proxy.as_deref()))
-        .transpose()?;
+        .transpose()?
+        .map(|p| Arc::new(p) as Arc<dyn OrderProvider>);
 
     info!(
         "close: symbol={symbol} binance_spot_qty={binance_spot_qty:?} kraken_spot_qty={kraken_spot_qty:?} futures_qty={futures_qty:?} testnet={testnet} dry_run={dry_run}"
     );
+
+    let params = ClosePositionParams {
+        symbol: symbol.clone(),
+        binance_spot_qty,
+        kraken_spot_qty,
+        futures_qty,
+        client_order_id_prefix,
+        dry_run,
+        fill_timeout: Duration::from_secs(fill_timeout_secs),
+    };
+
     if dry_run {
         info!("close: dry_run=true (default), pass --live to actually place orders");
+        let strategy = bare_manual_strategy();
+        let report = strategy
+            .close_hedged_position(
+                binance_spot.as_deref(),
+                kraken_spot.as_deref(),
+                binance_futures.as_deref(),
+                params,
+            )
+            .await?;
+        println!("{report:#?}");
+        return Ok(());
     }
 
-    let report = execution::close_hedged_position(
-        binance_spot.as_ref().map(|p| p as &dyn OrderProvider),
-        kraken_spot.as_ref().map(|p| p as &dyn OrderProvider),
-        binance_futures.as_ref().map(|p| p as &dyn OrderProvider),
-        execution::ClosePositionParams {
-            symbol,
-            binance_spot_qty,
-            kraken_spot_qty,
-            futures_qty,
-            client_order_id_prefix,
-            dry_run,
-        },
-    )
-    .await?;
+    // --live：只给传了 qty 的腿建完整的 OrderManager 流水线，成交结果落进
+    // PositionManager/PortfolioManager，和 `open --live`/`rotate --live` 一致。
+    let redis_url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379/".to_string());
+    info!("close --live: connecting to redis at {redis_url}");
+    let bus = Arc::new(TopicBus::new());
 
+    let default_limits = RiskLimits {
+        max_order_amount: Decimal::MAX,
+        max_position: Decimal::MAX,
+        max_orders_per_window: 3,
+    };
+    let mut legs: Vec<(Venue, Arc<dyn OrderProvider>, Box<dyn OrderStreamSource>, RiskLimits)> = Vec::new();
+    if let Some(provider) = &binance_spot {
+        let stream = Box::new(BinanceUserDataStream::from_env(
+            Venue::new("binance_spot"),
+            testnet,
+            proxy.as_deref(),
+            vec![symbol.clone()],
+        )?);
+        legs.push((provider.venue(), provider.clone(), stream, default_limits.clone()));
+    }
+    if let Some(provider) = &kraken_spot {
+        let stream = Box::new(KrakenPrivateOrderStream::from_env(Venue::new("kraken_spot"), proxy.as_deref())?);
+        legs.push((provider.venue(), provider.clone(), stream, default_limits.clone()));
+    }
+    if let Some(provider) = &binance_futures {
+        let stream = Box::new(BinanceFuturesUserDataStream::from_env(
+            Venue::new("binance_futures"),
+            testnet,
+            proxy.as_deref(),
+            vec![symbol.clone()],
+        )?);
+        legs.push((provider.venue(), provider.clone(), stream, default_limits.clone()));
+    }
+
+    let pipeline = build_manual_pipeline(&redis_url, bus.clone(), &symbol, legs).await?;
+
+    let strategy = ManualStrategy::new(bus, pipeline.order_manager);
+    let live_result = strategy
+        .close_hedged_position(
+            binance_spot.as_deref(),
+            kraken_spot.as_deref(),
+            binance_futures.as_deref(),
+            params,
+        )
+        .await;
+
+    for h in pipeline.stream_handles {
+        h.abort();
+    }
+
+    let report = live_result?;
     println!("{report:#?}");
     Ok(())
 }
@@ -995,7 +1116,7 @@ async fn run_scan_command(args: &[String]) -> anyhow::Result<()> {
 const FEE_QUERY_CONCURRENCY: usize = 4;
 
 /// `monitor` 子命令：复用 `scan::find_overlap` 筛出的币安/Kraken 交集币种，接入现成的
-/// 行情源 + `CrossExchangeStrategy` + `LogSink` 管线，持续监控两边现货价差。每个币的
+/// 行情源 + `CrossExchangeStrategy` 管线，持续监控两边现货价差。每个币的
 /// 手续费用 [`ExchangeInfoProvider::spot_trading_fee`] 查询两边真实账户 taker 费率(而
 /// 不是固定值)，币安这边再乘上 `config.toml` `[[venues]]` 里币安条目的 `fee_discount`
 /// 折扣(如 BNB 抵扣手续费，默认 1 不打折，见 [`VenueConfig::load_fee_discount`])，
@@ -1006,8 +1127,9 @@ const FEE_QUERY_CONCURRENCY: usize = 4;
 /// 所有 symbol 共享一份手续费配置。不接入 `config.toml` 驱动的默认主循环。
 ///
 /// 除非传了 `--no-portfolio`，否则默认把仓位/组合盈亏/资金费/定期报告这几个"基础服务"
-/// 一起跑起来：额外起一个 `BinanceFuturesSource` 把期货行情喂进
-/// `ArbitrageEngine::shared_cache()`，供 `PortfolioManager` 做 mark-to-market；连接 Redis
+/// 一起跑起来：额外起一个 `BinanceFuturesSource` 把期货行情喂进共享的 `TopicBus`，
+/// 供 `PortfolioManager` 做 mark-to-market(`CrossExchangeStrategy` 不会订阅它，因为它
+/// 没被配进任何一个币的手续费表)；连接 Redis
 /// 读取 `open`/`close` 写入的仓位并持续追踪；起 `FundingFeeTracker`/`ReportTracker` 定期
 /// 结算资金费、打印报告。Redis 连不上时直接报错退出(和 `accounting`/`report` 现有行为
 /// 一致)，不想连 Redis 就加 `--no-portfolio` 退回纯价差扫描。
@@ -1140,21 +1262,24 @@ async fn run_monitor_command(args: &[String]) -> anyhow::Result<()> {
         println!("{}", skipped.join("\n"));
     }
 
+    let bus = Arc::new(TopicBus::new());
     let strategies: Vec<Box<dyn Strategy>> = coin_fees
         .iter()
         .map(|(_, symbol, fees)| {
-            Box::new(CrossExchangeStrategy::new(vec![symbol.clone()], fees.clone(), min_profit_bps))
-                as Box<dyn Strategy>
+            Box::new(CrossExchangeStrategy::new(
+                vec![symbol.clone()],
+                fees.clone(),
+                min_profit_bps,
+                bus.clone(),
+            )) as Box<dyn Strategy>
         })
         .collect();
-    let sinks: Vec<Box<dyn OpportunitySink>> = vec![Box::new(LogSink) as Box<dyn OpportunitySink>];
-    let engine = ArbitrageEngine::new(strategies, sinks);
+    let engine = ArbitrageEngine::new(strategies);
 
-    let (tx, rx) = tokio::sync::mpsc::channel(1024);
     let mut source_handles = Vec::new();
     // 用 "binance_spot" 而不是策略层惯用的 "binance"，是为了和
     // `PositionManager`/`PortfolioManager` 里现货仓位统一用的 venue 命名对齐——
-    // 否则 `PortfolioManager::valuation_for` 按仓位的 venue 去 quote_cache 查
+    // 否则 `PortfolioManager::valuation_for` 按仓位的 venue 去 TopicBus 查
     // mark price 时，现货这条腿永远查不到 (之前拿 "binance" 存的行情)，导致
     // 现货 market_value/unrealized_pnl 恒为 None。
     let binance_source: Box<dyn MarketDataSource> = Box::new(BinanceSpotSource::new(
@@ -1163,20 +1288,23 @@ async fn run_monitor_command(args: &[String]) -> anyhow::Result<()> {
         testnet,
         proxy.clone(),
     ));
-    source_handles.push(binance_source.spawn(tx.clone()));
+    source_handles.push(binance_source.spawn(bus.clone()));
     let kraken_source: Box<dyn MarketDataSource> =
         Box::new(KrakenSpotSource::new(Venue::new("kraken"), symbols.clone(), proxy.clone()));
-    source_handles.push(kraken_source.spawn(tx.clone()));
+    source_handles.push(kraken_source.spawn(bus.clone()));
 
     if !no_portfolio {
         let redis_url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379/".to_string());
         info!("monitor: connecting to redis at {redis_url}");
-        let (position_manager, portfolio_manager) = build_portfolio_stack(&redis_url, engine.shared_cache())?;
+        // TODO: TopicBus 迁移后 ArbitrageEngine::shared_cache() 已移除，目前没有
+        // 桥接 TopicBus 实时行情到 PortfolioManager::quote_cache 的机制，
+        // mark-to-market (market_value/unrealized_pnl) 暂时恒为 N/A。
+        let (position_manager, portfolio_manager) = build_portfolio_stack(&redis_url, Arc::new(DashMap::new()))?;
 
         let futures_venue = Venue::new("binance_futures");
         let futures_source: Box<dyn MarketDataSource> =
             Box::new(BinanceFuturesSource::new(futures_venue.clone(), symbols.clone(), testnet, proxy.clone()));
-        source_handles.push(futures_source.spawn(tx.clone()));
+        source_handles.push(futures_source.spawn(bus.clone()));
 
         let futures_provider: Arc<dyn FundingFeeProvider> =
             Arc::new(BinanceFuturesOrderProvider::from_env(futures_venue.clone(), testnet, proxy.as_deref())?);
@@ -1211,10 +1339,8 @@ async fn run_monitor_command(args: &[String]) -> anyhow::Result<()> {
         );
     }
 
-    drop(tx);
-
     info!("monitor: engine starting");
-    engine.run(rx).await;
+    engine.run(bus).await;
 
     for handle in source_handles {
         let _ = handle.await;
@@ -1333,14 +1459,59 @@ async fn run_report_command(args: &[String]) -> anyhow::Result<()> {
 
 /// 把 `"binance"` / `"kraken"` 映射到对应的现货 `OrderProvider`，供 `rotate`
 /// 子命令按名字选择交易所。
-fn build_order_provider(name: &str, testnet: bool, proxy: Option<&str>) -> anyhow::Result<Box<dyn OrderProvider>> {
+fn build_order_provider(name: &str, testnet: bool, proxy: Option<&str>) -> anyhow::Result<Arc<dyn OrderProvider>> {
     match name {
-        "binance" => Ok(Box::new(BinanceOrderProvider::from_env(
+        "binance" => Ok(Arc::new(BinanceOrderProvider::from_env(
             Venue::new("binance_spot"),
             testnet,
             proxy,
         )?)),
-        "kraken" => Ok(Box::new(KrakenOrderProvider::from_env(Venue::new("kraken_spot"), proxy)?)),
+        "kraken" => Ok(Arc::new(KrakenOrderProvider::from_env(Venue::new("kraken_spot"), proxy)?)),
         other => anyhow::bail!("unknown venue '{other}' for 'rotate' subcommand, expected 'binance' or 'kraken'"),
     }
+}
+
+/// 和 [`build_order_provider`] 按同样的 venue 名字映射对应的私有 WS 订单流，
+/// 供 `rotate --live`/`close --live` 建 [`build_manual_pipeline`] 需要的
+/// `OrderStreamSource`。
+fn build_order_stream_source(
+    name: &str,
+    testnet: bool,
+    proxy: Option<&str>,
+    symbol: &Symbol,
+) -> anyhow::Result<Box<dyn OrderStreamSource>> {
+    match name {
+        "binance" => Ok(Box::new(BinanceUserDataStream::from_env(
+            Venue::new("binance_spot"),
+            testnet,
+            proxy,
+            vec![symbol.clone()],
+        )?)),
+        "kraken" => Ok(Box::new(KrakenPrivateOrderStream::from_env(Venue::new("kraken_spot"), proxy)?)),
+        other => anyhow::bail!("unknown venue '{other}' for 'rotate' subcommand, expected 'binance' or 'kraken'"),
+    }
+}
+
+/// 为 `rotate`/`close` 的 dry_run 路径构造一个不连 Redis 的"轻量"
+/// `ManualStrategy`：`rotate_inventory`/`close_hedged_position` 的 dry_run
+/// 分支完全不会碰 `self.bus`/`self.order_manager`（直接调
+/// `provider.place_market_order(dry_run: true)`），这里用纯内存实现垫背即可，
+/// 不需要 dry_run 也要求本地起 Redis。
+fn bare_manual_strategy() -> ManualStrategy {
+    let bus = Arc::new(TopicBus::new());
+    let position_manager = Arc::new(PositionManager::new(Arc::new(InMemoryPositionStore::new())));
+    let portfolio_manager = Arc::new(PortfolioManager::new(
+        position_manager.clone(),
+        Arc::new(InMemoryPnlStore::new()),
+        Arc::new(DashMap::new()),
+        HashMap::new(),
+    ));
+    let order_manager = Arc::new(OrderManager::new(
+        bus.clone(),
+        position_manager,
+        portfolio_manager,
+        Arc::new(InMemoryOrderStore::new()),
+        None,
+    ));
+    ManualStrategy::new(bus, order_manager)
 }

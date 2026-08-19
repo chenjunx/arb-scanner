@@ -1,15 +1,20 @@
+use std::sync::Arc;
+
 use rust_decimal::Decimal;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
 use crate::order::types::OrderStatus;
-use crate::types::Venue;
+use crate::types::{Symbol, Venue};
+
+use super::manager::OrderManager;
 
 /// 交易所私有 WS 推送的一条订单状态更新。`filled_qty`/`avg_price` 均为该订单
 /// 截至当前的累计值(不是本次推送的增量)，方便消费方直接覆盖存储的订单状态。
 #[derive(Debug, Clone)]
 pub struct ExchangeOrderUpdate {
     pub venue: Venue,
+    pub symbol: Symbol,
     /// 下单时透传给交易所的客户端订单号，用于关联回内部 `OrderId`。
     pub client_order_id: Option<String>,
     /// 交易所自己的订单号，client_order_id 关联失败时的兜底关联键。
@@ -27,8 +32,10 @@ pub struct ExchangeOrderUpdate {
 }
 
 /// 订单私有流扩展点：每个交易所实现一个 `OrderStreamSource`(通常是一个私有
-/// WebSocket 客户端)，将订单成交/状态变化统一转换成 `ExchangeOrderUpdate`
-/// 推送到 channel，供 `OrderManager::handle_exchange_update` 消费。
+/// WebSocket 客户端)，将订单成交/状态变化统一转换成 `ExchangeOrderUpdate`，
+/// 在后台任务里直接调用 `OrderManager::handle_exchange_update` 消费——不经过
+/// `TopicBus`，因为 `OrderManager` 才是成交状态的唯一权威来源，没有其他订阅方
+/// 需要这条推送。
 ///
 /// 和 `market_data::MarketDataSource` 同构：接入新交易所只需新增一个实现该
 /// trait 的类型，在组装 `OrderManager` 的地方注册即可。
@@ -44,6 +51,7 @@ pub struct StreamHandle {
 pub trait OrderStreamSource: Send + 'static {
     fn venue(&self) -> Venue;
 
-    /// 消费 self 并在后台任务中运行，持续向 tx 推送订单更新。
-    fn spawn(self: Box<Self>, tx: mpsc::Sender<ExchangeOrderUpdate>) -> StreamHandle;
+    /// 消费 self 并在后台任务中运行，把解析出的每条更新直接喂给
+    /// `order_manager.handle_exchange_update`。
+    fn spawn(self: Box<Self>, order_manager: Arc<OrderManager>) -> StreamHandle;
 }

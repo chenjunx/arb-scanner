@@ -134,7 +134,7 @@ mod tests {
 
     fn setup(records: Vec<FundingIncomeRecord>) -> (Arc<FundingFeeTracker>, Arc<PortfolioManager>) {
         let position_manager = Arc::new(PositionManager::new(Arc::new(InMemoryPositionStore::new())));
-        position_manager.on_filled(&venue(), &symbol(), OrderSide::Sell, Decimal::ONE, Some(Decimal::new(50000, 0)), 1);
+        position_manager.on_filled(&venue(), &symbol(), OrderSide::Sell, Decimal::ONE, Some(Decimal::new(50000, 0)), None, None, None, 1);
 
         let portfolio = Arc::new(PortfolioManager::new(
             position_manager.clone(),
@@ -191,7 +191,7 @@ mod tests {
     async fn ignores_venues_without_a_registered_provider() {
         let position_manager = Arc::new(PositionManager::new(Arc::new(InMemoryPositionStore::new())));
         let other_venue = Venue::new("kraken_futures");
-        position_manager.on_filled(&other_venue, &symbol(), OrderSide::Sell, Decimal::ONE, Some(Decimal::new(50000, 0)), 1);
+        position_manager.on_filled(&other_venue, &symbol(), OrderSide::Sell, Decimal::ONE, Some(Decimal::new(50000, 0)), None, None, None, 1);
         let portfolio = Arc::new(PortfolioManager::new(
             position_manager.clone(),
             Arc::new(InMemoryPnlStore::new()),

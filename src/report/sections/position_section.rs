@@ -33,11 +33,13 @@ impl ReportSection for PositionSection {
             .into_iter()
             .map(|p| {
                 format!(
-                    "{} {}: net_qty={} avg_price={}",
+                    "{} {}: net_qty={} avg_price={} total_fees_usdt={}{}",
                     p.venue,
                     p.symbol,
                     p.net_qty,
-                    p.avg_price.map(|v| v.to_string()).unwrap_or_else(|| "N/A".to_string())
+                    p.avg_price.map(|v| v.to_string()).unwrap_or_else(|| "N/A".to_string()),
+                    p.total_fees_usdt,
+                    if p.fees_usdt_incomplete { "(部分未换算)" } else { "" }
                 )
             })
             .collect::<Vec<_>>()
@@ -65,12 +67,12 @@ mod tests {
     fn skips_flat_positions_and_lists_open_ones_sorted() {
         let pm = Arc::new(PositionManager::new(Arc::new(InMemoryPositionStore::new())));
         let symbol = Symbol::new("BTC", "USDT");
-        pm.on_filled(&Venue::new("kraken_spot"), &symbol, OrderSide::Buy, Decimal::ONE, Some(Decimal::new(50000, 0)), 1);
-        pm.on_filled(&Venue::new("binance_spot"), &symbol, OrderSide::Buy, Decimal::ONE, Some(Decimal::new(50000, 0)), 2);
+        pm.on_filled(&Venue::new("kraken_spot"), &symbol, OrderSide::Buy, Decimal::ONE, Some(Decimal::new(50000, 0)), None, None, None, 1);
+        pm.on_filled(&Venue::new("binance_spot"), &symbol, OrderSide::Buy, Decimal::ONE, Some(Decimal::new(50000, 0)), None, None, None, 2);
         // 开仓又平仓，应该被过滤掉
         let flat_symbol = Symbol::new("ETH", "USDT");
-        pm.on_filled(&Venue::new("binance_spot"), &flat_symbol, OrderSide::Buy, Decimal::ONE, Some(Decimal::new(3000, 0)), 3);
-        pm.on_filled(&Venue::new("binance_spot"), &flat_symbol, OrderSide::Sell, Decimal::ONE, Some(Decimal::new(3100, 0)), 4);
+        pm.on_filled(&Venue::new("binance_spot"), &flat_symbol, OrderSide::Buy, Decimal::ONE, Some(Decimal::new(3000, 0)), None, None, None, 3);
+        pm.on_filled(&Venue::new("binance_spot"), &flat_symbol, OrderSide::Sell, Decimal::ONE, Some(Decimal::new(3100, 0)), None, None, None, 4);
 
         let section = PositionSection::new(pm);
         let body = section.render();

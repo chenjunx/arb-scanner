@@ -10,6 +10,16 @@ pub struct VenuePnl {
     pub symbol: Symbol,
     pub realized_pnl: Decimal,
     pub fees_paid: Decimal,
+    /// 已成功换算成 USDT 计价的手续费累计(见 `pricing::FeeUsdtConverter`)。
+    /// `fees_paid` 保留不变，是历史遗留、跨币种直接相加的口径；这个字段是
+    /// 只统计"已换算成功部分"的运行总和，`fees_usdt_incomplete` 为 true 时
+    /// 提示这个数可能偏低。`#[serde(default)]` 兼容旧的、没有这个字段的
+    /// Redis 记录。
+    #[serde(default)]
+    pub fees_paid_usdt: Decimal,
+    /// 曾经有手续费未能(或尚未)换算成 USDT。
+    #[serde(default)]
+    pub fees_usdt_incomplete: bool,
     /// 只要 fees_paid 里累加过一次 `FeeConfig` 估算值(而非交易所真实手续费)就
     /// 置 true，提示调用方这个累计数不是全部来自交易所真实返还值，且一旦置
     /// true 不会被后续的真实值覆盖回 false。
@@ -30,6 +40,8 @@ impl VenuePnl {
             symbol,
             realized_pnl: Decimal::ZERO,
             fees_paid: Decimal::ZERO,
+            fees_paid_usdt: Decimal::ZERO,
+            fees_usdt_incomplete: false,
             fee_is_estimated: false,
             trade_count: 0,
             funding_pnl: Decimal::ZERO,
@@ -44,6 +56,10 @@ pub struct AssetPnlSummary {
     pub asset: String,
     pub realized_pnl: Decimal,
     pub fees_paid: Decimal,
+    /// 已成功换算成 USDT 计价的手续费累计，跨 venue 聚合。
+    pub fees_paid_usdt: Decimal,
+    /// 参与聚合的 venue 里只要有一个 `fees_usdt_incomplete=true` 就置 true。
+    pub fees_usdt_incomplete: bool,
     /// 永续合约资金费累计(正=收到，负=支付)。
     pub funding_pnl: Decimal,
     /// 来自 `asset_valuation()` 的浮动盈亏；缺行情时为 None，不当 0 处理。

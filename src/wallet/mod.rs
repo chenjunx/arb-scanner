@@ -1,5 +1,6 @@
 pub mod binance;
 pub mod kraken;
+pub mod transfer;
 pub mod types;
 
 use async_trait::async_trait;
