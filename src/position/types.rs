@@ -14,7 +14,11 @@ pub struct VenuePosition {
     /// 当前净仓位的加权平均建仓价；net_qty 为 0 时是 None。
     pub avg_price: Option<Decimal>,
     /// 按币种汇总的累计手续费。键为币种符号（如 "USDT"、"BNB"），
-    /// 值为该币种的累计手续费金额。
+    /// 值为该币种的累计手续费金额。`#[serde(default)]` 兼容这个字段引入
+    /// 之前写入的旧 Redis 记录——否则反序列化失败会导致
+    /// `RedisPositionStore::update` 把已有仓位当成不存在，静默清空
+    /// net_qty/avg_price 重新计算，是真实的仓位状态丢失风险。
+    #[serde(default)]
     pub total_fees: HashMap<String, Decimal>,
     /// 已成功换算成 USDT 计价的手续费累计（见 `pricing::FeeUsdtConverter`）。
     /// 只是"已换算成功部分"的运行总和，`fees_usdt_incomplete` 为 true 时
