@@ -25,7 +25,12 @@ impl std::fmt::Display for OrderId {
 /// 策略提交的订单请求
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrderRequest {
-    /// 策略名称，用于跟踪和风控
+    /// 策略名称，用于跟踪和风控。`#[serde(default)]` 兼容这个字段引入之前
+    /// 写入 Redis 的旧订单记录——否则反序列化直接失败，这些订单会从
+    /// `all_orders()`/reconcile 扫描/报表里彻底消失（不会像 `VenuePosition`
+    /// 那样被当成"不存在"回写覆盖，因为 `RedisOrderStore::update` 反序列化
+    /// 失败时只是跳过返回 NotFound，不会拿一个新对象覆盖旧记录）。
+    #[serde(default)]
     pub strategy_id: String,
     /// 目标交易所
     pub venue: Venue,
