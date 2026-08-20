@@ -1,29 +1,6 @@
 use rust_decimal::Decimal;
-use serde::{Deserialize, Serialize};
 
 use crate::types::{Symbol, Venue};
-
-/// 单个 (venue, symbol) 的已实现盈亏/手续费累计。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct VenuePnl {
-    pub venue: Venue,
-    pub symbol: Symbol,
-    pub realized_pnl: Decimal,
-    pub trade_count: u64,
-    pub updated_at_ms: u64,
-}
-
-impl VenuePnl {
-    pub fn flat(venue: Venue, symbol: Symbol) -> Self {
-        Self {
-            venue,
-            symbol,
-            realized_pnl: Decimal::ZERO,
-            trade_count: 0,
-            updated_at_ms: 0,
-        }
-    }
-}
 
 /// 按 base 资产聚合的已实现盈亏汇总，含浮动盈亏拼接。
 #[derive(Debug, Clone, PartialEq)]
@@ -47,6 +24,9 @@ pub struct VenuePositionValuation {
     pub mark_price: Option<Decimal>,
     pub market_value: Option<Decimal>,
     pub unrealized_pnl: Option<Decimal>,
+    /// 直接来自 `PositionManager::VenuePosition.realized_pnl`：成交平仓 +
+    /// 手续费 + 资金费的完整已实现盈亏，`PortfolioManager` 不再自己维护账本。
+    pub realized_pnl: Decimal,
 }
 
 /// 按 base 资产聚合的估值。

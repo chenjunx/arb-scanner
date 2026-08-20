@@ -5,7 +5,6 @@ use log::warn;
 use rust_decimal::Decimal;
 
 use crate::order::types::OrderStatus;
-use crate::portfolio::PortfolioManager;
 use crate::position::{AdjustmentReason, PositionManager};
 use crate::pricing::FeeUsdtConverter;
 use crate::topic::{Topic, TopicBus};
@@ -23,7 +22,6 @@ use super::types::{Order, OrderEvent, OrderId};
 pub struct OrderManager {
     bus: Arc<TopicBus>,
     position_manager: Arc<PositionManager>,
-    portfolio: Arc<PortfolioManager>,
     /// client_order_id → OrderId 索引，按需从 Redis 懒加载
     client_order_index: Arc<Mutex<HashMap<String, OrderId>>>,
     /// exchange_order_id → OrderId 索引，按需从 Redis 懒加载
@@ -39,14 +37,12 @@ impl OrderManager {
     pub fn new(
         bus: Arc<TopicBus>,
         position_manager: Arc<PositionManager>,
-        portfolio: Arc<PortfolioManager>,
         order_store: Arc<dyn OrderStore>,
         fee_converter: Option<Arc<FeeUsdtConverter>>,
     ) -> Self {
         Self {
             bus,
             position_manager,
-            portfolio,
             client_order_index: Arc::new(Mutex::new(HashMap::new())),
             exchange_order_index: Arc::new(Mutex::new(HashMap::new())),
             order_store,
@@ -152,7 +148,7 @@ impl OrderManager {
                 _ => None,
             };
 
-            let outcome = self.position_manager.on_filled(
+            self.position_manager.on_filled(
                 &venue,
                 &symbol,
                 side,
@@ -163,7 +159,6 @@ impl OrderManager {
                 fee_usdt_sync,
                 update.ts_ms,
             );
-            self.portfolio.record_fill(&venue, &symbol, outcome.realized_pnl, update.ts_ms);
 
             // 同步解不出来但确实有手续费 → 后台异步查价，不阻塞下面的事件发布
             if fee_usdt_sync.is_none() {

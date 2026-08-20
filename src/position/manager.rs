@@ -35,10 +35,10 @@ impl PositionManager {
 
     /// 订单成交后调用，按增量成交量 (不是累计值) + 本次成交价更新净仓位和
     /// 加权平均建仓价，把这笔成交对旧仓位实现的盈亏累加进
-    /// `VenuePosition::realized_pnl`，同时通过 `FillOutcome` 把同一笔盈亏带
-    /// 出去给 `PortfolioManager` 独立累计(两份账本应当始终相等)。
-    /// `fill_price` 为 `None` 时 (极少数场景下交易所推送没带价格) 只更新数量，
-    /// 均价保持不变，也不计已实现盈亏。
+    /// `VenuePosition::realized_pnl`（唯一账本，`PortfolioManager` 直接读这里），
+    /// 同时通过 `FillOutcome` 把同一笔盈亏带出去供调用方(如 `OrderManager`)
+    /// 使用。`fill_price` 为 `None` 时 (极少数场景下交易所推送没带价格) 只更新
+    /// 数量，均价保持不变，也不计已实现盈亏。
     ///
     /// 已实现盈亏必须在 `store.update` 的原子闭包内部算，不能由调用方在调用
     /// 前后各查一次仓位自己算——`PositionStore::update` 的读改写原子性正是为了

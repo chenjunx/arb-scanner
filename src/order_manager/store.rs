@@ -12,8 +12,8 @@ pub enum OrderUpdateOutcome {
     Applied(Order),
 }
 
-/// 订单历史持久化接口。和 `position::PositionStore`/`portfolio::PnlStore` 同一套
-/// 设计语言。`upsert` 用于整体覆盖写入(创建新订单、或调用方已经拿到最新状态
+/// 订单历史持久化接口。和 `position::PositionStore` 同一套设计语言。`upsert`
+/// 用于整体覆盖写入(创建新订单、或调用方已经拿到最新状态
 /// 时)；`update` 用于需要原子读改写的场景——`ExecutionService`(REST 下单成功
 /// 后写 `exchange_order_id`)和 `OrderManager`(WS 推送驱动的成交状态)可能
 /// 并发更新同一个 order_id，如果各自 `get()` 再 `upsert()`，两次读之间可能被

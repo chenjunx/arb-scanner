@@ -723,7 +723,6 @@ fn describe_leg_result(label: &str, result: &anyhow::Result<Option<OrderResult>>
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use dashmap::DashMap;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
@@ -734,7 +733,6 @@ mod tests {
     use crate::order_manager::store::InMemoryOrderStore;
     use crate::order_manager::types::Order;
     use crate::order_manager::{ExchangeAdapter, ExecutionService, InMemoryOrderIdAllocator, RiskService};
-    use crate::portfolio::{InMemoryPnlStore, PortfolioManager};
     use crate::position::{InMemoryPositionStore, PositionManager};
     use crate::types::Venue;
 
@@ -989,9 +987,6 @@ mod tests {
 
         let bus = Arc::new(TopicBus::new());
         let position_manager = Arc::new(PositionManager::new(Arc::new(InMemoryPositionStore::new())));
-        let quote_cache = Arc::new(DashMap::new());
-        let portfolio =
-            Arc::new(PortfolioManager::new(position_manager.clone(), Arc::new(InMemoryPnlStore::new()), quote_cache));
 
         let order_store = Arc::new(InMemoryOrderStore::new());
         let order_id_allocator = Arc::new(InMemoryOrderIdAllocator::new());
@@ -1006,13 +1001,7 @@ mod tests {
 
         let execution_service = Arc::new(ExecutionService::new(bus.clone(), adapters, order_store.clone()));
 
-        let order_manager = Arc::new(OrderManager::new(
-            bus.clone(),
-            position_manager.clone(),
-            portfolio,
-            order_store,
-            None,
-        ));
+        let order_manager = Arc::new(OrderManager::new(bus.clone(), position_manager.clone(), order_store, None));
 
         let risk_handle = risk_service.clone().start();
         let execution_handle = execution_service.clone().start();

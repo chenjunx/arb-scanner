@@ -25,9 +25,9 @@ pub struct VenuePosition {
     /// 以及每次 `PositionManager::apply_adjustment`（资金费结算、手续费换算成
     /// USDT 后冲减盈亏、人工修正等非成交事件）加进来的调整量。
     /// `on_filled` 那部分和 `FillOutcome::realized_pnl` 用的是同一次计算，这里
-    /// 只是把逐笔结果就地累加、随仓位持久化，`PortfolioManager`/`PnlStore` 里
-    /// 独立维护的那份累计值不受影响，两者应当始终相等。`#[serde(default)]`
-    /// 兼容这个字段引入之前写入的旧 Redis 记录。
+    /// 只是把逐笔结果就地累加、随仓位持久化。这是已实现盈亏的唯一账本——
+    /// `PortfolioManager` 直接读这个字段，不再自己维护一份独立的累计值。
+    /// `#[serde(default)]` 兼容这个字段引入之前写入的旧 Redis 记录。
     #[serde(default)]
     pub realized_pnl: Decimal,
     pub updated_at_ms: u64,

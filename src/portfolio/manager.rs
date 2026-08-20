@@ -6,66 +6,34 @@ use rust_decimal::Decimal;
 use crate::position::PositionManager;
 use crate::types::{Quote, Symbol, Venue};
 
-use super::store::PnlStore;
-use super::types::{AssetPnlSummary, AssetValuation, VenuePnl, VenuePositionValuation};
+use super::types::{AssetPnlSummary, AssetValuation, VenuePositionValuation};
 
-/// Portfolio 模块：在 `PositionManager` (仓位数量的唯一真相源) 之上提供两类
-/// 只读视图——mark-to-market 估值 (按最新行情算市值/浮动盈亏) 和已实现
-/// 盈亏/手续费统计。自己只写一份独立的 `PnlStore` 账本，不碰
-/// `PositionManager`/`PositionStore`，职责边界见 `docs/portfolio_design.md`。
+/// Portfolio 模块：在 `PositionManager` (仓位数量与已实现盈亏的唯一真相源)
+/// 之上提供只读的 mark-to-market 视图 (按最新行情算市值/浮动盈亏)，并把
+/// `realized_pnl` 原样透传出来，不另外维护账本，职责边界见
+/// `docs/portfolio_design.md`。
 pub struct PortfolioManager {
     position_manager: Arc<PositionManager>,
-    pnl_store: Arc<dyn PnlStore>,
     quote_cache: Arc<DashMap<(Venue, Symbol), Quote>>,
 }
 
 impl PortfolioManager {
     pub fn new(
         position_manager: Arc<PositionManager>,
-        pnl_store: Arc<dyn PnlStore>,
         quote_cache: Arc<DashMap<(Venue, Symbol), Quote>>,
     ) -> Self {
-        Self { position_manager, pnl_store, quote_cache }
+        Self { position_manager, quote_cache }
     }
 
-    /// 成交后调用 (由 `OrderManager` 在拿到 `FillOutcome` 后转发)：把
-    /// `realized_pnl` 累加进 `PnlStore`。
-    pub fn record_fill(&self, venue: &Venue, symbol: &Symbol, realized_pnl: Decimal, ts_ms: u64) {
-        let venue_for_closure = venue.clone();
-        let symbol_for_closure = symbol.clone();
-        self.pnl_store.update(
-            venue,
-            symbol,
-            Box::new(move |current| {
-                let mut pnl =
-                    current.unwrap_or_else(|| VenuePnl::flat(venue_for_closure.clone(), symbol_for_closure.clone()));
-                pnl.realized_pnl += realized_pnl;
-                pnl.trade_count += 1;
-                pnl.updated_at_ms = ts_ms;
-                pnl
-            }),
-        );
-    }
-
-    pub fn venue_pnl(&self, venue: &Venue, symbol: &Symbol) -> Option<VenuePnl> {
-        self.pnl_store.get(venue, symbol)
-    }
-
-    /// 按 base 资产聚合已实现盈亏/手续费，并拼上 `asset_valuation` 算出的浮动
-    /// 盈亏。`unrealized_pnl` 缺行情时为 `None`，`net_pnl` 仍然给出不含浮动
-    /// 部分的值。
+    /// 按 base 资产聚合已实现盈亏，并拼上 `asset_valuation` 算出的浮动盈亏。
+    /// `unrealized_pnl` 缺行情时为 `None`，`net_pnl` 仍然给出不含浮动部分的值。
     pub fn asset_pnl(&self, asset: &str) -> AssetPnlSummary {
-        let realized_pnl = self
-            .pnl_store
-            .all()
-            .into_iter()
-            .filter(|p| p.symbol.base.as_ref().eq_ignore_ascii_case(asset))
-            .fold(Decimal::ZERO, |realized, p| realized + p.realized_pnl);
+        let valuation = self.asset_valuation(asset);
+        let realized_pnl =
+            valuation.venues.iter().fold(Decimal::ZERO, |realized, v| realized + v.realized_pnl);
+        let net_pnl = realized_pnl + valuation.unrealized_pnl.unwrap_or(Decimal::ZERO);
 
-        let unrealized_pnl = self.asset_valuation(asset).unrealized_pnl;
-        let net_pnl = realized_pnl + unrealized_pnl.unwrap_or(Decimal::ZERO);
-
-        AssetPnlSummary { asset: asset.to_string(), realized_pnl, unrealized_pnl, net_pnl }
+        AssetPnlSummary { asset: asset.to_string(), realized_pnl, unrealized_pnl: valuation.unrealized_pnl, net_pnl }
     }
 
     /// mark-to-market: `mid = (bid+ask)/2`，`market_value = net_qty * mid`，
@@ -75,14 +43,14 @@ impl PortfolioManager {
     /// symbol) 从未有过成交记录。
     pub fn venue_valuation(&self, venue: &Venue, symbol: &Symbol) -> Option<VenuePositionValuation> {
         let pos = self.position_manager.venue_position(venue, symbol)?;
-        Some(self.valuation_for(pos.venue, pos.symbol, pos.net_qty, pos.avg_price))
+        Some(self.valuation_for(pos.venue, pos.symbol, pos.net_qty, pos.avg_price, pos.realized_pnl))
     }
 
     pub fn all_valuations(&self) -> Vec<VenuePositionValuation> {
         self.position_manager
             .all_positions()
             .into_iter()
-            .map(|pos| self.valuation_for(pos.venue, pos.symbol, pos.net_qty, pos.avg_price))
+            .map(|pos| self.valuation_for(pos.venue, pos.symbol, pos.net_qty, pos.avg_price, pos.realized_pnl))
             .collect()
     }
 
@@ -116,6 +84,7 @@ impl PortfolioManager {
         symbol: Symbol,
         net_qty: Decimal,
         avg_price: Option<Decimal>,
+        realized_pnl: Decimal,
     ) -> VenuePositionValuation {
         let mark_price = avg_price.and_then(|_| {
             self.quote_cache
@@ -136,6 +105,7 @@ impl PortfolioManager {
             mark_price,
             market_value,
             unrealized_pnl,
+            realized_pnl,
         }
     }
 }
@@ -145,7 +115,6 @@ mod tests {
     use super::*;
     use crate::order::types::OrderSide;
     use crate::position::InMemoryPositionStore;
-    use crate::portfolio::store::InMemoryPnlStore;
 
     fn venue() -> Venue {
         Venue::new("binance_spot")
@@ -156,27 +125,19 @@ mod tests {
 
     fn manager() -> (PortfolioManager, Arc<PositionManager>) {
         let pm = Arc::new(PositionManager::new(Arc::new(InMemoryPositionStore::new())));
-        let portfolio = PortfolioManager::new(pm.clone(), Arc::new(InMemoryPnlStore::new()), Arc::new(DashMap::new()));
+        let portfolio = PortfolioManager::new(pm.clone(), Arc::new(DashMap::new()));
         (portfolio, pm)
     }
 
     #[test]
-    fn record_fill_accumulates_realized_pnl_and_trade_count() {
-        let (portfolio, _pm) = manager();
-        portfolio.record_fill(&venue(), &symbol(), Decimal::ZERO, 1);
+    fn venue_valuation_reflects_realized_pnl_from_position_manager() {
+        let (portfolio, pm) = manager();
+        pm.on_filled(&venue(), &symbol(), OrderSide::Buy, Decimal::ONE, Some(Decimal::new(50000, 0)), None, None, None, 1);
+        pm.on_filled(&venue(), &symbol(), OrderSide::Sell, Decimal::ONE, Some(Decimal::new(51000, 0)), None, None, None, 2);
 
-        let pnl = portfolio.venue_pnl(&venue(), &symbol()).unwrap();
-        assert_eq!(pnl.trade_count, 1);
-    }
-
-    #[test]
-    fn record_fill_accumulates_realized_pnl_across_multiple_fills() {
-        let (portfolio, _pm) = manager();
-        portfolio.record_fill(&venue(), &symbol(), Decimal::new(100, 0), 1);
-        portfolio.record_fill(&venue(), &symbol(), Decimal::new(50, 0), 2);
-
-        let pnl = portfolio.venue_pnl(&venue(), &symbol()).unwrap();
-        assert_eq!(pnl.realized_pnl, Decimal::new(150, 0));
+        let valuation = portfolio.venue_valuation(&venue(), &symbol()).unwrap();
+        assert_eq!(valuation.net_qty, Decimal::ZERO);
+        assert_eq!(valuation.realized_pnl, Decimal::new(1000, 0));
     }
 
     #[test]
@@ -202,7 +163,7 @@ mod tests {
     fn venue_valuation_computes_market_value_and_unrealized_pnl_with_quote() {
         let pm = Arc::new(PositionManager::new(Arc::new(InMemoryPositionStore::new())));
         let quote_cache = Arc::new(DashMap::new());
-        let portfolio = PortfolioManager::new(pm.clone(), Arc::new(InMemoryPnlStore::new()), quote_cache.clone());
+        let portfolio = PortfolioManager::new(pm.clone(), quote_cache.clone());
 
         pm.on_filled(&venue(), &symbol(), OrderSide::Buy, Decimal::ONE, Some(Decimal::new(50000, 0)), None, None, None, 1);
         quote_cache.insert(
@@ -226,7 +187,7 @@ mod tests {
     fn venue_valuation_handles_short_position() {
         let pm = Arc::new(PositionManager::new(Arc::new(InMemoryPositionStore::new())));
         let quote_cache = Arc::new(DashMap::new());
-        let portfolio = PortfolioManager::new(pm.clone(), Arc::new(InMemoryPnlStore::new()), quote_cache.clone());
+        let portfolio = PortfolioManager::new(pm.clone(), quote_cache.clone());
 
         pm.on_filled(&venue(), &symbol(), OrderSide::Sell, Decimal::ONE, Some(Decimal::new(50000, 0)), None, None, None, 1);
         quote_cache.insert(
@@ -252,7 +213,7 @@ mod tests {
     fn asset_valuation_aggregates_across_venues_when_all_priced() {
         let pm = Arc::new(PositionManager::new(Arc::new(InMemoryPositionStore::new())));
         let quote_cache = Arc::new(DashMap::new());
-        let portfolio = PortfolioManager::new(pm.clone(), Arc::new(InMemoryPnlStore::new()), quote_cache.clone());
+        let portfolio = PortfolioManager::new(pm.clone(), quote_cache.clone());
 
         let binance = Venue::new("binance_spot");
         let kraken = Venue::new("kraken_spot");
@@ -281,7 +242,7 @@ mod tests {
     fn asset_valuation_is_none_market_value_when_any_venue_missing_quote() {
         let pm = Arc::new(PositionManager::new(Arc::new(InMemoryPositionStore::new())));
         let quote_cache = Arc::new(DashMap::new());
-        let portfolio = PortfolioManager::new(pm.clone(), Arc::new(InMemoryPnlStore::new()), quote_cache.clone());
+        let portfolio = PortfolioManager::new(pm.clone(), quote_cache.clone());
 
         let binance = Venue::new("binance_spot");
         let kraken = Venue::new("kraken_spot");
@@ -306,11 +267,13 @@ mod tests {
 
     #[test]
     fn asset_pnl_aggregates_realized_pnl_across_venues() {
-        let (portfolio, _pm) = manager();
+        let (portfolio, pm) = manager();
         let binance = Venue::new("binance_spot");
         let kraken = Venue::new("kraken_spot");
-        portfolio.record_fill(&binance, &symbol(), Decimal::new(100, 0), 1);
-        portfolio.record_fill(&kraken, &symbol(), Decimal::new(50, 0), 2);
+        pm.on_filled(&binance, &symbol(), OrderSide::Buy, Decimal::ONE, Some(Decimal::new(50000, 0)), None, None, None, 1);
+        pm.on_filled(&binance, &symbol(), OrderSide::Sell, Decimal::ONE, Some(Decimal::new(50100, 0)), None, None, None, 2);
+        pm.on_filled(&kraken, &symbol(), OrderSide::Buy, Decimal::ONE, Some(Decimal::new(50000, 0)), None, None, None, 3);
+        pm.on_filled(&kraken, &symbol(), OrderSide::Sell, Decimal::ONE, Some(Decimal::new(50050, 0)), None, None, None, 4);
 
         let summary = portfolio.asset_pnl("BTC");
         assert_eq!(summary.realized_pnl, Decimal::new(150, 0));

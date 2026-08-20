@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use log::warn;
+use log::{debug, info, warn};
 use rust_decimal::Decimal;
 use tokio::task::JoinHandle;
 
@@ -54,11 +54,18 @@ impl FundingFeeTracker {
     }
 
     async fn poll_once(&self) {
-        for pos in self.position_manager.all_positions() {
+        let all_positions = self.position_manager.all_positions();
+        info!("funding tracker: poll_once start total_positions={}", all_positions.len());
+        for pos in all_positions {
             if pos.net_qty == Decimal::ZERO {
+                debug!("funding tracker: skip venue={} symbol={} reason=flat", pos.venue, pos.symbol);
                 continue;
             }
             let Some(provider) = self.providers.get(&pos.venue) else {
+                warn!(
+                    "funding tracker: no FundingFeeProvider registered for venue={}, skipping symbol={} (net_qty={})",
+                    pos.venue, pos.symbol, pos.net_qty
+                );
                 continue;
             };
 
@@ -80,6 +87,13 @@ impl FundingFeeTracker {
             records.sort_by_key(|r| r.tran_id);
 
             let last_seen_tran_id = cursor.map(|c| c.last_tran_id).unwrap_or(-1);
+            let new_count = records.iter().filter(|r| r.tran_id > last_seen_tran_id).count();
+            info!(
+                "funding tracker: polled venue={} symbol={} start_time_ms={start_time_ms} fetched={} new={new_count} last_seen_tran_id={last_seen_tran_id}",
+                pos.venue,
+                pos.symbol,
+                records.len(),
+            );
             let mut newest_cursor = None;
             for record in records.into_iter().filter(|r| r.tran_id > last_seen_tran_id) {
                 self.position_manager.apply_adjustment(

@@ -8,6 +8,6 @@ pub mod types;
 pub use channel::ReportChannel;
 pub use channels::LogChannel;
 pub use section::ReportSection;
-pub use sections::{OrderSection, PortfolioSection, PositionSection};
+pub use sections::{OrderSection, PortfolioSection};
 pub use tracker::ReportTracker;
 pub use types::{Report, ReportSectionOutput};

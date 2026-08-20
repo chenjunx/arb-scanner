@@ -3,8 +3,10 @@
 ## 概述
 
 Portfolio 模块在 [`position`](../src/position) 模块之上提供**估值 + 盈亏**视图：按最新行情
-把 `PositionManager` 的净仓位折算成市值和浮动盈亏 (unrealized PnL)，同时在每笔成交发生时
-记一笔已实现盈亏 (realized PnL)，按 `(venue, symbol)` 和 base 资产两种粒度查询。
+把 `PositionManager` 的净仓位折算成市值和浮动盈亏 (unrealized PnL)；已实现盈亏 (realized PnL)
+不再由 Portfolio 自己记账，而是直接读 `PositionManager::VenuePosition.realized_pnl`——这是
+成交平仓、手续费换算、资金费结算共同维护的唯一真相源，见"架构设计"，按 `(venue, symbol)`
+和 base 资产两种粒度查询。
 
 **动机**：`position_manager_design.md` 的"非目标"里明确排除了 PnL —— `PositionManager`
 只回答"我在哪个 venue 持有多少、成本价多少"，不回答"这笔套利到底赚了多少"、"现在打平的话
@@ -22,14 +24,17 @@ Portfolio 模块在 [`position`](../src/position) 模块之上提供**估值 + �
 
 ### 为什么放在 PositionManager 之上而不是并入其中
 
-`PositionManager` 的职责是"仓位数量的唯一真相源"，`position_manager_design.md` 已经明确
-把 PnL 排除在外，是为了让它保持单一职责、不需要行情依赖。如果直接把估值/盈亏字段加进
-`VenuePosition`，会让 `PositionManager` 同时依赖行情缓存、又要在 `on_filled` 里做和仓位
-无关的盈亏结算，职责重新混在一起。所以 Portfolio 作为独立的只读消费方 + 自己的盈亏账本：
+`PositionManager` 的职责是"仓位数量 + 已实现盈亏的唯一真相源"（`VenuePosition.realized_pnl`
+由 `on_filled` 的成交平仓结算和 `apply_adjustment` 的手续费/资金费调整共同维护，见
+`position_manager_design.md`）。Portfolio 只做行情相关的那部分：mark-to-market 估值和浮动
+盈亏 (unrealized PnL)，不需要也不应该自己再维护一份 realized PnL 账本——曾经的 `PnlStore`
+只在成交时由 `OrderManager::record_fill` 累加，完全绕开了后续的手续费/资金费调整，导致这份
+账本和 `PositionManager` 长期不一致，已删除。所以 Portfolio 是纯粹的只读消费方：
 
-- 读 `PositionManager` 拿净仓位/均价（不写，`PositionManager` 还是仓位状态唯一入口）
+- 读 `PositionManager` 拿净仓位/均价/已实现盈亏（不写，`PositionManager` 还是仓位和已实现
+  盈亏状态的唯一入口）
 - 读 `ArbitrageEngine::shared_cache()` 拿最新行情做 mark-to-market（见"核心组件 §4"）
-- 自己的 `PnlStore` 存 realized PnL/手续费累计值（结构和 `PositionStore` 同构）
+- 自己不持有任何状态（`quote_cache` 只是外部传入的共享缓存引用）
 
 ### 数据流
 
@@ -42,27 +47,26 @@ Portfolio 模块在 [`position`](../src/position) 模块之上提供**估值 + �
 │  handle_exchange_update():                │   │  run(): 收到 MarketEvent 时     │
 │    - risk_engine.on_filled(...)           │   │    顺手写入 cache（已有实现，    │
 │      -> position_manager.on_filled(...)   │   │    无需改动)                    │
-│         返回 FillOutcome{realized_pnl}     │   └───────────────┬───────────────┘
-│    - portfolio.record_fill(               │                   │ shared_cache()
-│        venue, symbol,                     │                   │ (Arc<DashMap<(Venue,Symbol),Quote>>)
-│        outcome.realized_pnl, ts_ms)       │                   │
+│         写入 VenuePosition.realized_pnl    │   └───────────────┬───────────────┘
+│    - apply_adjustment(...) 冲减手续费/      │                   │ shared_cache()
+│      结算资金费，同样写 realized_pnl        │                   │ (Arc<DashMap<(Venue,Symbol),Quote>>)
 └───────────────┬───────────────────────────┘                   │
                  ▼                                               │
 ┌─────────────────────────────────────────────────────────────────┐
 │                        PortfolioManager                           │
-│  record_fill(): 把 realized_pnl 累加进 PnlStore                   │
-│  venue_valuation()/asset_valuation(): position_manager 净仓位/均价  │
-│    × 从 shared_cache 查到的最新 mid 价 -> 市值 + 浮动盈亏           │
-│  venue_pnl()/asset_pnl(): 查 PnlStore 的已实现盈亏累计值，          │
-│    asset_pnl() 顺带把 asset_valuation() 的浮动盈亏拼进汇总          │
-└───────┬───────────────────────────────────┬───────────────────────┘
-        │ 委托读写 (原子 update)                │ 只读查询，不写
-        ▼                                     ▼
-┌───────────────────────┐           ┌─────────────────────────┐
-│      dyn PnlStore      │           │      PositionManager      │
-│  InMemoryPnlStore       │           │  (已有实现，见 §"对已有   │
-│  ← 本次实现              │           │   模块的改动"）            │
-└───────────────────────┘           └─────────────────────────┘
+│  venue_valuation()/asset_valuation(): position_manager 净仓位/均价/ │
+│    realized_pnl × 从 shared_cache 查到的最新 mid 价 -> 市值 + 浮动  │
+│    盈亏                                                            │
+│  asset_pnl(): 基于 asset_valuation() 聚合 realized_pnl，拼上         │
+│    unrealized_pnl                                                  │
+└───────────────────────────────┬───────────────────────────────────┘
+                                 │ 只读查询，不写
+                                 ▼
+                       ┌─────────────────────────┐
+                       │      PositionManager      │
+                       │  (已有实现，见 §"对已有   │
+                       │   模块的改动"）            │
+                       └─────────────────────────┘
 ```
 
 ## 对已有模块的改动 (尽量最小化)
@@ -143,15 +147,9 @@ pub fn on_filled(&self, venue: &Venue, symbol: &Symbol, side: OrderSide,
 ```
 
 `OrderManager::handle_exchange_update` 在现有调用 `risk_engine.on_filled(...)` 的地方
-(`src/order_manager/manager.rs:274` 附近) 拿到 `FillOutcome`，多转发一步给新增的
-`portfolio: Arc<PortfolioManager>` 字段：
-
-```rust
-if fill_delta > Decimal::ZERO {
-    let outcome = self.risk_engine.on_filled(&venue, &symbol, side, fill_delta, avg_price, update.ts_ms);
-    self.portfolio.record_fill(&venue, &symbol, outcome.realized_pnl, update.ts_ms);
-}
-```
+(`src/order_manager/manager.rs`) 触发 `position_manager.on_filled(...)`，`realized_pnl`
+直接写进 `VenuePosition`，`OrderManager` 不再需要转发给单独的 Portfolio 账本——`portfolio`
+字段和这一步转发已经删除，`PortfolioManager` 查询时直接读 `PositionManager` 即可。
 
 除此之外不涉及 `PositionStore`/`RiskEngine::check`/`RiskLimits` 等其它逻辑，`position/store.rs`
 和风控规则完全不用动。
@@ -260,7 +258,6 @@ Binance 合约在私有流补齐前统一传 `None`。
 ```rust
 pub struct PortfolioManager {
     position_manager: Arc<PositionManager>,
-    pnl_store: Arc<dyn PnlStore>,
     /// 直接复用 ArbitrageEngine::shared_cache()，不再单独维护一份行情缓存。
     quote_cache: Arc<DashMap<(Venue, Symbol), Quote>>,
 }
@@ -268,21 +265,15 @@ pub struct PortfolioManager {
 impl PortfolioManager {
     pub fn new(
         position_manager: Arc<PositionManager>,
-        pnl_store: Arc<dyn PnlStore>,
         quote_cache: Arc<DashMap<(Venue, Symbol), Quote>>,
     ) -> Self;
 
-    // 成交后调用 (由 OrderManager 在拿到 FillOutcome 后转发)：把 realized_pnl
-    // 累加进 PnlStore。
-    pub fn record_fill(&self, venue: &Venue, symbol: &Symbol, realized_pnl: Decimal, ts_ms: u64);
-
-    // 单个 venue+symbol 的已实现盈亏累计。
-    pub fn venue_pnl(&self, venue: &Venue, symbol: &Symbol) -> Option<VenuePnl>;
-
-    // 按 base 资产聚合已实现盈亏，并把 asset_valuation() 的浮动盈亏拼进来。
+    // 按 base 资产聚合已实现盈亏 (直接来自 PositionManager，不经过任何中间账本)，
+    // 并把 asset_valuation() 的浮动盈亏拼进来。
     pub fn asset_pnl(&self, asset: &str) -> AssetPnlSummary;
 
-    // 单个 venue+symbol 的市值/浮动盈亏 (无最新行情时 mark_price 及后续字段为 None)。
+    // 单个 venue+symbol 的市值/浮动盈亏/已实现盈亏 (无最新行情时 mark_price 及
+    // 后续字段为 None，realized_pnl 始终有值)。
     pub fn venue_valuation(&self, venue: &Venue, symbol: &Symbol) -> Option<VenuePositionValuation>;
 
     // 按 base 资产聚合市值/浮动盈亏。
@@ -308,27 +299,16 @@ Portfolio 曾经维护 `fees_paid`/`fees_paid_usdt`/`fees_usdt_incomplete`/`fee_
 现在只用于换算 USDT 等值、冲减 `PositionManager` 侧的已实现盈亏 (`AdjustmentReason::FeeUsdt`，
 见 `order_manager/manager.rs`)，Portfolio 自己不再单独统计手续费金额。
 
-### 3. PnlStore (持久化接口，和 PositionStore 同构)
+### 3. 已实现盈亏账本：已删除，直接读 PositionManager
 
-```rust
-pub trait PnlStore: Send + Sync {
-    fn all(&self) -> Vec<VenuePnl>;
-    fn get(&self, venue: &Venue, symbol: &Symbol) -> Option<VenuePnl>;
-    fn update(
-        &self,
-        venue: &Venue,
-        symbol: &Symbol,
-        f: Box<dyn FnOnce(Option<VenuePnl>) -> VenuePnl + Send>,
-    );
-}
-
-pub struct InMemoryPnlStore {
-    entries: Mutex<HashMap<(Venue, Symbol), VenuePnl>>,
-}
-```
-
-原子 `update` 的理由和 `PositionStore` 一致：避免同一 `(venue, symbol)` 上并发成交的
-盈亏/手续费累加互相覆盖。
+早期版本这里是一个独立的 `PnlStore` trait (`InMemoryPnlStore`/`RedisPnlStore`，结构和
+`PositionStore` 同构)，由 `OrderManager` 在每次成交后调用 `record_fill()` 累加。这份账本
+只覆盖"成交平仓"这一种已实现盈亏来源，后来新增的手续费换算 (`AdjustmentReason::FeeUsdt`)
+和资金费结算 (`AdjustmentReason::Funding`) 都是直接写 `PositionManager::VenuePosition
+.realized_pnl`，完全绕开了 `PnlStore`，导致两份账本长期不一致 (`PnlStore` 偏小)。现已把
+`PnlStore` 整条链路 (trait、`InMemoryPnlStore`、`RedisPnlStore`、`VenuePnl` 类型) 删除，
+`PortfolioManager` 的 `venue_valuation`/`asset_valuation`/`asset_pnl` 都直接从
+`PositionManager::VenuePosition.realized_pnl` 读取，不再有单独的持久化/一致性问题。
 
 ### 4. Mark price 来源：直接复用 ArbitrageEngine::shared_cache()
 
@@ -344,15 +324,6 @@ venue 混用的价格。
 /// PositionManager::on_filled 的返回值。
 pub struct FillOutcome {
     pub realized_pnl: Decimal,
-}
-
-/// 单个 (venue, symbol) 的已实现盈亏累计。
-pub struct VenuePnl {
-    pub venue: Venue,
-    pub symbol: Symbol,
-    pub realized_pnl: Decimal,
-    pub trade_count: u64,
-    pub updated_at_ms: u64,
 }
 
 /// 按 base 资产聚合的已实现盈亏汇总，含浮动盈亏拼接。
@@ -376,6 +347,9 @@ pub struct VenuePositionValuation {
     pub mark_price: Option<Decimal>,
     pub market_value: Option<Decimal>,
     pub unrealized_pnl: Option<Decimal>,
+    /// 直接来自 PositionManager::VenuePosition.realized_pnl：成交平仓 + 手续费 +
+    /// 资金费的完整已实现盈亏，始终有值 (不依赖行情)。
+    pub realized_pnl: Decimal,
 }
 
 /// 按 base 资产聚合的估值。
@@ -404,11 +378,10 @@ let risk_engine = Arc::new(RiskEngine::new(risk_limits, position_manager.clone()
 let engine = ArbitrageEngine::new(strategies, sinks);
 let quote_cache = engine.shared_cache();
 
-let pnl_store = Arc::new(InMemoryPnlStore::new());
-let portfolio = Arc::new(PortfolioManager::new(position_manager.clone(), pnl_store, quote_cache));
+let portfolio = Arc::new(PortfolioManager::new(position_manager.clone(), quote_cache));
 
-// OrderManager 新增 portfolio 依赖
-let order_manager = Arc::new(OrderManager::new(risk_engine, execution_engine, event_tx, portfolio.clone()));
+// OrderManager 不依赖 PortfolioManager，PortfolioManager 单向读 PositionManager
+let order_manager = Arc::new(OrderManager::new(bus, position_manager.clone(), order_store, fee_converter));
 ```
 
 ### 2. 查询已实现盈亏
@@ -446,9 +419,9 @@ for v in &valuation.venues {
 - **Kraken REST (`AddOrder`) 路径下单仍是估算值**：接口本身不同步返回成交/手续费信息，
   只能靠这条路径下单时退化为估算；Kraken **WS** (`executions` channel) 已确认真实值可用，
   见"对已有模块的改动 §2"。
-- **不做持久化**：`InMemoryPnlStore` 重启即丢，`PnlStore` trait 是为了让后续接
-  Redis/sled 时不用改 `PortfolioManager` 的调用方，和 `PositionStore` 现状一致。
-- **不区分策略/group_id**：`asset_pnl`/`venue_pnl` 是全局累计，不按 `OrderRequest.strategy_name`
+- **不做持久化**：已实现盈亏的持久化完全交给 `PositionManager`/`PositionStore`
+  (Redis)，`PortfolioManager` 自身不持有任何需要持久化的状态。
+- **不区分策略/group_id**：`asset_pnl` 是全局累计，不按 `OrderRequest.strategy_name`
   或 `group_id` 拆分单个套利动作的盈亏。
 
 ## 测试
@@ -460,13 +433,15 @@ for v in &valuation.venues {
   - 同向减仓未穿零 → `closed_qty * (fill_price - avg_price) * sign`
   - 穿零反向 → 只对被平掉的旧仓位部分计已实现盈亏，新方向部分为 0
   - `fill_price = None` → 0 (不计算)
-- `PortfolioManager::record_fill`：
-  - 单笔/多笔成交的 realized_pnl/trade_count 正确累加
+- `venue_valuation`/`all_valuations` 的 `realized_pnl` 字段：直接反映
+  `PositionManager::VenuePosition.realized_pnl`，包括成交平仓、手续费换算
+  (`AdjustmentReason::FeeUsdt`)、资金费结算 (`AdjustmentReason::Funding`)
 - `asset_valuation`/`venue_valuation`：
   - mark price 命中时市值/浮动盈亏计算正确 (含空头方向验证)
   - 缺行情时对应字段是 `None` 而不是 0
   - 多 venue 聚合时只要有一个 venue 缺价，`AssetValuation.market_value` 整体为 `None`
-- `asset_pnl` 正确拼接 realized (来自 PnlStore) 和 unrealized (来自 asset_valuation)
+- `asset_pnl` 正确聚合已平仓资产的历史 realized_pnl (不因当前 net_qty=0 而丢失)，并拼接
+  unrealized (来自 asset_valuation)
 
 ## 后期扩展计划
 
@@ -483,15 +458,11 @@ for v in &valuation.venues {
 之后才能把 quote 资产余额和 base 资产市值加总成一个"总权益"数字，是本版被排除的两个
 选项，留给后续统一设计。
 
-### 3. Redis/sql 持久化 PnlStore
-和 `position_manager_design.md` "后期扩展计划 §1" 一起做，两个 store 用同一套原子更新
-机制 (`WATCH`/`MULTI` 或 Lua 脚本)。
+### 3. 按策略/group_id 拆分盈亏
+`PositionManager::VenuePosition.realized_pnl` 目前是 `(venue, symbol)` 粒度的全局累计，
+后续可以在 key 里加上 `strategy_name`/`group_id`，单独核算每个套利策略/每组订单的表现。
 
-### 4. 按策略/group_id 拆分盈亏
-`VenuePnl` 目前是 `(venue, symbol)` 粒度的全局累计，后续可以在 key 里加上
-`strategy_name`/`group_id`，单独核算每个套利策略/每组订单的表现。
-
-### 5. `main.rs` 增加 `portfolio` 展示子命令
+### 4. `main.rs` 增加 `portfolio` 展示子命令
 输出 `all_valuations()`/`asset_pnl()` 的表格视图，供人工核对当前对冲组合的市值和盈亏，
 和 `position_manager_design.md` "后期扩展计划 §5" (`main.rs` 接入 `OrderManager`) 是
 同一批工作的一部分。
@@ -507,6 +478,8 @@ Portfolio 模块提供：
 - ✅ 对已有模块的改动降到最低：`PositionManager::on_filled`/`RiskEngine::on_filled`
   返回值从 `()` 变成 `FillOutcome`；`OrderResult`/`ExchangeOrderUpdate` 各新增
   `fee`/`fee_asset` 两个可选字段；`PositionStore`/风控规则完全不动
-- ✅ `PnlStore` trait 占位，后续可无痛切换 Redis/sql，和 `PositionStore` 同一套设计语言
-- 🔄 不含现金余额、总账户权益、持久化、按策略拆分，以及 Binance 合约的真实手续费接入
+- ✅ 已实现盈亏不再单独记账：`PortfolioManager` 是 `PositionManager` 之上的纯只读视图，
+  `realized_pnl` 直接读 `PositionManager::VenuePosition.realized_pnl`（成交平仓 + 手续费 +
+  资金费的完整口径），不存在两份账本互相漂移的问题
+- 🔄 不含现金余额、总账户权益、按策略拆分，以及 Binance 合约的真实手续费接入
   (见"非目标"，均已列入"后期扩展计划")

@@ -35,13 +35,13 @@ use arb_scanner::order_manager::{
 };
 use arb_scanner::order_manager::risk_service::RiskLimits;
 use arb_scanner::order_manager::types::OrderId;
-use arb_scanner::portfolio::{InMemoryPnlStore, PortfolioManager, RedisPnlStore};
+use arb_scanner::portfolio::PortfolioManager;
 use arb_scanner::position::{
     InMemoryPositionStore, PositionManager, PositionStore, RedisAdjustmentLog, RedisPositionStore, VenuePosition,
 };
 use arb_scanner::pricing::FeeUsdtConverter;
 use arb_scanner::report::channels::LogChannel;
-use arb_scanner::report::{OrderSection, PortfolioSection, PositionSection, ReportChannel, ReportTracker};
+use arb_scanner::report::{OrderSection, PortfolioSection, ReportChannel, ReportTracker};
 use arb_scanner::scan;
 use arb_scanner::strategy::cross_exchange::CrossExchangeStrategy;
 use arb_scanner::strategy::manual::{
@@ -206,7 +206,7 @@ async fn main() -> anyhow::Result<()> {
 
 /// 连 Redis 建出 `PositionManager`/`PortfolioManager` 这套仓位/组合盈亏技术栈，
 /// 供 `open --live`/`monitor`/`accounting`/`report` 共用，避免各自重复一遍
-/// "连 Redis -> RedisPositionStore/RedisPnlStore -> PositionManager/PortfolioManager"
+/// "连 Redis -> RedisPositionStore -> PositionManager/PortfolioManager"
 /// 的引导代码。`quote_cache` 由调用方决定：不需要浮动盈亏(纯记账场景)传空
 /// `Arc::new(DashMap::new())`；手动开平仓/轮转这几个一次性命令不接实时行情，
 /// 同样传空 cache。
@@ -218,13 +218,11 @@ fn build_portfolio_stack(
         RedisPositionStore::new(redis_url).context("failed to connect RedisPositionStore to redis")?;
     let adjustment_log =
         RedisAdjustmentLog::new(redis_url).context("failed to connect RedisAdjustmentLog to redis")?;
-    let pnl_store = RedisPnlStore::new(redis_url).context("failed to connect RedisPnlStore to redis")?;
 
     let position_manager = Arc::new(
         PositionManager::new(Arc::new(position_store)).with_adjustment_log(Arc::new(adjustment_log)),
     );
-    let portfolio_manager =
-        Arc::new(PortfolioManager::new(position_manager.clone(), Arc::new(pnl_store), quote_cache));
+    let portfolio_manager = Arc::new(PortfolioManager::new(position_manager.clone(), quote_cache));
     Ok((position_manager, portfolio_manager))
 }
 
@@ -249,7 +247,7 @@ async fn build_manual_pipeline(
     let order_store = Arc::new(RedisOrderStore::new(redis_url).context("failed to connect RedisOrderStore to redis")?);
     let order_id_allocator =
         RedisOrderIdAllocator::new(redis_url).context("failed to connect RedisOrderIdAllocator to redis")?;
-    let (position_manager, portfolio_manager) = build_portfolio_stack(redis_url, Arc::new(DashMap::new()))?;
+    let (position_manager, _portfolio_manager) = build_portfolio_stack(redis_url, Arc::new(DashMap::new()))?;
 
     let mut risk_limits = HashMap::new();
     let mut adapters = HashMap::new();
@@ -269,13 +267,7 @@ async fn build_manual_pipeline(
         position_manager.clone(),
     ));
     let execution_service = Arc::new(ExecutionService::new(bus.clone(), adapters, order_store.clone()));
-    let order_manager = Arc::new(OrderManager::new(
-        bus.clone(),
-        position_manager,
-        portfolio_manager,
-        order_store,
-        fee_converter,
-    ));
+    let order_manager = Arc::new(OrderManager::new(bus.clone(), position_manager, order_store, fee_converter));
 
     let _risk_handle = risk_service.clone().start();
     let _execution_handle = execution_service.clone().start();
@@ -553,7 +545,7 @@ async fn run_reconcile_order_command(args: &[String]) -> anyhow::Result<()> {
     info!("reconcile-order: connecting to redis at {redis_url}");
     let order_store = Arc::new(RedisOrderStore::new(&redis_url).context("failed to connect RedisOrderStore to redis")?);
     let bus = Arc::new(TopicBus::new());
-    let (position_manager, portfolio_manager) = build_portfolio_stack(&redis_url, Arc::new(DashMap::new()))?;
+    let (position_manager, _portfolio_manager) = build_portfolio_stack(&redis_url, Arc::new(DashMap::new()))?;
 
     let order = order_store
         .get(&order_id)
@@ -599,13 +591,7 @@ async fn run_reconcile_order_command(args: &[String]) -> anyhow::Result<()> {
 
     info!("reconcile-order: --confirm 已指定，写入 handle_exchange_update 落库");
 
-    let order_manager = Arc::new(OrderManager::new(
-        bus.clone(),
-        position_manager,
-        portfolio_manager,
-        order_store,
-        None,
-    ));
+    let order_manager = Arc::new(OrderManager::new(bus.clone(), position_manager, order_store, None));
 
     order_manager.seed_order(order.clone());
 
@@ -1335,8 +1321,7 @@ async fn run_monitor_command(args: &[String]) -> anyhow::Result<()> {
         let order_store = RedisOrderStore::new(&redis_url).context("failed to connect RedisOrderStore to redis")?;
         let order_store: Arc<dyn arb_scanner::order_manager::OrderStore> = Arc::new(order_store);
         let sections: Vec<Arc<dyn arb_scanner::report::ReportSection>> = vec![
-            Arc::new(PortfolioSection::new(position_manager.clone(), portfolio_manager)),
-            Arc::new(PositionSection::new(position_manager)),
+            Arc::new(PortfolioSection::new(portfolio_manager)),
             Arc::new(OrderSection::new(order_store)),
         ];
         let channels: Vec<Arc<dyn ReportChannel>> = vec![Arc::new(LogChannel)];
@@ -1447,13 +1432,12 @@ async fn run_report_command(args: &[String]) -> anyhow::Result<()> {
 
     let redis_url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379/".to_string());
     info!("report: connecting to redis at {redis_url}");
-    let (position_manager, portfolio_manager) = build_portfolio_stack(&redis_url, Arc::new(DashMap::new()))?;
+    let (_position_manager, portfolio_manager) = build_portfolio_stack(&redis_url, Arc::new(DashMap::new()))?;
     let order_store = RedisOrderStore::new(&redis_url).context("failed to connect RedisOrderStore to redis")?;
     let order_store: Arc<dyn arb_scanner::order_manager::OrderStore> = Arc::new(order_store);
 
     let sections: Vec<Arc<dyn arb_scanner::report::ReportSection>> = vec![
-        Arc::new(PortfolioSection::new(position_manager.clone(), portfolio_manager.clone())),
-        Arc::new(PositionSection::new(position_manager)),
+        Arc::new(PortfolioSection::new(portfolio_manager)),
         Arc::new(OrderSection::new(order_store)),
     ];
     let channels: Vec<Arc<dyn ReportChannel>> = vec![Arc::new(LogChannel)];
@@ -1510,15 +1494,9 @@ fn build_order_stream_source(
 fn bare_manual_strategy() -> ManualStrategy {
     let bus = Arc::new(TopicBus::new());
     let position_manager = Arc::new(PositionManager::new(Arc::new(InMemoryPositionStore::new())));
-    let portfolio_manager = Arc::new(PortfolioManager::new(
-        position_manager.clone(),
-        Arc::new(InMemoryPnlStore::new()),
-        Arc::new(DashMap::new()),
-    ));
     let order_manager = Arc::new(OrderManager::new(
         bus.clone(),
         position_manager,
-        portfolio_manager,
         Arc::new(InMemoryOrderStore::new()),
         None,
     ));

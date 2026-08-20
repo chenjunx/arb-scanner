@@ -10,9 +10,8 @@ use super::cursor_store::{FundingCursor, FundingCursorStore};
 
 const FUNDING_CURSOR_KEY: &str = "arb_scanner:funding_cursor";
 
-/// `FundingCursorStore` 的 Redis 实现，结构和 `portfolio::redis_store::RedisPnlStore`
-/// 对称：单个 Hash(`arb_scanner:funding_cursor`)，field=`"{venue}|{symbol}"`，
-/// value=JSON。
+/// `FundingCursorStore` 的 Redis 实现：单个 Hash(`arb_scanner:funding_cursor`)，
+/// field=`"{venue}|{symbol}"`，value=JSON。
 pub struct RedisFundingCursorStore {
     conn: Mutex<redis::Connection>,
 }
