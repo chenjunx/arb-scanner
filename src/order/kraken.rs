@@ -453,7 +453,7 @@ struct KrakenExecutionData {
 
 /// 按 asset 分组求和，语义和 `binance::sum_fee_by_asset` 一致：只有单一币种
 /// 时才认为是可信的单一手续费值返回 `Some`，混合多币种或没有 fee 项时返回
-/// `None`，交给 Portfolio 按 `FeeConfig` 估算兜底。
+/// `None`。
 fn sum_kraken_fees(fees: &[KrakenFee]) -> (Option<Decimal>, Option<String>) {
     let mut totals: HashMap<&str, Decimal> = HashMap::new();
     for fee in fees {

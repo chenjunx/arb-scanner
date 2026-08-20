@@ -33,13 +33,12 @@ impl ReportSection for PositionSection {
             .into_iter()
             .map(|p| {
                 format!(
-                    "{} {}: net_qty={} avg_price={} total_fees_usdt={}{}",
+                    "{} {}: net_qty={} avg_price={} realized_pnl={}",
                     p.venue,
                     p.symbol,
                     p.net_qty,
                     p.avg_price.map(|v| v.to_string()).unwrap_or_else(|| "N/A".to_string()),
-                    p.total_fees_usdt,
-                    if p.fees_usdt_incomplete { "(部分未换算)" } else { "" }
+                    p.realized_pnl,
                 )
             })
             .collect::<Vec<_>>()

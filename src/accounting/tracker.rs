@@ -7,21 +7,19 @@ use rust_decimal::Decimal;
 use tokio::task::JoinHandle;
 
 use crate::market_data::now_ms;
-use crate::portfolio::PortfolioManager;
-use crate::position::PositionManager;
+use crate::position::{AdjustmentReason, PositionManager};
 use crate::types::Venue;
 
 use super::cursor_store::{FundingCursor, FundingCursorStore};
 use super::provider::FundingFeeProvider;
 
-/// 定期轮询各交易所的资金费流水，去重后累加进 `PortfolioManager` 的
-/// `PnlStore`。每次 tick 都从 `PositionManager` 重新读取当前非零仓位，而不是
-/// 启动时固定一份 symbol 列表，这样新开/平仓的期货仓位不需要重启这个任务
-/// 就能被自动跟踪/停止跟踪。
+/// 定期轮询各交易所的资金费流水，去重后通过 `PositionManager::apply_adjustment`
+/// (`AdjustmentReason::Funding`) 累加进对应仓位的 `realized_pnl`。每次 tick 都从
+/// `PositionManager` 重新读取当前非零仓位，而不是启动时固定一份 symbol 列表，
+/// 这样新开/平仓的期货仓位不需要重启这个任务就能被自动跟踪/停止跟踪。
 pub struct FundingFeeTracker {
     providers: HashMap<Venue, Arc<dyn FundingFeeProvider>>,
     position_manager: Arc<PositionManager>,
-    portfolio: Arc<PortfolioManager>,
     cursor_store: Arc<dyn FundingCursorStore>,
     poll_interval: Duration,
     /// 某个 (venue, symbol) 第一次被轮询、还没有游标时，往回补多久的历史。
@@ -32,7 +30,6 @@ impl FundingFeeTracker {
     pub fn new(
         providers: HashMap<Venue, Arc<dyn FundingFeeProvider>>,
         position_manager: Arc<PositionManager>,
-        portfolio: Arc<PortfolioManager>,
         cursor_store: Arc<dyn FundingCursorStore>,
         poll_interval: Duration,
         initial_lookback: Duration,
@@ -40,7 +37,6 @@ impl FundingFeeTracker {
         Self {
             providers,
             position_manager,
-            portfolio,
             cursor_store,
             poll_interval,
             initial_lookback,
@@ -86,7 +82,13 @@ impl FundingFeeTracker {
             let last_seen_tran_id = cursor.map(|c| c.last_tran_id).unwrap_or(-1);
             let mut newest_cursor = None;
             for record in records.into_iter().filter(|r| r.tran_id > last_seen_tran_id) {
-                self.portfolio.record_funding_fee(&pos.venue, &pos.symbol, record.income, record.time_ms);
+                self.position_manager.apply_adjustment(
+                    &pos.venue,
+                    &pos.symbol,
+                    record.income,
+                    AdjustmentReason::Funding,
+                    record.time_ms,
+                );
                 newest_cursor = Some(FundingCursor { last_time_ms: record.time_ms, last_tran_id: record.tran_id });
             }
             if let Some(cursor) = newest_cursor {
@@ -102,11 +104,9 @@ mod tests {
     use crate::accounting::cursor_store::InMemoryFundingCursorStore;
     use crate::accounting::provider::FundingIncomeRecord;
     use crate::order::types::OrderSide;
-    use crate::portfolio::{FeeConfig, InMemoryPnlStore};
     use crate::position::InMemoryPositionStore;
     use crate::types::Symbol;
     use async_trait::async_trait;
-    use dashmap::DashMap;
     use std::sync::Mutex;
 
     struct MockProvider {
@@ -132,47 +132,39 @@ mod tests {
         Symbol::new("BTC", "USDT")
     }
 
-    fn setup(records: Vec<FundingIncomeRecord>) -> (Arc<FundingFeeTracker>, Arc<PortfolioManager>) {
+    fn setup(records: Vec<FundingIncomeRecord>) -> (Arc<FundingFeeTracker>, Arc<PositionManager>) {
         let position_manager = Arc::new(PositionManager::new(Arc::new(InMemoryPositionStore::new())));
         position_manager.on_filled(&venue(), &symbol(), OrderSide::Sell, Decimal::ONE, Some(Decimal::new(50000, 0)), None, None, None, 1);
-
-        let portfolio = Arc::new(PortfolioManager::new(
-            position_manager.clone(),
-            Arc::new(InMemoryPnlStore::new()),
-            Arc::new(DashMap::new()),
-            HashMap::<Venue, FeeConfig>::new(),
-        ));
 
         let mut providers: HashMap<Venue, Arc<dyn FundingFeeProvider>> = HashMap::new();
         providers.insert(venue(), Arc::new(MockProvider { venue: venue(), records: Mutex::new(records) }));
 
         let tracker = Arc::new(FundingFeeTracker::new(
             providers,
-            position_manager,
-            portfolio.clone(),
+            position_manager.clone(),
             Arc::new(InMemoryFundingCursorStore::new()),
             Duration::from_secs(1),
             Duration::from_secs(3600),
         ));
-        (tracker, portfolio)
+        (tracker, position_manager)
     }
 
     #[tokio::test]
     async fn accumulates_funding_income_for_open_positions() {
-        let (tracker, portfolio) = setup(vec![
+        let (tracker, position_manager) = setup(vec![
             FundingIncomeRecord { symbol: symbol(), income: Decimal::new(-10, 0), time_ms: 1000, tran_id: 1 },
             FundingIncomeRecord { symbol: symbol(), income: Decimal::new(5, 0), time_ms: 2000, tran_id: 2 },
         ]);
 
         tracker.poll_once().await;
 
-        let pnl = portfolio.venue_pnl(&venue(), &symbol()).unwrap();
-        assert_eq!(pnl.funding_pnl, Decimal::new(-5, 0));
+        let pos = position_manager.venue_position(&venue(), &symbol()).unwrap();
+        assert_eq!(pos.realized_pnl, Decimal::new(-5, 0));
     }
 
     #[tokio::test]
     async fn repeated_polls_do_not_double_count() {
-        let (tracker, portfolio) = setup(vec![FundingIncomeRecord {
+        let (tracker, position_manager) = setup(vec![FundingIncomeRecord {
             symbol: symbol(),
             income: Decimal::new(-10, 0),
             time_ms: 1000,
@@ -183,8 +175,8 @@ mod tests {
         tracker.poll_once().await;
         tracker.poll_once().await;
 
-        let pnl = portfolio.venue_pnl(&venue(), &symbol()).unwrap();
-        assert_eq!(pnl.funding_pnl, Decimal::new(-10, 0));
+        let pos = position_manager.venue_position(&venue(), &symbol()).unwrap();
+        assert_eq!(pos.realized_pnl, Decimal::new(-10, 0));
     }
 
     #[tokio::test]
@@ -192,16 +184,9 @@ mod tests {
         let position_manager = Arc::new(PositionManager::new(Arc::new(InMemoryPositionStore::new())));
         let other_venue = Venue::new("kraken_futures");
         position_manager.on_filled(&other_venue, &symbol(), OrderSide::Sell, Decimal::ONE, Some(Decimal::new(50000, 0)), None, None, None, 1);
-        let portfolio = Arc::new(PortfolioManager::new(
-            position_manager.clone(),
-            Arc::new(InMemoryPnlStore::new()),
-            Arc::new(DashMap::new()),
-            HashMap::<Venue, FeeConfig>::new(),
-        ));
         let tracker = Arc::new(FundingFeeTracker::new(
             HashMap::new(),
-            position_manager,
-            portfolio.clone(),
+            position_manager.clone(),
             Arc::new(InMemoryFundingCursorStore::new()),
             Duration::from_secs(1),
             Duration::from_secs(3600),
@@ -209,6 +194,6 @@ mod tests {
 
         tracker.poll_once().await;
 
-        assert!(portfolio.venue_pnl(&other_venue, &symbol()).is_none());
+        assert_eq!(position_manager.venue_position(&other_venue, &symbol()).unwrap().realized_pnl, Decimal::ZERO);
     }
 }

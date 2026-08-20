@@ -161,9 +161,8 @@ impl OrderProvider for BinanceFuturesOrderProvider {
     /// executedQty/avgPrice)和下单 RESULT 响应一致，直接复用
     /// `parse_order_response`——但这个接口本身不带手续费(和现货一样，订单
     /// 汇总查询不给逐笔成交明细)，成交了就再查一次 `GET /fapi/v1/userTrades`
-    /// 补真实手续费；那一步失败不影响这里返回订单状态本身，只是手续费留空，
-    /// 交给 Portfolio 按 `FeeConfig` 估算兜底。用于 `wait_for_fill` 的 REST
-    /// 兜底核对，以及 `reconcile-order` 命令。
+    /// 补真实手续费；那一步失败不影响这里返回订单状态本身，只是手续费留空。
+    /// 用于 `wait_for_fill` 的 REST 兜底核对，以及 `reconcile-order` 命令。
     async fn query_order(&self, symbol: &Symbol, exchange_order_id: &str) -> anyhow::Result<OrderResult> {
         let params = vec![
             ("symbol".to_string(), binance_symbol(symbol)),
@@ -589,8 +588,7 @@ fn parse_order_response(text: &str) -> anyhow::Result<OrderResult> {
         status: map_status(&resp.status),
         filled_qty: resp.executed_qty,
         avg_price,
-        // 合约下单响应(RESULT)不带手续费信息，也没有对应的私有流可补，
-        // 由 Portfolio 按 FeeConfig 估算兜底。
+        // 合约下单响应(RESULT)不带手续费信息，也没有对应的私有流可补。
         fee: None,
         fee_asset: None,
     })
@@ -604,8 +602,8 @@ struct TradeFill {
 }
 
 /// 按 `commissionAsset` 分组求和；只有单一币种时才认为是可信的单一手续费值
-/// 返回 `Some`，混合多币种时返回 `None`，交给 Portfolio 按 `FeeConfig` 估算
-/// 兜底，不做加权处理(和现货 `binance.rs` 里的同名逻辑一致)。
+/// 返回 `Some`，混合多币种时返回 `None`，不做加权处理(和现货 `binance.rs`
+/// 里的同名逻辑一致)。
 fn sum_fee_by_asset(fills: &[TradeFill]) -> (Option<Decimal>, Option<String>) {
     let mut totals: HashMap<&str, Decimal> = HashMap::new();
     for fill in fills {

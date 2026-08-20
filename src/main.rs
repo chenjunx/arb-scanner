@@ -21,6 +21,7 @@ use arb_scanner::logging;
 use arb_scanner::market_data::MarketDataSource;
 use arb_scanner::market_data::binance::BinanceSpotSource;
 use arb_scanner::market_data::binance_futures::BinanceFuturesSource;
+use arb_scanner::market_data::cache::MarketDataCache;
 use arb_scanner::market_data::kraken::KrakenSpotSource;
 use arb_scanner::market_data::mock::{MockSource, MockSymbolConfig};
 use arb_scanner::net;
@@ -35,7 +36,9 @@ use arb_scanner::order_manager::{
 use arb_scanner::order_manager::risk_service::RiskLimits;
 use arb_scanner::order_manager::types::OrderId;
 use arb_scanner::portfolio::{InMemoryPnlStore, PortfolioManager, RedisPnlStore};
-use arb_scanner::position::{InMemoryPositionStore, PositionManager, PositionStore, RedisPositionStore, VenuePosition};
+use arb_scanner::position::{
+    InMemoryPositionStore, PositionManager, PositionStore, RedisAdjustmentLog, RedisPositionStore, VenuePosition,
+};
 use arb_scanner::pricing::FeeUsdtConverter;
 use arb_scanner::report::channels::LogChannel;
 use arb_scanner::report::{OrderSection, PortfolioSection, PositionSection, ReportChannel, ReportTracker};
@@ -46,7 +49,7 @@ use arb_scanner::strategy::manual::{
 };
 use arb_scanner::strategy::triangular::{LegSide, TriangularLeg, TriangularPath, TriangularStrategy};
 use arb_scanner::strategy::{FeeSchedule, Strategy};
-use arb_scanner::topic::TopicBus;
+use arb_scanner::topic::{Topic, TopicBus};
 use arb_scanner::types::{Quote, Symbol, Venue};
 use arb_scanner::wallet::binance::BinanceWalletProvider;
 use arb_scanner::wallet::kraken::KrakenWalletProvider;
@@ -206,23 +209,22 @@ async fn main() -> anyhow::Result<()> {
 /// "连 Redis -> RedisPositionStore/RedisPnlStore -> PositionManager/PortfolioManager"
 /// 的引导代码。`quote_cache` 由调用方决定：不需要浮动盈亏(纯记账场景)传空
 /// `Arc::new(DashMap::new())`；手动开平仓/轮转这几个一次性命令不接实时行情，
-/// 同样传空 cache。手续费配置固定用空 `HashMap`(按 `FeeConfig::default()`
-/// 估算)，目前没有命令需要自定义。
+/// 同样传空 cache。
 fn build_portfolio_stack(
     redis_url: &str,
     quote_cache: Arc<DashMap<(Venue, Symbol), Quote>>,
 ) -> anyhow::Result<(Arc<PositionManager>, Arc<PortfolioManager>)> {
     let position_store =
         RedisPositionStore::new(redis_url).context("failed to connect RedisPositionStore to redis")?;
+    let adjustment_log =
+        RedisAdjustmentLog::new(redis_url).context("failed to connect RedisAdjustmentLog to redis")?;
     let pnl_store = RedisPnlStore::new(redis_url).context("failed to connect RedisPnlStore to redis")?;
 
-    let position_manager = Arc::new(PositionManager::new(Arc::new(position_store)));
-    let portfolio_manager = Arc::new(PortfolioManager::new(
-        position_manager.clone(),
-        Arc::new(pnl_store),
-        quote_cache,
-        HashMap::new(),
-    ));
+    let position_manager = Arc::new(
+        PositionManager::new(Arc::new(position_store)).with_adjustment_log(Arc::new(adjustment_log)),
+    );
+    let portfolio_manager =
+        Arc::new(PortfolioManager::new(position_manager.clone(), Arc::new(pnl_store), quote_cache));
     Ok((position_manager, portfolio_manager))
 }
 
@@ -722,8 +724,7 @@ async fn run_set_position_command(args: &[String]) -> anyhow::Result<()> {
             net_qty: qty,
             avg_price,
             total_fees: std::collections::HashMap::new(),
-            total_fees_usdt: Decimal::ZERO,
-            fees_usdt_incomplete: false,
+            realized_pnl: Decimal::ZERO,
             updated_at_ms: ts_ms,
         }),
     );
@@ -1296,12 +1297,22 @@ async fn run_monitor_command(args: &[String]) -> anyhow::Result<()> {
     if !no_portfolio {
         let redis_url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379/".to_string());
         info!("monitor: connecting to redis at {redis_url}");
-        // TODO: TopicBus 迁移后 ArbitrageEngine::shared_cache() 已移除，目前没有
-        // 桥接 TopicBus 实时行情到 PortfolioManager::quote_cache 的机制，
-        // mark-to-market (market_value/unrealized_pnl) 暂时恒为 N/A。
-        let (position_manager, portfolio_manager) = build_portfolio_stack(&redis_url, Arc::new(DashMap::new()))?;
 
         let futures_venue = Venue::new("binance_futures");
+
+        // 独立的行情缓存：订阅三条腿(现货/期货/kraken)的最新价格，喂给
+        // `PortfolioManager::quote_cache` 做 mark-to-market 估值，
+        // 参见 `MarketDataCache` 文档。
+        let quote_topics: Vec<Topic> = [Venue::new("binance_spot"), Venue::new("kraken"), futures_venue.clone()]
+            .into_iter()
+            .flat_map(|venue| symbols.iter().map(move |symbol| Topic::quote(venue.clone(), symbol.clone())))
+            .collect();
+        let market_data_cache = Arc::new(MarketDataCache::new());
+        source_handles.push(market_data_cache.clone().spawn(bus.clone(), quote_topics));
+
+        let (position_manager, portfolio_manager) =
+            build_portfolio_stack(&redis_url, market_data_cache.snapshot())?;
+
         let futures_source: Box<dyn MarketDataSource> =
             Box::new(BinanceFuturesSource::new(futures_venue.clone(), symbols.clone(), testnet, proxy.clone()));
         source_handles.push(futures_source.spawn(bus.clone()));
@@ -1315,7 +1326,6 @@ async fn run_monitor_command(args: &[String]) -> anyhow::Result<()> {
         let funding_tracker = Arc::new(FundingFeeTracker::new(
             providers,
             position_manager.clone(),
-            portfolio_manager.clone(),
             Arc::new(cursor_store),
             Duration::from_secs(funding_interval_secs),
             Duration::from_secs(funding_initial_lookback_hours * 3600),
@@ -1349,9 +1359,10 @@ async fn run_monitor_command(args: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// 独立的常驻进程：定期轮询交易所资金费流水，累加进 `PortfolioManager` 的
-/// `PnlStore`(`funding_pnl` 字段)。跟踪对象是 `PositionManager`(Redis 支撑)里
-/// 每次轮询时读到的当前非零仓位，而不是启动时固定的一份列表，所以
+/// 独立的常驻进程：定期轮询交易所资金费流水，通过
+/// `PositionManager::apply_adjustment`(`AdjustmentReason::Funding`)累加进对应
+/// 仓位的 `realized_pnl`。跟踪对象是 `PositionManager`(Redis 支撑)里每次轮询时
+/// 读到的当前非零仓位，而不是启动时固定的一份列表，所以
 /// `open`/`close` 开平的期货仓位不需要重启这个进程就能被自动跟踪/停止跟踪。
 /// 如果 `monitor` 已经在跑且没加 `--no-portfolio`，通常不需要单独起本命令；只需要
 /// 资金费追踪、不想启动价差扫描和行情连接时单独使用。
@@ -1390,14 +1401,13 @@ async fn run_accounting_command(args: &[String]) -> anyhow::Result<()> {
 
     let redis_url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379/".to_string());
     info!("accounting: connecting to redis at {redis_url}");
-    let (position_manager, portfolio_manager) = build_portfolio_stack(&redis_url, Arc::new(DashMap::new()))?;
+    let (position_manager, _portfolio_manager) = build_portfolio_stack(&redis_url, Arc::new(DashMap::new()))?;
     let cursor_store =
         RedisFundingCursorStore::new(&redis_url).context("failed to connect RedisFundingCursorStore to redis")?;
 
     let tracker = Arc::new(FundingFeeTracker::new(
         providers,
         position_manager,
-        portfolio_manager,
         Arc::new(cursor_store),
         Duration::from_secs(interval_secs),
         Duration::from_secs(initial_lookback_hours * 3600),
@@ -1504,7 +1514,6 @@ fn bare_manual_strategy() -> ManualStrategy {
         position_manager.clone(),
         Arc::new(InMemoryPnlStore::new()),
         Arc::new(DashMap::new()),
-        HashMap::new(),
     ));
     let order_manager = Arc::new(OrderManager::new(
         bus.clone(),

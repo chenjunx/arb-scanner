@@ -4,8 +4,7 @@
 
 Portfolio 模块在 [`position`](../src/position) 模块之上提供**估值 + 盈亏**视图：按最新行情
 把 `PositionManager` 的净仓位折算成市值和浮动盈亏 (unrealized PnL)，同时在每笔成交发生时
-记一笔已实现盈亏 (realized PnL) 和估算手续费，按 `(venue, symbol)` 和 base 资产两种粒度
-查询。
+记一笔已实现盈亏 (realized PnL)，按 `(venue, symbol)` 和 base 资产两种粒度查询。
 
 **动机**：`position_manager_design.md` 的"非目标"里明确排除了 PnL —— `PositionManager`
 只回答"我在哪个 venue 持有多少、成本价多少"，不回答"这笔套利到底赚了多少"、"现在打平的话
@@ -13,8 +12,9 @@ Portfolio 模块在 [`position`](../src/position) 模块之上提供**估值 + �
 
 - ✅ 按 asset 估值持仓 (mark-to-market)：结合 `PositionManager` 的净仓位/均价和最新行情，
   算出市值和浮动盈亏
-- ✅ 已实现盈亏 / 手续费统计：每笔成交记一笔 realized PnL + 手续费，可累计查询。手续费
-  **优先用交易所真实返还值，拿不到时才退化为估算**（见"核心组件 §2"）
+- ✅ 已实现盈亏统计：每笔成交记一笔 realized PnL，可累计查询
+- ❌ 手续费统计（`fees_paid`/`fee_is_estimated` 等字段已移除，手续费只用于冲减
+  `PositionManager` 侧的已实现盈亏，见"对已有模块的改动 §2"）
 - ❌ quote 资产/现金余额追踪、跨 venue 总账户权益 (一个数字)、持久化 —— 均不在本版范围，
   见"非目标"
 
@@ -44,18 +44,16 @@ Portfolio 模块在 [`position`](../src/position) 模块之上提供**估值 + �
 │      -> position_manager.on_filled(...)   │   │    无需改动)                    │
 │         返回 FillOutcome{realized_pnl}     │   └───────────────┬───────────────┘
 │    - portfolio.record_fill(               │                   │ shared_cache()
-│        venue, symbol, filled_qty_delta,   │                   │ (Arc<DashMap<(Venue,Symbol),Quote>>)
-│        fill_price, update.fee,            │                   │
+│        venue, symbol,                     │                   │ (Arc<DashMap<(Venue,Symbol),Quote>>)
 │        outcome.realized_pnl, ts_ms)       │                   │
 └───────────────┬───────────────────────────┘                   │
                  ▼                                               │
 ┌─────────────────────────────────────────────────────────────────┐
 │                        PortfolioManager                           │
-│  record_fill(): real_fee 非 None 直接用，否则按 FeeConfig 估算，   │
-│    连同 realized_pnl 一起更新 PnlStore                            │
+│  record_fill(): 把 realized_pnl 累加进 PnlStore                   │
 │  venue_valuation()/asset_valuation(): position_manager 净仓位/均价  │
 │    × 从 shared_cache 查到的最新 mid 价 -> 市值 + 浮动盈亏           │
-│  venue_pnl()/asset_pnl(): 查 PnlStore 的已实现盈亏/手续费累计值，    │
+│  venue_pnl()/asset_pnl(): 查 PnlStore 的已实现盈亏累计值，          │
 │    asset_pnl() 顺带把 asset_valuation() 的浮动盈亏拼进汇总          │
 └───────┬───────────────────────────────────┬───────────────────────┘
         │ 委托读写 (原子 update)                │ 只读查询，不写
@@ -151,7 +149,7 @@ pub fn on_filled(&self, venue: &Venue, symbol: &Symbol, side: OrderSide,
 ```rust
 if fill_delta > Decimal::ZERO {
     let outcome = self.risk_engine.on_filled(&venue, &symbol, side, fill_delta, avg_price, update.ts_ms);
-    self.portfolio.record_fill(&venue, &symbol, fill_delta, avg_price, update.fee, outcome.realized_pnl, update.ts_ms);
+    self.portfolio.record_fill(&venue, &symbol, outcome.realized_pnl, update.ts_ms);
 }
 ```
 
@@ -195,7 +193,8 @@ pub struct OrderResult {
     pub filled_qty: Decimal,
     pub avg_price: Option<Decimal>,
     /// 交易所真实返还的手续费，拿不到时为 None (如 Kraken REST AddOrder 本身
-    /// 不同步返回成交信息、Binance 合约缺私有流)，由 Portfolio 退化为估算。
+    /// 不同步返回成交信息、Binance 合约缺私有流)，缺失时这笔成交不冲减
+    /// 已实现盈亏。
     pub fee: Option<Decimal>,
     pub fee_asset: Option<String>,
 }
@@ -211,7 +210,7 @@ pub struct ExchangeOrderUpdate {
     /// 本次推送(增量)对应的手续费，语义上对齐 Binance `executionReport` 的
     /// `n`/`N`——是这一次 fill_delta 的手续费，不是订单累计值，和 filled_qty/
     /// avg_price(累计值)刻意不同，调用方(OrderManager::handle_exchange_update)
-    /// 直接把它转发给 `portfolio.record_fill` 即可，不需要自己再做增量计算。
+    /// 用它换算 USDT 等值去冲减 `PositionManager` 的已实现盈亏。
     pub fee: Option<Decimal>,
     pub fee_asset: Option<String>,
     pub ts_ms: u64,
@@ -220,7 +219,7 @@ pub struct ExchangeOrderUpdate {
 
 `Binance` 现货一侧的解析改动：REST 端把 `fills` 里的 `commission` 按 `commissionAsset`
 分组求和，只有单一币种时才写入 `fee`/`fee_asset`(多币种混合是 BNB 抵扣额度中途用完等
-边缘情况，概率很低，出现时保留 `None` 交给 Portfolio 估算兜底，不做加权处理)；WS 端直接
+边缘情况，概率很低，出现时保留 `None`，不做加权处理)；WS 端直接
 把每条 `executionReport` 的 `n`/`N` 透传进 `ExchangeOrderUpdate`。
 
 `Kraken` WS 一侧的解析改动：`KrakenExecutionData` 新增
@@ -250,8 +249,7 @@ struct KrakenExecutionData {
 ```
 
 和 Binance 一样按 `asset` 分组求和，单一币种才写入 `fee`/`fee_asset`；`fees` 为空(非
-`trade` 类型的推送，或者 Kraken 少见地不带手续费的成交)时传 `None`，交给 Portfolio 按
-`FeeConfig` 估算兜底。
+`trade` 类型的推送，或者 Kraken 少见地不带手续费的成交)时传 `None`。
 
 Binance 合约在私有流补齐前统一传 `None`。
 
@@ -265,8 +263,6 @@ pub struct PortfolioManager {
     pnl_store: Arc<dyn PnlStore>,
     /// 直接复用 ArbitrageEngine::shared_cache()，不再单独维护一份行情缓存。
     quote_cache: Arc<DashMap<(Venue, Symbol), Quote>>,
-    fee_config: HashMap<Venue, FeeConfig>,
-    default_fee_config: FeeConfig,
 }
 
 impl PortfolioManager {
@@ -274,27 +270,16 @@ impl PortfolioManager {
         position_manager: Arc<PositionManager>,
         pnl_store: Arc<dyn PnlStore>,
         quote_cache: Arc<DashMap<(Venue, Symbol), Quote>>,
-        fee_config: HashMap<Venue, FeeConfig>,
     ) -> Self;
 
-    // 成交后调用 (由 OrderManager 在拿到 FillOutcome 后转发)：real_fee 非 None
-    // 时直接用交易所真实手续费，否则按 venue 的 taker_fee_bps × fee_discount
-    // 估算兜底，连同 realized_pnl 一起累加进 PnlStore。
-    pub fn record_fill(
-        &self,
-        venue: &Venue,
-        symbol: &Symbol,
-        filled_qty_delta: Decimal,
-        fill_price: Option<Decimal>,
-        real_fee: Option<Decimal>,
-        realized_pnl: Decimal,
-        ts_ms: u64,
-    );
+    // 成交后调用 (由 OrderManager 在拿到 FillOutcome 后转发)：把 realized_pnl
+    // 累加进 PnlStore。
+    pub fn record_fill(&self, venue: &Venue, symbol: &Symbol, realized_pnl: Decimal, ts_ms: u64);
 
-    // 单个 venue+symbol 的已实现盈亏/手续费累计。
+    // 单个 venue+symbol 的已实现盈亏累计。
     pub fn venue_pnl(&self, venue: &Venue, symbol: &Symbol) -> Option<VenuePnl>;
 
-    // 按 base 资产聚合已实现盈亏/手续费，并把 asset_valuation() 的浮动盈亏拼进来。
+    // 按 base 资产聚合已实现盈亏，并把 asset_valuation() 的浮动盈亏拼进来。
     pub fn asset_pnl(&self, asset: &str) -> AssetPnlSummary;
 
     // 单个 venue+symbol 的市值/浮动盈亏 (无最新行情时 mark_price 及后续字段为 None)。
@@ -315,28 +300,13 @@ impl PortfolioManager {
 利润)。查不到行情或 `avg_price` 为 `None` (仓位为 0) 时，`mark_price`/`market_value`/
 `unrealized_pnl` 都返回 `None`，不用 0 兜底，避免"没有行情"和"确实不赚不赔"混淆。
 
-### 2. 手续费来源：真实值优先，FeeConfig 估算兜底
+### 2. 手续费：只用于冲减已实现盈亏，Portfolio 不再单独记账
 
-`record_fill` 收到的 `real_fee`（来自"对已有模块的改动 §2"新增的 `OrderResult.fee`/
-`ExchangeOrderUpdate.fee`）非 `None` 时直接用它记账；只有交易所侧确实拿不到真实值时
-(目前是 Binance 合约、Kraken REST `AddOrder` 路径、Binance 现货多币种手续费的边缘情况)
-才退化为按 `taker_fee_bps`/`fee_discount` 估算——复用 `config.rs` 里 `VenueConfig` 已有的
-概念 (和 `monitor` 子命令算实际成本用的是同一套数字，见最近一次提交 "switch binance fee
-basis to taker")，和 `RiskLimits` 一样按 venue 建表 + 默认值兜底：
-
-```rust
-#[derive(Debug, Clone, Default)]
-pub struct FeeConfig {
-    pub taker_fee_bps: Decimal,
-    pub fee_discount: Decimal,
-}
-```
-
-估算公式：`fee = filled_qty_delta.abs() * fill_price * taker_fee_bps / 10000 * fee_discount`，
-仅当 `real_fee` 为 `None` 且 `fill_price` 非 `None` 时使用。`VenuePnl` 因此新增一个
-`fee_is_estimated: bool` 标记 (只要这个 venue+symbol 上有过一次估算兜底就置 `true`，见"数据
-类型")，避免估算值和真实值混在一起却让调用方误以为全是精确数字。`fill_price` 为 `None`
-时这笔成交跳过手续费和已实现盈亏统计 (只有 `PositionManager` 那边的数量记账不受影响)。
+Portfolio 曾经维护 `fees_paid`/`fees_paid_usdt`/`fees_usdt_incomplete`/`fee_is_estimated`
+四个字段，按交易所真实手续费优先、拿不到时用 `FeeConfig`(`taker_fee_bps`/`fee_discount`)
+估算兜底。这套估算逻辑已经移除：`OrderResult.fee`/`ExchangeOrderUpdate.fee` 拿到的手续费
+现在只用于换算 USDT 等值、冲减 `PositionManager` 侧的已实现盈亏 (`AdjustmentReason::FeeUsdt`，
+见 `order_manager/manager.rs`)，Portfolio 自己不再单独统计手续费金额。
 
 ### 3. PnlStore (持久化接口，和 PositionStore 同构)
 
@@ -376,15 +346,11 @@ pub struct FillOutcome {
     pub realized_pnl: Decimal,
 }
 
-/// 单个 (venue, symbol) 的已实现盈亏/手续费累计。
+/// 单个 (venue, symbol) 的已实现盈亏累计。
 pub struct VenuePnl {
     pub venue: Venue,
     pub symbol: Symbol,
     pub realized_pnl: Decimal,
-    pub fees_paid: Decimal,
-    /// 只要 fees_paid 里累加过一次 FeeConfig 估算值(而非交易所真实手续费)就
-    /// 置 true，提示调用方这个累计数不是全部来自交易所真实返还值。
-    pub fee_is_estimated: bool,
     pub trade_count: u64,
     pub updated_at_ms: u64,
 }
@@ -393,10 +359,9 @@ pub struct VenuePnl {
 pub struct AssetPnlSummary {
     pub asset: String,
     pub realized_pnl: Decimal,
-    pub fees_paid: Decimal,
     /// 来自 asset_valuation() 的浮动盈亏；缺行情时为 None，不当 0 处理。
     pub unrealized_pnl: Option<Decimal>,
-    /// realized_pnl - fees_paid + unrealized_pnl.unwrap_or(0)；缺行情时仍然
+    /// realized_pnl + unrealized_pnl.unwrap_or(0)；缺行情时仍然
     /// 给出这个值(只是不含浮动部分)，并靠 unrealized_pnl=None 提示调用方"这不是
     /// 全量"。
     pub net_pnl: Decimal,
@@ -439,15 +404,8 @@ let risk_engine = Arc::new(RiskEngine::new(risk_limits, position_manager.clone()
 let engine = ArbitrageEngine::new(strategies, sinks);
 let quote_cache = engine.shared_cache();
 
-// 手续费配置：从 config.toml 的 [[venues]] 里已有的 taker_fee_bps/fee_discount 转换
-let mut fee_config = HashMap::new();
-fee_config.insert(
-    Venue::new("binance_spot"),
-    FeeConfig { taker_fee_bps: Decimal::new(10, 2), fee_discount: Decimal::ONE }, // 0.1%
-);
-
 let pnl_store = Arc::new(InMemoryPnlStore::new());
-let portfolio = Arc::new(PortfolioManager::new(position_manager.clone(), pnl_store, quote_cache, fee_config));
+let portfolio = Arc::new(PortfolioManager::new(position_manager.clone(), pnl_store, quote_cache));
 
 // OrderManager 新增 portfolio 依赖
 let order_manager = Arc::new(OrderManager::new(risk_engine, execution_engine, event_tx, portfolio.clone()));
@@ -458,8 +416,8 @@ let order_manager = Arc::new(OrderManager::new(risk_engine, execution_engine, ev
 ```rust
 let summary = portfolio.asset_pnl("BTC");
 println!(
-    "BTC 已实现盈亏: {} 手续费: {} 净盈亏: {}",
-    summary.realized_pnl, summary.fees_paid, summary.net_pnl
+    "BTC 已实现盈亏: {} 净盈亏: {}",
+    summary.realized_pnl, summary.net_pnl
 );
 ```
 
@@ -503,11 +461,7 @@ for v in &valuation.venues {
   - 穿零反向 → 只对被平掉的旧仓位部分计已实现盈亏，新方向部分为 0
   - `fill_price = None` → 0 (不计算)
 - `PortfolioManager::record_fill`：
-  - `real_fee` 非 `None` 时直接记账，不走 `FeeConfig` 估算，`fee_is_estimated` 保持 `false`
-  - `real_fee` 为 `None` 时按 venue 配置估算，未配置的 venue 用默认 `FeeConfig`，
-    `fee_is_estimated` 置为 `true` 且后续调用不会被真实值覆盖回 `false`
-  - 多笔成交的 realized_pnl/fees_paid/trade_count 正确累加，真实值和估算值混合累加时
-    `fees_paid` 数值正确、`fee_is_estimated` 仍然是 `true`（只要出现过一次估算）
+  - 单笔/多笔成交的 realized_pnl/trade_count 正确累加
 - `asset_valuation`/`venue_valuation`：
   - mark price 命中时市值/浮动盈亏计算正确 (含空头方向验证)
   - 缺行情时对应字段是 `None` 而不是 0
@@ -521,7 +475,8 @@ for v in &valuation.venues {
 `fees` 数组) 接成真实手续费，只剩一块没做：
 - **Binance 合约**：新增合约 User Data Stream，接 `ORDER_TRADE_UPDATE` 事件的 `n`/`N`
   (或退一步定期拉取 `GET /fapi/v1/userTrades` 核对/补齐)。Kraken REST `AddOrder` 路径
-  仍会退化为估算，这是接口本身的同步限制，不是待办项。
+  拿不到真实手续费时，这笔成交就没有 fee 数据可用于冲减 `PositionManager` 的已实现
+  盈亏(不再有估算兜底)，这是接口本身的同步限制，不是待办项。
 
 ### 2. quote 资产/现金余额追踪 → 总账户权益
 需要先有余额查询能力 (`wallet::WalletProvider` 目前只有转账相关接口，没有余额查询)，
@@ -547,8 +502,8 @@ Portfolio 模块提供：
 - ✅ 按 `(venue, symbol)` / base 资产的市值 + 浮动盈亏 (复用 `ArbitrageEngine` 已有的
   行情缓存，不新增行情订阅)
 - ✅ 每笔成交的已实现盈亏 (由 `PositionManager::on_filled` 在原子更新内算出，避免并发
-  竞态) + 手续费累计统计，**真实值优先**(Binance 现货 REST/WS、Kraken WS)，拿不到时才
-  退化为估算(Binance 合约、Kraken REST `AddOrder`)，并用 `fee_is_estimated` 标记区分
+  竞态)；手续费不在 Portfolio 单独记账，而是换算成 USDT 等值后直接冲减
+  `PositionManager` 的已实现盈亏(见"手续费：只用于冲减已实现盈亏")
 - ✅ 对已有模块的改动降到最低：`PositionManager::on_filled`/`RiskEngine::on_filled`
   返回值从 `()` 变成 `FillOutcome`；`OrderResult`/`ExchangeOrderUpdate` 各新增
   `fee`/`fee_asset` 两个可选字段；`PositionStore`/风控规则完全不动

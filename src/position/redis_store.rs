@@ -6,10 +6,12 @@ use redis::Commands;
 
 use crate::types::{Symbol, Venue};
 
+use super::adjustment_log::{AdjustmentLog, AdjustmentRecord};
 use super::store::PositionStore;
 use super::types::VenuePosition;
 
 const POSITIONS_KEY: &str = "arb_scanner:positions";
+const ADJUSTMENTS_KEY: &str = "arb_scanner:positions_adjustments";
 
 /// `PositionStore` 的 Redis 实现：单个 Hash(`arb_scanner:positions`)，
 /// field=`"{venue}|{symbol}"`，value=JSON。`update()` 用 `Mutex<Connection>`
@@ -86,6 +88,38 @@ impl PositionStore for RedisPositionStore {
                 }
             }
             Err(err) => warn!("RedisPositionStore: failed to serialize field={field}: {err}"),
+        }
+    }
+}
+
+/// `AdjustmentLog` 的 Redis 实现：单个 List(`arb_scanner:positions_adjustments`)，
+/// `RPUSH` 追加 JSON，天生 append-only、允许无限增长——这正是当初不把审计
+/// 记录塞进热路径 `VenuePosition` 的原因，放在独立 key 里就没有这个顾虑。
+pub struct RedisAdjustmentLog {
+    conn: Mutex<redis::Connection>,
+}
+
+impl RedisAdjustmentLog {
+    pub fn new(redis_url: &str) -> anyhow::Result<Self> {
+        let client = redis::Client::open(redis_url).with_context(|| format!("invalid redis url: {redis_url}"))?;
+        let conn = client.get_connection().with_context(|| format!("failed to connect to redis at {redis_url}"))?;
+        Ok(Self { conn: Mutex::new(conn) })
+    }
+}
+
+impl AdjustmentLog for RedisAdjustmentLog {
+    fn record(&self, record: AdjustmentRecord) {
+        let json = match serde_json::to_string(&record) {
+            Ok(json) => json,
+            Err(err) => {
+                warn!("RedisAdjustmentLog: failed to serialize record: {err}");
+                return;
+            }
+        };
+        let mut conn = self.conn.lock().unwrap();
+        let result: redis::RedisResult<()> = conn.rpush(ADJUSTMENTS_KEY, json);
+        if let Err(err) = result {
+            warn!("RedisAdjustmentLog: failed to append record: {err}");
         }
     }
 }

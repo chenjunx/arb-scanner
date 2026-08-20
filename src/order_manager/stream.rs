@@ -25,7 +25,7 @@ pub struct ExchangeOrderUpdate {
     /// 本次推送(增量)对应的手续费，语义上对齐 Binance `executionReport` 的
     /// `n`/`N`——是这一次 fill_delta 的手续费，不是订单累计值，和 filled_qty/
     /// avg_price(累计值)刻意不同，调用方(OrderManager::handle_exchange_update)
-    /// 直接把它转发给 `portfolio.record_fill` 即可，不需要自己再做增量计算。
+    /// 用它换算 USDT 等值去冲减 `PositionManager` 的已实现盈亏。
     pub fee: Option<Decimal>,
     pub fee_asset: Option<String>,
     pub ts_ms: u64,

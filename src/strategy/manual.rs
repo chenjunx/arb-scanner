@@ -990,12 +990,8 @@ mod tests {
         let bus = Arc::new(TopicBus::new());
         let position_manager = Arc::new(PositionManager::new(Arc::new(InMemoryPositionStore::new())));
         let quote_cache = Arc::new(DashMap::new());
-        let portfolio = Arc::new(PortfolioManager::new(
-            position_manager.clone(),
-            Arc::new(InMemoryPnlStore::new()),
-            quote_cache,
-            HashMap::new(),
-        ));
+        let portfolio =
+            Arc::new(PortfolioManager::new(position_manager.clone(), Arc::new(InMemoryPnlStore::new()), quote_cache));
 
         let order_store = Arc::new(InMemoryOrderStore::new());
         let order_id_allocator = Arc::new(InMemoryOrderIdAllocator::new());

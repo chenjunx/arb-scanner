@@ -136,7 +136,7 @@ impl OrderProvider for BinanceOrderProvider {
     /// `fills` 靠 `#[serde(default)]` 缺省为空即可直接复用。这个接口本身不带
     /// 手续费(币安故意不在订单汇总查询里给逐笔成交明细)，成交了就再查一次
     /// `GET /api/v3/myTrades` 补真实手续费；那一步失败也不影响这里返回订单
-    /// 状态本身，只是手续费留空，交给 Portfolio 按 `FeeConfig` 估算兜底。
+    /// 状态本身，只是手续费留空。
     /// 用于 `wait_for_fill` 的 REST 兜底核对，以及 `reconcile-order` 命令。
     async fn query_order(&self, symbol: &Symbol, exchange_order_id: &str) -> anyhow::Result<OrderResult> {
         let params = vec![
@@ -285,8 +285,8 @@ struct OrderResponse {
 }
 
 /// 按 `commissionAsset` 分组求和；只有单一币种时才认为是可信的单一手续费值
-/// 返回 `Some`，混合多币种(如 BNB 抵扣额度中途用完)时返回 `None`，交给
-/// Portfolio 按 `FeeConfig` 估算兜底，不做加权处理。
+/// 返回 `Some`，混合多币种(如 BNB 抵扣额度中途用完)时返回 `None`，不做加权
+/// 处理。
 fn sum_fee_by_asset(fills: &[OrderFill]) -> (Option<Decimal>, Option<String>) {
     let mut totals: HashMap<&str, Decimal> = HashMap::new();
     for fill in fills {

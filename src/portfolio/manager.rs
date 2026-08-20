@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use dashmap::DashMap;
@@ -8,7 +7,7 @@ use crate::position::PositionManager;
 use crate::types::{Quote, Symbol, Venue};
 
 use super::store::PnlStore;
-use super::types::{AssetPnlSummary, AssetValuation, FeeConfig, VenuePnl, VenuePositionValuation};
+use super::types::{AssetPnlSummary, AssetValuation, VenuePnl, VenuePositionValuation};
 
 /// Portfolio 模块：在 `PositionManager` (仓位数量的唯一真相源) 之上提供两类
 /// 只读视图——mark-to-market 估值 (按最新行情算市值/浮动盈亏) 和已实现
@@ -18,8 +17,6 @@ pub struct PortfolioManager {
     position_manager: Arc<PositionManager>,
     pnl_store: Arc<dyn PnlStore>,
     quote_cache: Arc<DashMap<(Venue, Symbol), Quote>>,
-    fee_config: HashMap<Venue, FeeConfig>,
-    default_fee_config: FeeConfig,
 }
 
 impl PortfolioManager {
@@ -27,45 +24,13 @@ impl PortfolioManager {
         position_manager: Arc<PositionManager>,
         pnl_store: Arc<dyn PnlStore>,
         quote_cache: Arc<DashMap<(Venue, Symbol), Quote>>,
-        fee_config: HashMap<Venue, FeeConfig>,
     ) -> Self {
-        Self {
-            position_manager,
-            pnl_store,
-            quote_cache,
-            fee_config,
-            default_fee_config: FeeConfig::default(),
-        }
+        Self { position_manager, pnl_store, quote_cache }
     }
 
-    /// 成交后调用 (由 `OrderManager` 在拿到 `FillOutcome` 后转发)：`real_fee`
-    /// 非 `None` 时直接用交易所真实手续费，否则按 venue 的
-    /// `taker_fee_bps × fee_discount` 估算兜底 (需要 `fill_price` 才能估算；
-    /// 两者都缺时本次不计手续费，也不标记为估算)，连同 `realized_pnl` 一起
-    /// 累加进 `PnlStore`。
-    pub fn record_fill(
-        &self,
-        venue: &Venue,
-        symbol: &Symbol,
-        filled_qty_delta: Decimal,
-        fill_price: Option<Decimal>,
-        real_fee: Option<Decimal>,
-        fee_usdt: Option<Decimal>,
-        realized_pnl: Decimal,
-        ts_ms: u64,
-    ) {
-        let (fee, is_estimated) = match real_fee {
-            Some(fee) => (fee, false),
-            None => match fill_price {
-                Some(price) => {
-                    let cfg = self.fee_config.get(venue).copied().unwrap_or(self.default_fee_config);
-                    let fee = filled_qty_delta.abs() * price * cfg.taker_fee_bps / Decimal::new(10000, 0) * cfg.fee_discount;
-                    (fee, true)
-                }
-                None => (Decimal::ZERO, false),
-            },
-        };
-
+    /// 成交后调用 (由 `OrderManager` 在拿到 `FillOutcome` 后转发)：把
+    /// `realized_pnl` 累加进 `PnlStore`。
+    pub fn record_fill(&self, venue: &Venue, symbol: &Symbol, realized_pnl: Decimal, ts_ms: u64) {
         let venue_for_closure = venue.clone();
         let symbol_for_closure = symbol.clone();
         self.pnl_store.update(
@@ -75,48 +40,8 @@ impl PortfolioManager {
                 let mut pnl =
                     current.unwrap_or_else(|| VenuePnl::flat(venue_for_closure.clone(), symbol_for_closure.clone()));
                 pnl.realized_pnl += realized_pnl;
-                pnl.fees_paid += fee;
-                if let Some(usdt) = fee_usdt {
-                    pnl.fees_paid_usdt += usdt;
-                }
-                pnl.fee_is_estimated = pnl.fee_is_estimated || is_estimated;
                 pnl.trade_count += 1;
                 pnl.updated_at_ms = ts_ms;
-                pnl
-            }),
-        );
-    }
-
-    /// 后台异步查价(`pricing::FeeUsdtConverter::query_async`)成功后调用，
-    /// 把换算出的 USDT 等值补记到 `fees_paid_usdt`。与 `record_fill` 走独立的
-    /// 原子 `pnl_store.update`，因为查价结果回来时这笔成交早已经处理完。
-    pub fn apply_fee_usdt(&self, venue: &Venue, symbol: &Symbol, amount_usdt: Decimal) {
-        let venue_for_closure = venue.clone();
-        let symbol_for_closure = symbol.clone();
-        self.pnl_store.update(
-            venue,
-            symbol,
-            Box::new(move |current| {
-                let mut pnl =
-                    current.unwrap_or_else(|| VenuePnl::flat(venue_for_closure.clone(), symbol_for_closure.clone()));
-                pnl.fees_paid_usdt += amount_usdt;
-                pnl
-            }),
-        );
-    }
-
-    /// 后台异步查价失败，或找不到对应 venue 的 `OrderProvider` 时调用，标记
-    /// 这个 (venue, symbol) 的 `fees_paid_usdt` 可能不完整，不当 0 处理。
-    pub fn mark_fee_usdt_incomplete(&self, venue: &Venue, symbol: &Symbol) {
-        let venue_for_closure = venue.clone();
-        let symbol_for_closure = symbol.clone();
-        self.pnl_store.update(
-            venue,
-            symbol,
-            Box::new(move |current| {
-                let mut pnl =
-                    current.unwrap_or_else(|| VenuePnl::flat(venue_for_closure.clone(), symbol_for_closure.clone()));
-                pnl.fees_usdt_incomplete = true;
                 pnl
             }),
         );
@@ -126,60 +51,21 @@ impl PortfolioManager {
         self.pnl_store.get(venue, symbol)
     }
 
-    /// 永续合约资金费到账后调用(由 `accounting::FundingFeeTracker` 定期轮询交易
-    /// 所资金费流水后转发)：`amount` 正=收到、负=支付，累加进 `PnlStore` 的
-    /// `funding_pnl`，不影响 `trade_count`(那是成交笔数，资金费不是成交)。
-    pub fn record_funding_fee(&self, venue: &Venue, symbol: &Symbol, amount: Decimal, ts_ms: u64) {
-        let venue_for_closure = venue.clone();
-        let symbol_for_closure = symbol.clone();
-        self.pnl_store.update(
-            venue,
-            symbol,
-            Box::new(move |current| {
-                let mut pnl =
-                    current.unwrap_or_else(|| VenuePnl::flat(venue_for_closure.clone(), symbol_for_closure.clone()));
-                pnl.funding_pnl += amount;
-                pnl.updated_at_ms = ts_ms;
-                pnl
-            }),
-        );
-    }
-
-    /// 按 base 资产聚合已实现盈亏/手续费/资金费，并拼上 `asset_valuation` 算出
-    /// 的浮动盈亏。`unrealized_pnl` 缺行情时为 `None`，`net_pnl` 仍然给出不含
-    /// 浮动部分的值。
+    /// 按 base 资产聚合已实现盈亏/手续费，并拼上 `asset_valuation` 算出的浮动
+    /// 盈亏。`unrealized_pnl` 缺行情时为 `None`，`net_pnl` 仍然给出不含浮动
+    /// 部分的值。
     pub fn asset_pnl(&self, asset: &str) -> AssetPnlSummary {
-        let (realized_pnl, fees_paid, fees_paid_usdt, fees_usdt_incomplete, funding_pnl) = self
+        let realized_pnl = self
             .pnl_store
             .all()
             .into_iter()
             .filter(|p| p.symbol.base.as_ref().eq_ignore_ascii_case(asset))
-            .fold(
-                (Decimal::ZERO, Decimal::ZERO, Decimal::ZERO, false, Decimal::ZERO),
-                |(realized, fees, fees_usdt, incomplete, funding), p| {
-                    (
-                        realized + p.realized_pnl,
-                        fees + p.fees_paid,
-                        fees_usdt + p.fees_paid_usdt,
-                        incomplete || p.fees_usdt_incomplete,
-                        funding + p.funding_pnl,
-                    )
-                },
-            );
+            .fold(Decimal::ZERO, |realized, p| realized + p.realized_pnl);
 
         let unrealized_pnl = self.asset_valuation(asset).unrealized_pnl;
-        let net_pnl = realized_pnl - fees_paid + funding_pnl + unrealized_pnl.unwrap_or(Decimal::ZERO);
+        let net_pnl = realized_pnl + unrealized_pnl.unwrap_or(Decimal::ZERO);
 
-        AssetPnlSummary {
-            asset: asset.to_string(),
-            realized_pnl,
-            fees_paid,
-            fees_paid_usdt,
-            fees_usdt_incomplete,
-            funding_pnl,
-            unrealized_pnl,
-            net_pnl,
-        }
+        AssetPnlSummary { asset: asset.to_string(), realized_pnl, unrealized_pnl, net_pnl }
     }
 
     /// mark-to-market: `mid = (bid+ask)/2`，`market_value = net_qty * mid`，
@@ -270,80 +156,24 @@ mod tests {
 
     fn manager() -> (PortfolioManager, Arc<PositionManager>) {
         let pm = Arc::new(PositionManager::new(Arc::new(InMemoryPositionStore::new())));
-        let portfolio = PortfolioManager::new(
-            pm.clone(),
-            Arc::new(InMemoryPnlStore::new()),
-            Arc::new(DashMap::new()),
-            HashMap::new(),
-        );
+        let portfolio = PortfolioManager::new(pm.clone(), Arc::new(InMemoryPnlStore::new()), Arc::new(DashMap::new()));
         (portfolio, pm)
     }
 
     #[test]
-    fn record_fill_uses_real_fee_when_present() {
+    fn record_fill_accumulates_realized_pnl_and_trade_count() {
         let (portfolio, _pm) = manager();
-        portfolio.record_fill(
-            &venue(),
-            &symbol(),
-            Decimal::ONE,
-            Some(Decimal::new(50000, 0)),
-            Some(Decimal::new(5, 0)),
-            None,
-            Decimal::ZERO,
-            1,
-        );
+        portfolio.record_fill(&venue(), &symbol(), Decimal::ZERO, 1);
 
         let pnl = portfolio.venue_pnl(&venue(), &symbol()).unwrap();
-        assert_eq!(pnl.fees_paid, Decimal::new(5, 0));
-        assert!(!pnl.fee_is_estimated);
         assert_eq!(pnl.trade_count, 1);
-    }
-
-    #[test]
-    fn record_fill_estimates_fee_when_real_fee_missing() {
-        let mut fee_config = HashMap::new();
-        fee_config.insert(venue(), FeeConfig { taker_fee_bps: Decimal::new(10, 0), fee_discount: Decimal::ONE });
-        let portfolio = PortfolioManager::new(
-            Arc::new(PositionManager::new(Arc::new(InMemoryPositionStore::new()))),
-            Arc::new(InMemoryPnlStore::new()),
-            Arc::new(DashMap::new()),
-            fee_config,
-        );
-
-        // 1.0 BTC @ 50000, 10 bps -> fee = 1.0 * 50000 * 10 / 10000 = 50
-        portfolio.record_fill(&venue(), &symbol(), Decimal::ONE, Some(Decimal::new(50000, 0)), None, None, Decimal::ZERO, 1);
-
-        let pnl = portfolio.venue_pnl(&venue(), &symbol()).unwrap();
-        assert_eq!(pnl.fees_paid, Decimal::new(50, 0));
-        assert!(pnl.fee_is_estimated);
-    }
-
-    #[test]
-    fn record_fill_estimation_stays_sticky_after_real_fee_seen_later() {
-        let (portfolio, _pm) = manager();
-        portfolio.record_fill(&venue(), &symbol(), Decimal::ONE, Some(Decimal::new(50000, 0)), None, None, Decimal::ZERO, 1);
-        portfolio.record_fill(&venue(), &symbol(), Decimal::ONE, Some(Decimal::new(50000, 0)), Some(Decimal::new(5, 0)), None, Decimal::ZERO, 2);
-
-        let pnl = portfolio.venue_pnl(&venue(), &symbol()).unwrap();
-        assert!(pnl.fee_is_estimated);
-        assert_eq!(pnl.trade_count, 2);
-    }
-
-    #[test]
-    fn record_fill_without_real_fee_or_price_records_zero_fee() {
-        let (portfolio, _pm) = manager();
-        portfolio.record_fill(&venue(), &symbol(), Decimal::ONE, None, None, None, Decimal::ZERO, 1);
-
-        let pnl = portfolio.venue_pnl(&venue(), &symbol()).unwrap();
-        assert_eq!(pnl.fees_paid, Decimal::ZERO);
-        assert!(!pnl.fee_is_estimated);
     }
 
     #[test]
     fn record_fill_accumulates_realized_pnl_across_multiple_fills() {
         let (portfolio, _pm) = manager();
-        portfolio.record_fill(&venue(), &symbol(), Decimal::ONE, Some(Decimal::new(50000, 0)), None, None, Decimal::new(100, 0), 1);
-        portfolio.record_fill(&venue(), &symbol(), Decimal::ONE, Some(Decimal::new(50000, 0)), None, None, Decimal::new(50, 0), 2);
+        portfolio.record_fill(&venue(), &symbol(), Decimal::new(100, 0), 1);
+        portfolio.record_fill(&venue(), &symbol(), Decimal::new(50, 0), 2);
 
         let pnl = portfolio.venue_pnl(&venue(), &symbol()).unwrap();
         assert_eq!(pnl.realized_pnl, Decimal::new(150, 0));
@@ -372,7 +202,7 @@ mod tests {
     fn venue_valuation_computes_market_value_and_unrealized_pnl_with_quote() {
         let pm = Arc::new(PositionManager::new(Arc::new(InMemoryPositionStore::new())));
         let quote_cache = Arc::new(DashMap::new());
-        let portfolio = PortfolioManager::new(pm.clone(), Arc::new(InMemoryPnlStore::new()), quote_cache.clone(), HashMap::new());
+        let portfolio = PortfolioManager::new(pm.clone(), Arc::new(InMemoryPnlStore::new()), quote_cache.clone());
 
         pm.on_filled(&venue(), &symbol(), OrderSide::Buy, Decimal::ONE, Some(Decimal::new(50000, 0)), None, None, None, 1);
         quote_cache.insert(
@@ -396,7 +226,7 @@ mod tests {
     fn venue_valuation_handles_short_position() {
         let pm = Arc::new(PositionManager::new(Arc::new(InMemoryPositionStore::new())));
         let quote_cache = Arc::new(DashMap::new());
-        let portfolio = PortfolioManager::new(pm.clone(), Arc::new(InMemoryPnlStore::new()), quote_cache.clone(), HashMap::new());
+        let portfolio = PortfolioManager::new(pm.clone(), Arc::new(InMemoryPnlStore::new()), quote_cache.clone());
 
         pm.on_filled(&venue(), &symbol(), OrderSide::Sell, Decimal::ONE, Some(Decimal::new(50000, 0)), None, None, None, 1);
         quote_cache.insert(
@@ -422,7 +252,7 @@ mod tests {
     fn asset_valuation_aggregates_across_venues_when_all_priced() {
         let pm = Arc::new(PositionManager::new(Arc::new(InMemoryPositionStore::new())));
         let quote_cache = Arc::new(DashMap::new());
-        let portfolio = PortfolioManager::new(pm.clone(), Arc::new(InMemoryPnlStore::new()), quote_cache.clone(), HashMap::new());
+        let portfolio = PortfolioManager::new(pm.clone(), Arc::new(InMemoryPnlStore::new()), quote_cache.clone());
 
         let binance = Venue::new("binance_spot");
         let kraken = Venue::new("kraken_spot");
@@ -451,7 +281,7 @@ mod tests {
     fn asset_valuation_is_none_market_value_when_any_venue_missing_quote() {
         let pm = Arc::new(PositionManager::new(Arc::new(InMemoryPositionStore::new())));
         let quote_cache = Arc::new(DashMap::new());
-        let portfolio = PortfolioManager::new(pm.clone(), Arc::new(InMemoryPnlStore::new()), quote_cache.clone(), HashMap::new());
+        let portfolio = PortfolioManager::new(pm.clone(), Arc::new(InMemoryPnlStore::new()), quote_cache.clone());
 
         let binance = Venue::new("binance_spot");
         let kraken = Venue::new("kraken_spot");
@@ -475,46 +305,17 @@ mod tests {
     }
 
     #[test]
-    fn asset_pnl_aggregates_realized_and_fees_across_venues() {
+    fn asset_pnl_aggregates_realized_pnl_across_venues() {
         let (portfolio, _pm) = manager();
         let binance = Venue::new("binance_spot");
         let kraken = Venue::new("kraken_spot");
-        portfolio.record_fill(&binance, &symbol(), Decimal::ONE, Some(Decimal::new(50000, 0)), Some(Decimal::new(5, 0)), None, Decimal::new(100, 0), 1);
-        portfolio.record_fill(&kraken, &symbol(), Decimal::ONE, Some(Decimal::new(50000, 0)), Some(Decimal::new(3, 0)), None, Decimal::new(50, 0), 2);
+        portfolio.record_fill(&binance, &symbol(), Decimal::new(100, 0), 1);
+        portfolio.record_fill(&kraken, &symbol(), Decimal::new(50, 0), 2);
 
         let summary = portfolio.asset_pnl("BTC");
         assert_eq!(summary.realized_pnl, Decimal::new(150, 0));
-        assert_eq!(summary.fees_paid, Decimal::new(8, 0));
         assert_eq!(summary.unrealized_pnl, None);
-        assert_eq!(summary.net_pnl, Decimal::new(142, 0));
+        assert_eq!(summary.net_pnl, Decimal::new(150, 0));
     }
 
-    #[test]
-    fn record_funding_fee_accumulates_and_updates_timestamp() {
-        let (portfolio, _pm) = manager();
-        portfolio.record_funding_fee(&venue(), &symbol(), Decimal::new(-5, 1), 1);
-        portfolio.record_funding_fee(&venue(), &symbol(), Decimal::new(8, 1), 2);
-
-        let pnl = portfolio.venue_pnl(&venue(), &symbol()).unwrap();
-        assert_eq!(pnl.funding_pnl, Decimal::new(3, 1));
-        assert_eq!(pnl.updated_at_ms, 2);
-        // 资金费不是成交，不应该影响 trade_count/fees_paid/realized_pnl
-        assert_eq!(pnl.trade_count, 0);
-        assert_eq!(pnl.fees_paid, Decimal::ZERO);
-        assert_eq!(pnl.realized_pnl, Decimal::ZERO);
-    }
-
-    #[test]
-    fn asset_pnl_includes_funding_pnl_in_net_pnl() {
-        let (portfolio, _pm) = manager();
-        let binance = Venue::new("binance_spot");
-        let futures = Venue::new("binance_futures");
-        portfolio.record_fill(&binance, &symbol(), Decimal::ONE, Some(Decimal::new(50000, 0)), Some(Decimal::new(5, 0)), None, Decimal::new(100, 0), 1);
-        portfolio.record_funding_fee(&futures, &symbol(), Decimal::new(-15, 1), 2);
-
-        let summary = portfolio.asset_pnl("BTC");
-        assert_eq!(summary.funding_pnl, Decimal::new(-15, 1));
-        // net_pnl = realized_pnl(100) - fees_paid(5) + funding_pnl(-1.5) = 93.5
-        assert_eq!(summary.net_pnl, Decimal::new(935, 1));
-    }
 }

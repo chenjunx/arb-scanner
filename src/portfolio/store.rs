@@ -75,12 +75,7 @@ mod tests {
                     venue: Venue::new("binance_spot"),
                     symbol: Symbol::new("BTC", "USDT"),
                     realized_pnl: Decimal::ONE,
-                    fees_paid: Decimal::ZERO,
-                    fees_paid_usdt: Decimal::ZERO,
-                    fees_usdt_incomplete: false,
-                    fee_is_estimated: false,
                     trade_count: 1,
-                    funding_pnl: Decimal::ZERO,
                     updated_at_ms: 1,
                 }
             }),

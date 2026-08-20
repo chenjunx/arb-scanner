@@ -222,7 +222,7 @@ cargo run -- close --symbol BTC/USDT --kraken-spot-qty 0.005 --live
 
 ## 资金费追踪（`accounting` 子命令）
 
-独立常驻进程：定期轮询交易所资金费流水，累加进 `PortfolioManager` 的 `PnlStore`（`funding_pnl` 字段）。跟踪对象是 `PositionManager`（Redis 支撑）里每次轮询时读到的**当前非零仓位**，而不是启动时固定的一份列表，所以 `open`/`close` 开平的期货仓位不需要重启这个进程就能被自动跟踪/停止跟踪。如果 `monitor` 已经在跑且没加 `--no-portfolio`，通常不需要单独起本命令；只需要资金费追踪、不想启动价差扫描和行情连接时单独使用。
+独立常驻进程：定期轮询交易所资金费流水，通过 `PositionManager::apply_adjustment`（`AdjustmentReason::Funding`）累加进对应仓位的 `realized_pnl`。跟踪对象是 `PositionManager`（Redis 支撑）里每次轮询时读到的**当前非零仓位**，而不是启动时固定的一份列表，所以 `open`/`close` 开平的期货仓位不需要重启这个进程就能被自动跟踪/停止跟踪。如果 `monitor` 已经在跑且没加 `--no-portfolio`，通常不需要单独起本命令；只需要资金费追踪、不想启动价差扫描和行情连接时单独使用。
 
 ```bash
 cargo run -- accounting
@@ -234,7 +234,7 @@ cargo run -- accounting --testnet --interval-secs 900 --initial-lookback-hours 7
 - `--interval-secs <secs>`（可选，默认 1800）：轮询间隔。
 - `--initial-lookback-hours <hours>`（可选，默认 168）：某个 `(venue, symbol)` 第一次被轮询、还没有游标时往回补多久的历史资金费记录。
 
-流程：每次 tick 从 `PositionManager::all_positions()` 重新读非零仓位，按 venue 找对应的 `FundingFeeProvider`（目前只注册了 `binance_futures` 一家）；用 Redis 里的游标（`arb_scanner:funding_cursor` Hash，field=`"{venue}|{symbol}"`，同时存 `last_time_ms`/`last_tran_id`，因为 Binance 只能按时间范围查、没有增量参数）算出本次查询起点，拉回流水后按 `tran_id` 过滤掉已入账的记录，累加进 PnL，游标推进到最新位置。
+流程：每次 tick 从 `PositionManager::all_positions()` 重新读非零仓位，按 venue 找对应的 `FundingFeeProvider`（目前只注册了 `binance_futures` 一家）；用 Redis 里的游标（`arb_scanner:funding_cursor` Hash，field=`"{venue}|{symbol}"`，同时存 `last_time_ms`/`last_tran_id`，因为 Binance 只能按时间范围查、没有增量参数）算出本次查询起点，拉回流水后按 `tran_id` 过滤掉已入账的记录，累加进仓位已实现盈亏（`PositionManager::apply_adjustment`），游标推进到最新位置。
 
 依赖 `REDIS_URL`（默认 `redis://127.0.0.1:6379/`）连接 `RedisPositionStore`/`RedisPnlStore`/`RedisFundingCursorStore`，凭证走 `BINANCE_API_KEY`/`BINANCE_API_SECRET`。跑起来后一直轮询直到 ctrl-c。
 
@@ -251,7 +251,7 @@ cargo run -- report --interval-secs 60
 - `--interval-secs <secs>`（可选，默认 300）：报告生成/分发间隔。
 
 三个内置 section（各自实现 `ReportSection` trait，`render()` 是同步方法）：
-- **投资组合盈亏**：按 base 资产聚合，列出 `net_qty`/`market_value`(N/A)/`realized_pnl`/`fees_paid`/`funding_pnl`/`unrealized_pnl`(N/A)/`net_pnl`。资产列表从当前持仓里出现过的 symbol.base 去重得到。
+- **投资组合盈亏**：按 base 资产聚合，列出 `net_qty`/`market_value`(N/A)/`realized_pnl`/`fees_paid`/`unrealized_pnl`(N/A)/`net_pnl`。资产列表从当前持仓里出现过的 symbol.base 去重得到。
 - **仓位明细**：按 venue+symbol 列出当前非零仓位的净数量和均价，已平仓的记录不列出。
 - **订单概览**：订单状态计数（New/PartiallyFilled/Filled/Rejected/Expired）+ 最近挂单明细（最多列 20 条），直接读 `OrderStore`（跨进程可见的实时数据），而不是 `OrderManager` 进程内存态。
 

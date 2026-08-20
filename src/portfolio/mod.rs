@@ -6,4 +6,4 @@ pub mod types;
 pub use manager::PortfolioManager;
 pub use redis_store::RedisPnlStore;
 pub use store::{InMemoryPnlStore, PnlStore};
-pub use types::{AssetPnlSummary, AssetValuation, FeeConfig, VenuePnl, VenuePositionValuation};
+pub use types::{AssetPnlSummary, AssetValuation, VenuePnl, VenuePositionValuation};

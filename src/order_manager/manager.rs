@@ -6,7 +6,7 @@ use rust_decimal::Decimal;
 
 use crate::order::types::OrderStatus;
 use crate::portfolio::PortfolioManager;
-use crate::position::PositionManager;
+use crate::position::{AdjustmentReason, PositionManager};
 use crate::pricing::FeeUsdtConverter;
 use crate::topic::{Topic, TopicBus};
 
@@ -163,16 +163,7 @@ impl OrderManager {
                 fee_usdt_sync,
                 update.ts_ms,
             );
-            self.portfolio.record_fill(
-                &venue,
-                &symbol,
-                fill_delta,
-                avg_price,
-                update.fee,
-                fee_usdt_sync,
-                outcome.realized_pnl,
-                update.ts_ms,
-            );
+            self.portfolio.record_fill(&venue, &symbol, outcome.realized_pnl, update.ts_ms);
 
             // 同步解不出来但确实有手续费 → 后台异步查价，不阻塞下面的事件发布
             if fee_usdt_sync.is_none() {
@@ -182,17 +173,11 @@ impl OrderManager {
                     let venue = venue.clone();
                     let symbol = symbol.clone();
                     let position_manager = self.position_manager.clone();
-                    let portfolio = self.portfolio.clone();
+                    let ts_ms = update.ts_ms;
                     tokio::spawn(async move {
-                        match converter.query_async(&venue, &asset, amount).await {
-                            Some(usdt) => {
-                                position_manager.apply_fee_usdt(&venue, &symbol, usdt);
-                                portfolio.apply_fee_usdt(&venue, &symbol, usdt);
-                            }
-                            None => {
-                                position_manager.mark_fee_usdt_incomplete(&venue, &symbol);
-                                portfolio.mark_fee_usdt_incomplete(&venue, &symbol);
-                            }
+                        if let Some(usdt) = converter.query_async(&venue, &asset, amount).await {
+                            // 手续费是成本，冲减已实现盈亏用负数
+                            position_manager.apply_adjustment(&venue, &symbol, -usdt, AdjustmentReason::FeeUsdt, ts_ms);
                         }
                     });
                 }

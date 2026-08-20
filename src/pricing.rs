@@ -44,8 +44,7 @@ impl FeeUsdtConverter {
 
     /// 向手续费实际产生的那个交易所(`venue`)发起 REST 请求查 `fee_asset` 现价，
     /// 换算成 USDT 等值。找不到对应 provider、或查价请求本身失败，都记录
-    /// warn 日志并返回 `None`——调用方据此把这笔手续费标记为"换算未完成"
-    /// (`fees_usdt_incomplete`)，不当 0 处理。
+    /// warn 日志并返回 `None`，调用方据此跳过这笔手续费的冲减。
     pub async fn query_async(&self, venue: &Venue, fee_asset: &str, fee_amount: Decimal) -> Option<Decimal> {
         let Some(provider) = self.providers.get(venue) else {
             warn!("pricing: no OrderProvider registered for venue={venue}, cannot convert fee_asset={fee_asset} to USDT");

@@ -1,5 +1,6 @@
 pub mod binance;
 pub mod binance_futures;
+pub mod cache;
 pub mod kraken;
 pub mod mock;
 

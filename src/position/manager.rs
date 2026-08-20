@@ -1,28 +1,42 @@
 use std::sync::{Arc, Mutex};
 
+use log::info;
 use rust_decimal::prelude::Signed;
 use rust_decimal::Decimal;
 
 use crate::order::types::OrderSide;
 use crate::types::{Symbol, Venue};
 
+use super::adjustment_log::{AdjustmentLog, AdjustmentRecord, InMemoryAdjustmentLog};
 use super::store::PositionStore;
-use super::types::{AssetExposure, FillOutcome, VenuePosition};
+use super::types::{AdjustmentReason, AssetExposure, FillOutcome, VenuePosition};
 
 /// 跨交易所/跨产品的统一持仓视图。写入口是 `on_filled` (由 `RiskEngine`/
 /// `OrderManager` 在订单成交后调用)，查询接口按 `(venue, symbol)` 或按
 /// base 资产聚合两种粒度提供。见 `docs/position_manager_design.md`。
 pub struct PositionManager {
     store: Arc<dyn PositionStore>,
+    adjustment_log: Arc<dyn AdjustmentLog>,
 }
 
 impl PositionManager {
     pub fn new(store: Arc<dyn PositionStore>) -> Self {
-        Self { store }
+        Self { store, adjustment_log: Arc::new(InMemoryAdjustmentLog::new()) }
+    }
+
+    /// 接入生产用的审计日志实现(如 `RedisAdjustmentLog`)，默认是纯内存、
+    /// 重启即丢的 `InMemoryAdjustmentLog`——绝大多数调用点(测试代码、
+    /// Redis-free 的 dry-run 路径)不需要关心这个，只有唯一的生产接线点
+    /// (`main.rs::build_portfolio_stack`)需要显式调用。
+    pub fn with_adjustment_log(mut self, log: Arc<dyn AdjustmentLog>) -> Self {
+        self.adjustment_log = log;
+        self
     }
 
     /// 订单成交后调用，按增量成交量 (不是累计值) + 本次成交价更新净仓位和
-    /// 加权平均建仓价，并把这笔成交对旧仓位实现的盈亏通过 `FillOutcome` 带出去。
+    /// 加权平均建仓价，把这笔成交对旧仓位实现的盈亏累加进
+    /// `VenuePosition::realized_pnl`，同时通过 `FillOutcome` 把同一笔盈亏带
+    /// 出去给 `PortfolioManager` 独立累计(两份账本应当始终相等)。
     /// `fill_price` 为 `None` 时 (极少数场景下交易所推送没带价格) 只更新数量，
     /// 均价保持不变，也不计已实现盈亏。
     ///
@@ -71,7 +85,9 @@ impl PositionManager {
                     if !old_qty.is_zero() && old_qty.signum() != signed_delta.signum() {
                         if let Some(avg) = old_avg {
                             let closed_qty = signed_delta.abs().min(old_qty.abs());
-                            *slot.lock().unwrap() = closed_qty * (price - avg) * old_qty.signum();
+                            let realized = closed_qty * (price - avg) * old_qty.signum();
+                            *slot.lock().unwrap() = realized;
+                            pos.realized_pnl += realized;
                         }
                     }
                 }
@@ -96,12 +112,9 @@ impl PositionManager {
                     }
                 };
 
-                // 累加手续费
+                // 累加手续费（原始币种，独立于 realized_pnl）
                 if let (Some(fee_amt), Some(asset)) = (fee, fee_asset_for_closure.as_ref()) {
                     *pos.total_fees.entry(asset.clone()).or_insert(Decimal::ZERO) += fee_amt;
-                }
-                if let Some(usdt) = fee_usdt {
-                    pos.total_fees_usdt += usdt;
                 }
 
                 pos.net_qty = new_qty;
@@ -109,6 +122,14 @@ impl PositionManager {
                 pos
             }),
         );
+
+        // 手续费的 USDT 等值若在这次成交里就能同步解出来，走 `apply_adjustment`
+        // 冲减 realized_pnl（手续费是成本，取负）；异步才能解出的情形（如
+        // BNB/KFEE 需要查价）由调用方在查到价格后另外调 `apply_adjustment`。
+        // 不管同步还是异步，最终都收敛到同一个方法，审计记录也统一由它写。
+        if let Some(usdt) = fee_usdt {
+            self.apply_adjustment(venue, symbol, -usdt, AdjustmentReason::FeeUsdt, ts_ms);
+        }
 
         FillOutcome {
             realized_pnl: *realized_pnl_slot.lock().unwrap(),
@@ -120,39 +141,52 @@ impl PositionManager {
         }
     }
 
-    /// 后台异步查价(`pricing::FeeUsdtConverter::query_async`)成功后调用，
-    /// 把换算出的 USDT 等值补记到 `total_fees_usdt`。与 `on_filled` 走独立的
-    /// 原子 `store.update`，因为查价结果回来时这笔成交早已经处理完。
-    pub fn apply_fee_usdt(&self, venue: &Venue, symbol: &Symbol, amount_usdt: Decimal) {
+    /// 记录一笔非成交导致的已实现盈亏调整（资金费结算、手续费换算成 USDT 后
+    /// 冲减盈亏、人工修正等）。直接累加到 `VenuePosition::realized_pnl`，不碰
+    /// net_qty/avg_price；符号由调用方决定（例如手续费传负数），这里只管做加法。
+    ///
+    /// 和 `on_filled` 一样，加法必须写在 `store.update` 传入闭包的内部（用闭包参数
+    /// `current`，而不是在调用 `apply_adjustment` 之前由外部先查一次 `realized_pnl`
+    /// 自己算好新值再传进来）——闭包内部的读改写是原子的一步，闭包外部"先查后传"
+    /// 则会在并发的另一次 `on_filled`/`apply_adjustment`（同一 venue+symbol，例如
+    /// 两笔手续费换算结果前后脚回调）之间留出竞态窗口，导致其中一次更新被覆盖丢失。
+    pub fn apply_adjustment(
+        &self,
+        venue: &Venue,
+        symbol: &Symbol,
+        amount: Decimal,
+        reason: AdjustmentReason,
+        ts_ms: u64,
+    ) {
+        info!("position: non-fill realized_pnl adjustment venue={venue} symbol={symbol} amount={amount} reason={reason:?}");
         let venue_for_closure = venue.clone();
         let symbol_for_closure = symbol.clone();
+        let before_after_slot = Arc::new(Mutex::new((Decimal::ZERO, Decimal::ZERO)));
+        let slot = before_after_slot.clone();
         self.store.update(
             venue,
             symbol,
             Box::new(move |current: Option<VenuePosition>| {
                 let mut pos =
                     current.unwrap_or_else(|| VenuePosition::flat(venue_for_closure.clone(), symbol_for_closure.clone()));
-                pos.total_fees_usdt += amount_usdt;
+                let before = pos.realized_pnl;
+                pos.realized_pnl += amount;
+                *slot.lock().unwrap() = (before, pos.realized_pnl);
+                pos.updated_at_ms = ts_ms;
                 pos
             }),
         );
-    }
 
-    /// 后台异步查价失败，或找不到对应 venue 的 `OrderProvider` 时调用，标记
-    /// 这个 (venue, symbol) 的 `total_fees_usdt` 可能不完整，不当 0 处理。
-    pub fn mark_fee_usdt_incomplete(&self, venue: &Venue, symbol: &Symbol) {
-        let venue_for_closure = venue.clone();
-        let symbol_for_closure = symbol.clone();
-        self.store.update(
-            venue,
-            symbol,
-            Box::new(move |current: Option<VenuePosition>| {
-                let mut pos =
-                    current.unwrap_or_else(|| VenuePosition::flat(venue_for_closure.clone(), symbol_for_closure.clone()));
-                pos.fees_usdt_incomplete = true;
-                pos
-            }),
-        );
+        let (realized_pnl_before, realized_pnl_after) = *before_after_slot.lock().unwrap();
+        self.adjustment_log.record(AdjustmentRecord {
+            venue: venue.clone(),
+            symbol: symbol.clone(),
+            amount,
+            reason,
+            realized_pnl_before,
+            realized_pnl_after,
+            ts_ms,
+        });
     }
 
     /// 单个 venue+symbol 的净数量 (正=多头，负=空头)。
@@ -334,6 +368,7 @@ mod tests {
 
         let outcome = pm.on_filled(&venue, &symbol, OrderSide::Buy, Decimal::new(5, 1), Some(Decimal::new(50000, 0)), None, None, None, 1);
         assert_eq!(outcome.realized_pnl, Decimal::ZERO);
+        assert_eq!(pm.venue_position(&venue, &symbol).unwrap().realized_pnl, Decimal::ZERO);
     }
 
     #[test]
@@ -345,6 +380,7 @@ mod tests {
         pm.on_filled(&venue, &symbol, OrderSide::Buy, Decimal::new(5, 1), Some(Decimal::new(50000, 0)), None, None, None, 1);
         let outcome = pm.on_filled(&venue, &symbol, OrderSide::Buy, Decimal::new(5, 1), Some(Decimal::new(60000, 0)), None, None, None, 2);
         assert_eq!(outcome.realized_pnl, Decimal::ZERO);
+        assert_eq!(pm.venue_position(&venue, &symbol).unwrap().realized_pnl, Decimal::ZERO);
     }
 
     #[test]
@@ -358,6 +394,7 @@ mod tests {
         // 卖 0.4 BTC @ 70000 -> 已实现盈亏 = 0.4 * (70000 - 50000) * 1 = 8000
         let outcome = pm.on_filled(&venue, &symbol, OrderSide::Sell, Decimal::new(4, 1), Some(Decimal::new(70000, 0)), None, None, None, 2);
         assert_eq!(outcome.realized_pnl, Decimal::new(8000, 0));
+        assert_eq!(pm.venue_position(&venue, &symbol).unwrap().realized_pnl, Decimal::new(8000, 0));
     }
 
     #[test]
@@ -372,6 +409,23 @@ mod tests {
         // 反向新开的 0.5 空头不计入。
         let outcome = pm.on_filled(&venue, &symbol, OrderSide::Sell, Decimal::new(15, 1), Some(Decimal::new(60000, 0)), None, None, None, 2);
         assert_eq!(outcome.realized_pnl, Decimal::new(10000, 0));
+        assert_eq!(pm.venue_position(&venue, &symbol).unwrap().realized_pnl, Decimal::new(10000, 0));
+    }
+
+    #[test]
+    fn realized_pnl_accumulates_across_multiple_reducing_fills() {
+        let pm = manager();
+        let venue = Venue::new("binance_spot");
+        let symbol = Symbol::new("BTC", "USDT");
+
+        // 多 1.0 BTC @ 50000
+        pm.on_filled(&venue, &symbol, OrderSide::Buy, Decimal::ONE, Some(Decimal::new(50000, 0)), None, None, None, 1);
+        // 卖 0.4 BTC @ 70000 -> 已实现盈亏 = 0.4 * 20000 = 8000
+        pm.on_filled(&venue, &symbol, OrderSide::Sell, Decimal::new(4, 1), Some(Decimal::new(70000, 0)), None, None, None, 2);
+        // 再卖 0.6 BTC @ 40000 -> 已实现盈亏 = 0.6 * -10000 = -6000，累计应为 8000 - 6000 = 2000
+        let outcome = pm.on_filled(&venue, &symbol, OrderSide::Sell, Decimal::new(6, 1), Some(Decimal::new(40000, 0)), None, None, None, 3);
+        assert_eq!(outcome.realized_pnl, Decimal::new(-6000, 0));
+        assert_eq!(pm.venue_position(&venue, &symbol).unwrap().realized_pnl, Decimal::new(2000, 0));
     }
 
     #[test]
@@ -522,5 +576,139 @@ mod tests {
         let totals = pm.total_fees_by_asset();
         assert_eq!(totals.get("BNB"), Some(&Decimal::new(3, 3))); // 0.001 + 0.002
         assert_eq!(totals.get("USDT"), Some(&Decimal::new(25, 0))); // 25
+    }
+
+    #[test]
+    fn apply_adjustment_accumulates_into_realized_pnl_without_touching_position() {
+        let pm = manager();
+        let venue = Venue::new("binance_futures");
+        let symbol = Symbol::new("BTC", "USDT");
+
+        pm.on_filled(&venue, &symbol, OrderSide::Buy, Decimal::ONE, Some(Decimal::new(50000, 0)), None, None, None, 1);
+
+        // 手续费换算成 USDT 后冲减盈亏 (调用方负责传负数)
+        pm.apply_adjustment(&venue, &symbol, Decimal::new(-5, 0), AdjustmentReason::FeeUsdt, 2);
+        // 资金费结算，正数=收到
+        pm.apply_adjustment(&venue, &symbol, Decimal::new(3, 1), AdjustmentReason::Funding, 3);
+
+        let pos = pm.venue_position(&venue, &symbol).unwrap();
+        assert_eq!(pos.realized_pnl, Decimal::new(-47, 1)); // -5 + 0.3
+        assert_eq!(pos.updated_at_ms, 3);
+        // 不影响仓位数量/均价
+        assert_eq!(pos.net_qty, Decimal::ONE);
+        assert_eq!(pos.avg_price, Some(Decimal::new(50000, 0)));
+    }
+
+    #[test]
+    fn apply_adjustment_is_created_flat_when_position_never_existed() {
+        let pm = manager();
+        let venue = Venue::new("binance_futures");
+        let symbol = Symbol::new("ETH", "USDT");
+
+        pm.apply_adjustment(&venue, &symbol, Decimal::new(100, 0), AdjustmentReason::Manual, 1);
+
+        let pos = pm.venue_position(&venue, &symbol).unwrap();
+        assert_eq!(pos.realized_pnl, Decimal::new(100, 0));
+        assert_eq!(pos.net_qty, Decimal::ZERO);
+        assert_eq!(pos.avg_price, None);
+    }
+
+    #[test]
+    fn concurrent_fills_and_adjustments_do_not_lose_updates_to_realized_pnl() {
+        let pm = Arc::new(manager());
+        let venue = Venue::new("binance_futures");
+        let symbol = Symbol::new("BTC", "USDT");
+
+        // 起 1.0 BTC 多头底仓，后面并发的减仓成交才有得实现盈亏
+        pm.on_filled(&venue, &symbol, OrderSide::Buy, Decimal::new(1000, 0), Some(Decimal::new(50000, 0)), None, None, None, 1);
+
+        let mut handles = Vec::new();
+        // 16 个线程各自 apply_adjustment 一笔固定 delta
+        for i in 0..16i64 {
+            let pm = pm.clone();
+            let venue = venue.clone();
+            let symbol = symbol.clone();
+            handles.push(std::thread::spawn(move || {
+                pm.apply_adjustment(&venue, &symbol, Decimal::new(i, 0), AdjustmentReason::Manual, 10 + i as u64);
+            }));
+        }
+        // 8 个线程各自 on_filled 一笔 0.001 BTC 减仓 @ 60000 (每笔已实现盈亏 = 0.001 * 10000 = 10)
+        for i in 0..8i64 {
+            let pm = pm.clone();
+            let venue = venue.clone();
+            let symbol = symbol.clone();
+            handles.push(std::thread::spawn(move || {
+                pm.on_filled(
+                    &venue,
+                    &symbol,
+                    OrderSide::Sell,
+                    Decimal::new(1, 3),
+                    Some(Decimal::new(60000, 0)),
+                    None,
+                    None,
+                    None,
+                    100 + i as u64,
+                );
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // sum(0..16) = 120, 8 笔减仓各实现 10 = 80
+        let expected: Decimal = Decimal::new(120, 0) + Decimal::new(80, 0);
+        let pos = pm.venue_position(&venue, &symbol).unwrap();
+        assert_eq!(pos.realized_pnl, expected);
+    }
+
+    #[test]
+    fn apply_adjustment_writes_audit_record_with_before_after_pnl() {
+        let log = Arc::new(InMemoryAdjustmentLog::new());
+        let pm = PositionManager::new(Arc::new(InMemoryPositionStore::new())).with_adjustment_log(log.clone());
+        let venue = Venue::new("binance_futures");
+        let symbol = Symbol::new("BTC", "USDT");
+
+        pm.on_filled(&venue, &symbol, OrderSide::Buy, Decimal::ONE, Some(Decimal::new(50000, 0)), None, None, None, 1);
+        pm.apply_adjustment(&venue, &symbol, Decimal::new(-5, 0), AdjustmentReason::FeeUsdt, 2);
+
+        let records = log.all();
+        assert_eq!(records.len(), 1);
+        let record = &records[0];
+        assert_eq!(record.venue, venue);
+        assert_eq!(record.symbol, symbol);
+        assert_eq!(record.amount, Decimal::new(-5, 0));
+        assert_eq!(record.reason, AdjustmentReason::FeeUsdt);
+        assert_eq!(record.realized_pnl_before, Decimal::ZERO);
+        assert_eq!(record.realized_pnl_after, Decimal::new(-5, 0));
+        assert_eq!(record.ts_ms, 2);
+    }
+
+    #[test]
+    fn on_filled_sync_fee_usdt_subtracts_and_logs_adjustment() {
+        let log = Arc::new(InMemoryAdjustmentLog::new());
+        let pm = PositionManager::new(Arc::new(InMemoryPositionStore::new())).with_adjustment_log(log.clone());
+        let venue = Venue::new("binance_spot");
+        let symbol = Symbol::new("BTC", "USDT");
+
+        pm.on_filled(
+            &venue,
+            &symbol,
+            OrderSide::Buy,
+            Decimal::new(5, 1),
+            Some(Decimal::new(50000, 0)),
+            Some(Decimal::new(30, 0)),
+            Some("USDT".to_string()),
+            Some(Decimal::new(30, 0)),
+            1,
+        );
+
+        let pos = pm.venue_position(&venue, &symbol).unwrap();
+        assert_eq!(pos.realized_pnl, Decimal::new(-30, 0));
+
+        let records = log.all();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].reason, AdjustmentReason::FeeUsdt);
+        assert_eq!(records[0].amount, Decimal::new(-30, 0));
     }
 }

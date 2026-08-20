@@ -9,27 +9,7 @@ pub struct VenuePnl {
     pub venue: Venue,
     pub symbol: Symbol,
     pub realized_pnl: Decimal,
-    pub fees_paid: Decimal,
-    /// 已成功换算成 USDT 计价的手续费累计(见 `pricing::FeeUsdtConverter`)。
-    /// `fees_paid` 保留不变，是历史遗留、跨币种直接相加的口径；这个字段是
-    /// 只统计"已换算成功部分"的运行总和，`fees_usdt_incomplete` 为 true 时
-    /// 提示这个数可能偏低。`#[serde(default)]` 兼容旧的、没有这个字段的
-    /// Redis 记录。
-    #[serde(default)]
-    pub fees_paid_usdt: Decimal,
-    /// 曾经有手续费未能(或尚未)换算成 USDT。
-    #[serde(default)]
-    pub fees_usdt_incomplete: bool,
-    /// 只要 fees_paid 里累加过一次 `FeeConfig` 估算值(而非交易所真实手续费)就
-    /// 置 true，提示调用方这个累计数不是全部来自交易所真实返还值，且一旦置
-    /// true 不会被后续的真实值覆盖回 false。
-    pub fee_is_estimated: bool,
     pub trade_count: u64,
-    /// 永续合约资金费累计(正=收到，负=支付)，由 `accounting::FundingFeeTracker`
-    /// 定期轮询交易所资金费流水写入。`#[serde(default)]` 兼容旧的、没有这个
-    /// 字段的 Redis 记录。
-    #[serde(default)]
-    pub funding_pnl: Decimal,
     pub updated_at_ms: u64,
 }
 
@@ -39,12 +19,7 @@ impl VenuePnl {
             venue,
             symbol,
             realized_pnl: Decimal::ZERO,
-            fees_paid: Decimal::ZERO,
-            fees_paid_usdt: Decimal::ZERO,
-            fees_usdt_incomplete: false,
-            fee_is_estimated: false,
             trade_count: 0,
-            funding_pnl: Decimal::ZERO,
             updated_at_ms: 0,
         }
     }
@@ -55,18 +30,10 @@ impl VenuePnl {
 pub struct AssetPnlSummary {
     pub asset: String,
     pub realized_pnl: Decimal,
-    pub fees_paid: Decimal,
-    /// 已成功换算成 USDT 计价的手续费累计，跨 venue 聚合。
-    pub fees_paid_usdt: Decimal,
-    /// 参与聚合的 venue 里只要有一个 `fees_usdt_incomplete=true` 就置 true。
-    pub fees_usdt_incomplete: bool,
-    /// 永续合约资金费累计(正=收到，负=支付)。
-    pub funding_pnl: Decimal,
     /// 来自 `asset_valuation()` 的浮动盈亏；缺行情时为 None，不当 0 处理。
     pub unrealized_pnl: Option<Decimal>,
-    /// `realized_pnl - fees_paid + funding_pnl + unrealized_pnl.unwrap_or(0)`；
-    /// 缺行情时仍然给出这个值(只是不含浮动部分)，并靠 unrealized_pnl=None 提示
-    /// 调用方"这不是全量"。
+    /// `realized_pnl + unrealized_pnl.unwrap_or(0)`；缺行情时仍然给出这个值
+    /// (只是不含浮动部分)，并靠 unrealized_pnl=None 提示调用方"这不是全量"。
     pub net_pnl: Decimal,
 }
 
@@ -92,12 +59,4 @@ pub struct AssetValuation {
     pub market_value: Option<Decimal>,
     pub unrealized_pnl: Option<Decimal>,
     pub venues: Vec<VenuePositionValuation>,
-}
-
-/// 单个 venue 的手续费估算参数：`fee = filled_qty_delta.abs() * fill_price *
-/// taker_fee_bps / 10000 * fee_discount`，只在拿不到交易所真实手续费时使用。
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
-pub struct FeeConfig {
-    pub taker_fee_bps: Decimal,
-    pub fee_discount: Decimal,
 }

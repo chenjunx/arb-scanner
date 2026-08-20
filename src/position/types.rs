@@ -20,17 +20,16 @@ pub struct VenuePosition {
     /// net_qty/avg_price 重新计算，是真实的仓位状态丢失风险。
     #[serde(default)]
     pub total_fees: HashMap<String, Decimal>,
-    /// 已成功换算成 USDT 计价的手续费累计（见 `pricing::FeeUsdtConverter`）。
-    /// 只是"已换算成功部分"的运行总和，`fees_usdt_incomplete` 为 true 时
-    /// 提示这个数可能偏低。`#[serde(default)]` 兼容旧的、没有这个字段的
-    /// Redis 记录。
+    /// 累计已实现盈亏：每次 `PositionManager::on_filled` 在减仓/穿零反向时
+    /// 算出的那笔盈亏都会加进来(同方向加仓/从 0 建仓恒为 0，不影响这个值)，
+    /// 以及每次 `PositionManager::apply_adjustment`（资金费结算、手续费换算成
+    /// USDT 后冲减盈亏、人工修正等非成交事件）加进来的调整量。
+    /// `on_filled` 那部分和 `FillOutcome::realized_pnl` 用的是同一次计算，这里
+    /// 只是把逐笔结果就地累加、随仓位持久化，`PortfolioManager`/`PnlStore` 里
+    /// 独立维护的那份累计值不受影响，两者应当始终相等。`#[serde(default)]`
+    /// 兼容这个字段引入之前写入的旧 Redis 记录。
     #[serde(default)]
-    pub total_fees_usdt: Decimal,
-    /// 曾经有手续费未能(或尚未)换算成 USDT——REST 查价失败，或换算任务
-    /// 在完成前进程崩溃。不区分"进行中"和"失败"，只表示"别信
-    /// total_fees_usdt 是全量"。
-    #[serde(default)]
-    pub fees_usdt_incomplete: bool,
+    pub realized_pnl: Decimal,
     pub updated_at_ms: u64,
 }
 
@@ -42,8 +41,7 @@ impl VenuePosition {
             net_qty: Decimal::ZERO,
             avg_price: None,
             total_fees: HashMap::new(),
-            total_fees_usdt: Decimal::ZERO,
-            fees_usdt_incomplete: false,
+            realized_pnl: Decimal::ZERO,
             updated_at_ms: 0,
         }
     }
@@ -59,8 +57,22 @@ pub struct FillOutcome {
     /// 本次成交的手续费换算成 USDT 的等值，只反映 `on_filled` 调用那一刻
     /// **同步**能解出来的值(稳定币直通/复用成交价)；需要异步查价的情形
     /// (如 BNB/KFEE)这里是 `None`，稍后由后台任务通过
-    /// `PositionManager::apply_fee_usdt` 补齐，不会体现在这个一次性返回值里。
+    /// `PositionManager::apply_adjustment` 冲减进 `realized_pnl`，不会体现在
+    /// 这个一次性返回值里。
     pub fee_usdt: Option<Decimal>,
+}
+
+/// `PositionManager::apply_adjustment` 的调整来源。不落进 `VenuePosition`
+/// 状态里——避免把每笔调整都存成一个永远增长的流水数组；而是随每次调用一起
+/// 写进独立的 `AdjustmentRecord` 审计日志（见 `adjustment_log` 模块）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum AdjustmentReason {
+    /// 永续合约资金费结算
+    Funding,
+    /// 手续费换算成 USDT 后冲减已实现盈亏
+    FeeUsdt,
+    /// 人工修正
+    Manual,
 }
 
 /// 按 base 资产跨 venue/产品聚合后的全局敞口。
