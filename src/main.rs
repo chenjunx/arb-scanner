@@ -183,6 +183,7 @@ async fn main() -> anyhow::Result<()> {
             symbols,
             fees.clone(),
             config.min_profit_bps,
+            config.max_quote_age_ms,
             bus.clone(),
         )),
         Box::new(TriangularStrategy::new(
@@ -1108,6 +1109,8 @@ const FEE_QUERY_CONCURRENCY: usize = 4;
 /// 不是固定值)，币安这边再乘上 `config.toml` `[[venues]]` 里币安条目的 `fee_discount`
 /// 折扣(如 BNB 抵扣手续费，默认 1 不打折，见 [`VenueConfig::load_fee_discount`])，
 /// Kraken 不打折。扣费后价差只要 >= `--min-profit-bps`(默认 0，即扣费后为正)就打印。
+/// 参与比较的两侧报价里只要有一个距今超过 `--max-quote-age-ms`(默认 5000ms)，就跳过
+/// 这次比较——防止某一侧 WS 断线/卡住后，一直拿旧报价和另一侧的新报价比出虚假价差。
 ///
 /// `CrossExchangeStrategy` 的手续费 map 不区分 symbol，因此给每个币单独构造一个只监控
 /// 该币、只装这个币真实手续费的 `CrossExchangeStrategy` 实例，而不是像默认主流程那样
@@ -1123,6 +1126,7 @@ const FEE_QUERY_CONCURRENCY: usize = 4;
 async fn run_monitor_command(args: &[String]) -> anyhow::Result<()> {
     let mut testnet = false;
     let mut min_profit_bps = Decimal::ZERO;
+    let mut max_quote_age_ms: u64 = 5000;
     let mut no_portfolio = false;
     let mut funding_interval_secs: u64 = 1800;
     let mut funding_initial_lookback_hours: u64 = 168;
@@ -1138,6 +1142,11 @@ async fn run_monitor_command(args: &[String]) -> anyhow::Result<()> {
             "--min-profit-bps" => {
                 let v = args.get(i + 1).context("--min-profit-bps requires a value")?;
                 min_profit_bps = v.parse().context("--min-profit-bps must be a valid decimal number")?;
+                i += 2;
+            }
+            "--max-quote-age-ms" => {
+                let v = args.get(i + 1).context("--max-quote-age-ms requires a value")?;
+                max_quote_age_ms = v.parse().context("--max-quote-age-ms must be a valid non-negative integer")?;
                 i += 2;
             }
             "--no-portfolio" => {
@@ -1240,7 +1249,10 @@ async fn run_monitor_command(args: &[String]) -> anyhow::Result<()> {
     }
 
     monitored_summary.sort();
-    println!("== Monitoring {} Symbols (min_profit_bps={min_profit_bps}) ==", symbols.len());
+    println!(
+        "== Monitoring {} Symbols (min_profit_bps={min_profit_bps}, max_quote_age_ms={max_quote_age_ms}) ==",
+        symbols.len()
+    );
     println!("{}", monitored_summary.join("\n"));
     if !skipped.is_empty() {
         skipped.sort();
@@ -1257,6 +1269,7 @@ async fn run_monitor_command(args: &[String]) -> anyhow::Result<()> {
                 vec![symbol.clone()],
                 fees.clone(),
                 min_profit_bps,
+                max_quote_age_ms,
                 bus.clone(),
             )) as Box<dyn Strategy>
         })

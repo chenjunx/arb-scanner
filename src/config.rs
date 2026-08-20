@@ -14,6 +14,10 @@ pub struct AppConfig {
     pub min_profit_bps: Decimal,
     #[serde(default = "default_tick_interval_ms")]
     pub tick_interval_ms: u64,
+    /// 一条报价距今超过这个毫秒数就视为过期，`CrossExchangeStrategy` 跳过用它算价差，
+    /// 避免某个 venue 断线/卡住后一直拿旧报价和另一边的新报价比出虚假机会。
+    #[serde(default = "default_max_quote_age_ms")]
+    pub max_quote_age_ms: u64,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -73,6 +77,10 @@ fn default_min_profit_bps() -> Decimal {
 
 fn default_tick_interval_ms() -> u64 {
     500
+}
+
+fn default_max_quote_age_ms() -> u64 {
+    5000
 }
 
 fn default_volatility() -> f64 {
