@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use log::{debug, info};
 use rust_decimal::Decimal;
 
-use crate::market_data::now_ms;
+use crate::market_data::link_health::LinkHealthMonitor;
 use crate::topic::{Topic, TopicBus};
 use crate::types::{Quote, Symbol, Venue};
 
@@ -16,7 +16,7 @@ pub struct CrossExchangeStrategy {
     symbols: Vec<Symbol>,
     fees: HashMap<Venue, FeeSchedule>,
     min_profit_bps: Decimal,
-    max_quote_age_ms: u64,
+    health: Arc<LinkHealthMonitor>,
     latest: Mutex<HashMap<Symbol, HashMap<Venue, Quote>>>,
     bus: Arc<TopicBus>,
 }
@@ -26,14 +26,14 @@ impl CrossExchangeStrategy {
         symbols: Vec<Symbol>,
         fees: HashMap<Venue, FeeSchedule>,
         min_profit_bps: Decimal,
-        max_quote_age_ms: u64,
+        health: Arc<LinkHealthMonitor>,
         bus: Arc<TopicBus>,
     ) -> Self {
         Self {
             symbols,
             fees,
             min_profit_bps,
-            max_quote_age_ms,
+            health,
             latest: Mutex::new(HashMap::new()),
             bus,
         }
@@ -122,10 +122,7 @@ impl Strategy for CrossExchangeStrategy {
                 }
                 let sell_fee = self.fee_for(sell_venue);
 
-                let now = now_ms();
-                if now.saturating_sub(buy_quote.ts_ms) > self.max_quote_age_ms
-                    || now.saturating_sub(sell_quote.ts_ms) > self.max_quote_age_ms
-                {
+                if !self.health.is_healthy(buy_venue) || !self.health.is_healthy(sell_venue) {
                     continue;
                 }
 
@@ -200,7 +197,7 @@ mod tests {
             vec![watched.clone()],
             fees_for(&[&venue_a]),
             Decimal::ZERO,
-            u64::MAX,
+            Arc::new(LinkHealthMonitor::always_healthy()),
             Arc::new(TopicBus::new()),
         );
 
@@ -217,7 +214,7 @@ mod tests {
             vec![symbol.clone()],
             fees_for(&[&venue_a, &venue_b]),
             Decimal::from(1),
-            u64::MAX,
+            Arc::new(LinkHealthMonitor::always_healthy()),
             Arc::new(TopicBus::new()),
         );
 
@@ -245,7 +242,7 @@ mod tests {
             vec![symbol.clone()],
             fees_for(&[&venue_a, &venue_b]),
             Decimal::from(50),
-            u64::MAX,
+            Arc::new(LinkHealthMonitor::always_healthy()),
             Arc::new(TopicBus::new()),
         );
 

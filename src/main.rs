@@ -23,6 +23,7 @@ use arb_scanner::market_data::binance::BinanceSpotSource;
 use arb_scanner::market_data::binance_futures::BinanceFuturesSource;
 use arb_scanner::market_data::cache::MarketDataCache;
 use arb_scanner::market_data::kraken::KrakenSpotSource;
+use arb_scanner::market_data::link_health::LinkHealthMonitor;
 use arb_scanner::market_data::mock::{MockSource, MockSymbolConfig};
 use arb_scanner::net;
 use arb_scanner::order::OrderProvider;
@@ -183,7 +184,7 @@ async fn main() -> anyhow::Result<()> {
             symbols,
             fees.clone(),
             config.min_profit_bps,
-            config.max_quote_age_ms,
+            Arc::new(LinkHealthMonitor::always_healthy()),
             bus.clone(),
         )),
         Box::new(TriangularStrategy::new(
@@ -1126,7 +1127,7 @@ const FEE_QUERY_CONCURRENCY: usize = 4;
 async fn run_monitor_command(args: &[String]) -> anyhow::Result<()> {
     let mut testnet = false;
     let mut min_profit_bps = Decimal::ZERO;
-    let mut max_quote_age_ms: u64 = 5000;
+    let mut link_health_window_ms: u64 = 5000;
     let mut no_portfolio = false;
     let mut funding_interval_secs: u64 = 1800;
     let mut funding_initial_lookback_hours: u64 = 168;
@@ -1144,9 +1145,10 @@ async fn run_monitor_command(args: &[String]) -> anyhow::Result<()> {
                 min_profit_bps = v.parse().context("--min-profit-bps must be a valid decimal number")?;
                 i += 2;
             }
-            "--max-quote-age-ms" => {
-                let v = args.get(i + 1).context("--max-quote-age-ms requires a value")?;
-                max_quote_age_ms = v.parse().context("--max-quote-age-ms must be a valid non-negative integer")?;
+            "--link-health-window-ms" => {
+                let v = args.get(i + 1).context("--link-health-window-ms requires a value")?;
+                link_health_window_ms =
+                    v.parse().context("--link-health-window-ms must be a valid non-negative integer")?;
                 i += 2;
             }
             "--no-portfolio" => {
@@ -1250,7 +1252,7 @@ async fn run_monitor_command(args: &[String]) -> anyhow::Result<()> {
 
     monitored_summary.sort();
     println!(
-        "== Monitoring {} Symbols (min_profit_bps={min_profit_bps}, max_quote_age_ms={max_quote_age_ms}) ==",
+        "== Monitoring {} Symbols (min_profit_bps={min_profit_bps}, link_health_window_ms={link_health_window_ms}) ==",
         symbols.len()
     );
     println!("{}", monitored_summary.join("\n"));
@@ -1262,6 +1264,16 @@ async fn run_monitor_command(args: &[String]) -> anyhow::Result<()> {
     }
 
     let bus = Arc::new(TopicBus::new());
+
+    // 每条参与价差计算的 venue 链路额外订阅一个 BTC/USDT 心跳探针：只要在
+    // link_health_window_ms 内持续收到它的报价推送，就认为该链路健康。见
+    // `LinkHealthMonitor`。
+    let heartbeat_symbol = Symbol::new("BTC", "USDT");
+    let link_health = Arc::new(LinkHealthMonitor::new(heartbeat_symbol.clone(), link_health_window_ms));
+    let mut source_handles = Vec::new();
+    source_handles
+        .push(link_health.clone().spawn(bus.clone(), vec![Venue::new("binance_spot"), Venue::new("kraken")]));
+
     let strategies: Vec<Box<dyn Strategy>> = coin_fees
         .iter()
         .map(|(_, symbol, fees)| {
@@ -1269,14 +1281,23 @@ async fn run_monitor_command(args: &[String]) -> anyhow::Result<()> {
                 vec![symbol.clone()],
                 fees.clone(),
                 min_profit_bps,
-                max_quote_age_ms,
+                link_health.clone(),
                 bus.clone(),
             )) as Box<dyn Strategy>
         })
         .collect();
     let engine = ArbitrageEngine::new(strategies);
 
-    let mut source_handles = Vec::new();
+    // WS 实际订阅的 symbol 列表，在套利币种之外补上心跳探针（若不在其中），
+    // 确保 link_health 真的能收到 BTC/USDT 的行情推送。
+    let ws_symbols: Vec<Symbol> = {
+        let mut s = symbols.clone();
+        if !s.contains(&heartbeat_symbol) {
+            s.push(heartbeat_symbol.clone());
+        }
+        s
+    };
+
     // 用 "binance_spot" 而不是策略层惯用的 "binance"，是为了和
     // `PositionManager`/`PortfolioManager` 里现货仓位统一用的 venue 命名对齐——
     // 否则 `PortfolioManager::valuation_for` 按仓位的 venue 去 TopicBus 查
@@ -1284,13 +1305,13 @@ async fn run_monitor_command(args: &[String]) -> anyhow::Result<()> {
     // 现货 market_value/unrealized_pnl 恒为 None。
     let binance_source: Box<dyn MarketDataSource> = Box::new(BinanceSpotSource::new(
         Venue::new("binance_spot"),
-        symbols.clone(),
+        ws_symbols.clone(),
         testnet,
         proxy.clone(),
     ));
     source_handles.push(binance_source.spawn(bus.clone()));
     let kraken_source: Box<dyn MarketDataSource> =
-        Box::new(KrakenSpotSource::new(Venue::new("kraken"), symbols.clone(), proxy.clone()));
+        Box::new(KrakenSpotSource::new(Venue::new("kraken"), ws_symbols.clone(), proxy.clone()));
     source_handles.push(kraken_source.spawn(bus.clone()));
 
     if !no_portfolio {
