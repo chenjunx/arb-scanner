@@ -47,13 +47,34 @@ END_MS="$(([[ -n "$END" ]] && to_ms "$END") || date -u +%s%3N)"
 echo "查询窗口: $(date -u -d @$((START_MS/1000)) '+%Y-%m-%d %H:%M:%S UTC') ~ $(date -u -d @$((END_MS/1000)) '+%Y-%m-%d %H:%M:%S UTC')"
 echo
 
-for symbol in "${SYMBOLS[@]}"; do
+for raw_symbol in "${SYMBOLS[@]}"; do
+    # Binance 接口要的是 "APEUSDT" 这种无分隔符格式；项目内部/持仓日志里的
+    # symbol 常带斜杠 ("APE/USDT")，这里自动去掉，避免因为格式不对查出空结果
+    # 却看起来像是"没有资金费"。
+    symbol="${raw_symbol//\//}"
     echo "== $symbol =="
     url="${BASE_URL}/fapi/v1/fundingRate?symbol=${symbol}&startTime=${START_MS}&endTime=${END_MS}&limit=100"
-    resp="$(curl -sS "$url")"
+    http_code="$(curl -sS -o /tmp/funding_rate_resp.$$ -w '%{http_code}' "$url")" || {
+        echo "curl 请求失败 (网络不通/超时/被墙？)"
+        echo
+        continue
+    }
+    resp="$(cat /tmp/funding_rate_resp.$$)"
+    rm -f /tmp/funding_rate_resp.$$
+
+    if [[ "$http_code" != "200" ]]; then
+        echo "HTTP $http_code: $resp"
+        echo
+        continue
+    fi
+
     if command -v jq >/dev/null 2>&1; then
-        echo "$resp" | jq -r '.[] | "\((.fundingTime|tonumber)/1000 | strftime("%Y-%m-%d %H:%M:%S UTC")) rate=\(.fundingRate) mark_price=\(.markPrice)"' \
-            2>/dev/null || echo "$resp" | jq .
+        lines="$(echo "$resp" | jq -r '.[] | "\((.fundingTime|tonumber)/1000 | strftime("%Y-%m-%d %H:%M:%S UTC")) rate=\(.fundingRate) mark_price=\(.markPrice)"' 2>/dev/null)"
+        if [[ -z "$lines" ]]; then
+            echo "(该窗口内没有结算记录，原始返回: $resp)"
+        else
+            echo "$lines"
+        fi
     else
         echo "$resp"
     fi
