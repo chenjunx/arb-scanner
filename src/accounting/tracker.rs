@@ -62,7 +62,9 @@ impl FundingFeeTracker {
                 continue;
             }
             let Some(provider) = self.providers.get(&pos.venue) else {
-                warn!(
+                // 现货 venue 本来就不会在 `providers` 里注册(没有资金费概念)，
+                // 每轮轮询都会走到这里，属于预期路径，不用 warn 刷屏。
+                debug!(
                     "funding tracker: no FundingFeeProvider registered for venue={}, skipping symbol={} (net_qty={})",
                     pos.venue, pos.symbol, pos.net_qty
                 );
@@ -85,6 +87,12 @@ impl FundingFeeTracker {
                 }
             };
             records.sort_by_key(|r| r.tran_id);
+            for r in &records {
+                debug!(
+                    "funding tracker: fetched record venue={} symbol={} tran_id={} income={} time_ms={}",
+                    pos.venue, pos.symbol, r.tran_id, r.income, r.time_ms
+                );
+            }
 
             let last_seen_tran_id = cursor.map(|c| c.last_tran_id).unwrap_or(-1);
             let new_count = records.iter().filter(|r| r.tran_id > last_seen_tran_id).count();
