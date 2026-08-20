@@ -130,16 +130,6 @@ impl Strategy for CrossExchangeStrategy {
                     continue;
                 };
 
-                debug!(
-                    "{sym} spread: buy={bv}@{ba} sell={sv}@{sb} profit_bps={p}",
-                    sym = symbol,
-                    bv = buy_venue,
-                    ba = buy_quote.ask,
-                    sv = sell_venue,
-                    sb = sell_quote.bid,
-                    p = profit_bps
-                );
-
                 if profit_bps < self.min_profit_bps {
                     continue;
                 }
