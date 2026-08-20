@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use dashmap::DashMap;
 use futures_util::StreamExt;
+use log::{info, warn};
 use tokio::task::JoinHandle;
 
 use super::now_ms;
@@ -49,6 +50,7 @@ impl HealthCheck for HeartbeatFreshness {
 pub struct LinkHealthMonitor {
     heartbeat: Arc<HeartbeatFreshness>,
     checks: Vec<Arc<dyn HealthCheck>>,
+    last_health: DashMap<Venue, bool>,
 }
 
 impl LinkHealthMonitor {
@@ -57,6 +59,7 @@ impl LinkHealthMonitor {
         Self {
             heartbeat: heartbeat.clone(),
             checks: vec![heartbeat],
+            last_health: DashMap::new(),
         }
     }
 
@@ -65,11 +68,22 @@ impl LinkHealthMonitor {
         Self {
             heartbeat: Arc::new(HeartbeatFreshness::new(Symbol::new("BTC", "USDT"), 0)),
             checks: Vec::new(),
+            last_health: DashMap::new(),
         }
     }
 
     pub fn is_healthy(&self, venue: &Venue) -> bool {
-        self.checks.iter().all(|check| check.is_healthy(venue))
+        let healthy = self.checks.iter().all(|check| check.is_healthy(venue));
+        let prev = self.last_health.get(venue).map(|v| *v);
+        if prev != Some(healthy) {
+            self.last_health.insert(venue.clone(), healthy);
+            if healthy {
+                info!("link recovered: venue={venue}");
+            } else {
+                warn!("link unhealthy: venue={venue}");
+            }
+        }
+        healthy
     }
 
     /// 后台订阅每个 venue 上探针交易对的行情，每收到一次推送就把该 venue

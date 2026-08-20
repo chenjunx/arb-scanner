@@ -122,17 +122,7 @@ impl Strategy for CrossExchangeStrategy {
                 }
                 let sell_fee = self.fee_for(sell_venue);
 
-                let buy_healthy = self.health.is_healthy(buy_venue);
-                let sell_healthy = self.health.is_healthy(sell_venue);
-                if !buy_healthy || !sell_healthy {
-                    debug!(
-                        "{sym} skipped: link unhealthy buy={bv}({bh}) sell={sv}({sh})",
-                        sym = symbol,
-                        bv = buy_venue,
-                        bh = buy_healthy,
-                        sv = sell_venue,
-                        sh = sell_healthy,
-                    );
+                if !self.health.is_healthy(buy_venue) || !self.health.is_healthy(sell_venue) {
                     continue;
                 }
 
