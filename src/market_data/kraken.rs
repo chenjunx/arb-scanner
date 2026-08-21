@@ -54,6 +54,7 @@ impl KrakenSpotSource {
             "params": {
                 "channel": "ticker",
                 "symbol": pairs,
+                "event_trigger": "bbo",
             }
         })
         .to_string()
@@ -277,5 +278,6 @@ mod tests {
         assert_eq!(msg["method"], "subscribe");
         assert_eq!(msg["params"]["channel"], "ticker");
         assert_eq!(msg["params"]["symbol"], serde_json::json!(["BTC/USD", "ETH/USD"]));
+        assert_eq!(msg["params"]["event_trigger"], "bbo");
     }
 }
