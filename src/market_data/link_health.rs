@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use dashmap::DashMap;
@@ -15,20 +16,21 @@ pub trait HealthCheck: Send + Sync {
     fn is_healthy(&self, venue: &Venue) -> bool;
 }
 
-/// 心跳新鲜度规则：每条 venue 链路额外订阅一个"探针"交易对（如 BTC/USDT），
-/// 只要求在 `window_ms` 内收到过它的报价推送就算健康——不看价格是否变化，
-/// 只看 WS 连接是否还在正常推送数据。用本地接收时间而不是交易所自带的
-/// 时间戳，避免交易所时钟偏差影响判断。
+/// 心跳新鲜度规则：每条 venue 链路额外订阅各自的一个"探针"交易对（如
+/// binance 用 BTC/USDT、kraken 用 BTC/USD——不同交易所报价币种习惯不同，
+/// 探针需要按 venue 配置），只要求在 `window_ms` 内收到过它的报价推送就算
+/// 健康——不看价格是否变化，只看 WS 连接是否还在正常推送数据。用本地接收
+/// 时间而不是交易所自带的时间戳，避免交易所时钟偏差影响判断。
 struct HeartbeatFreshness {
-    probe_symbol: Symbol,
+    probe_symbols: HashMap<Venue, Symbol>,
     window_ms: u64,
     last_seen: DashMap<Venue, u64>,
 }
 
 impl HeartbeatFreshness {
-    fn new(probe_symbol: Symbol, window_ms: u64) -> Self {
+    fn new(probe_symbols: HashMap<Venue, Symbol>, window_ms: u64) -> Self {
         Self {
-            probe_symbol,
+            probe_symbols,
             window_ms,
             last_seen: DashMap::new(),
         }
@@ -54,8 +56,11 @@ pub struct LinkHealthMonitor {
 }
 
 impl LinkHealthMonitor {
-    pub fn new(probe_symbol: Symbol, window_ms: u64) -> Self {
-        let heartbeat = Arc::new(HeartbeatFreshness::new(probe_symbol, window_ms));
+    /// `probe_symbols` 按 venue 各自指定探针交易对，key 即为参与心跳监控的
+    /// venue 集合——`spawn` 直接从这里派生要订阅的 topic，不用再单独传一份
+    /// venue 列表（避免两处列表脱节）。
+    pub fn new(probe_symbols: HashMap<Venue, Symbol>, window_ms: u64) -> Self {
+        let heartbeat = Arc::new(HeartbeatFreshness::new(probe_symbols, window_ms));
         Self {
             heartbeat: heartbeat.clone(),
             checks: vec![heartbeat],
@@ -66,7 +71,7 @@ impl LinkHealthMonitor {
     /// 不接心跳探针、永远视为健康——供不想接入链路监控的调用方使用。
     pub fn always_healthy() -> Self {
         Self {
-            heartbeat: Arc::new(HeartbeatFreshness::new(Symbol::new("BTC", "USDT"), 0)),
+            heartbeat: Arc::new(HeartbeatFreshness::new(HashMap::new(), 0)),
             checks: Vec::new(),
             last_health: DashMap::new(),
         }
@@ -86,12 +91,14 @@ impl LinkHealthMonitor {
         healthy
     }
 
-    /// 后台订阅每个 venue 上探针交易对的行情，每收到一次推送就把该 venue
+    /// 后台订阅每个 venue 上各自探针交易对的行情，每收到一次推送就把该 venue
     /// 的"最近心跳时间"刷新为本地当前时间。
-    pub fn spawn(self: Arc<Self>, bus: Arc<TopicBus>, venues: Vec<Venue>) -> JoinHandle<()> {
-        let topics: Vec<Topic> = venues
-            .into_iter()
-            .map(|venue| Topic::quote(venue, self.heartbeat.probe_symbol.clone()))
+    pub fn spawn(self: Arc<Self>, bus: Arc<TopicBus>) -> JoinHandle<()> {
+        let topics: Vec<Topic> = self
+            .heartbeat
+            .probe_symbols
+            .iter()
+            .map(|(venue, symbol)| Topic::quote(venue.clone(), symbol.clone()))
             .collect();
         tokio::spawn(async move {
             let mut quotes = bus.subscribe_many::<Quote>(topics);
@@ -123,24 +130,29 @@ mod tests {
         }
     }
 
+    fn probes_for(venues: &[&Venue]) -> HashMap<Venue, Symbol> {
+        venues.iter().map(|v| ((*v).clone(), Symbol::new("BTC", "USDT"))).collect()
+    }
+
     #[test]
     fn unhealthy_when_never_seen() {
-        let monitor = LinkHealthMonitor::new(Symbol::new("BTC", "USDT"), 5000);
-        assert!(!monitor.is_healthy(&Venue::new("binance_spot")));
+        let venue = Venue::new("binance_spot");
+        let monitor = LinkHealthMonitor::new(probes_for(&[&venue]), 5000);
+        assert!(!monitor.is_healthy(&venue));
     }
 
     #[test]
     fn healthy_within_window_after_seen() {
-        let monitor = LinkHealthMonitor::new(Symbol::new("BTC", "USDT"), 5000);
         let venue = Venue::new("binance_spot");
+        let monitor = LinkHealthMonitor::new(probes_for(&[&venue]), 5000);
         monitor.mark_seen_for_test(&venue);
         assert!(monitor.is_healthy(&venue));
     }
 
     #[test]
     fn unhealthy_after_window_elapses() {
-        let monitor = LinkHealthMonitor::new(Symbol::new("BTC", "USDT"), 10);
         let venue = Venue::new("binance_spot");
+        let monitor = LinkHealthMonitor::new(probes_for(&[&venue]), 10);
         monitor.mark_seen_for_test(&venue);
         std::thread::sleep(std::time::Duration::from_millis(50));
         assert!(!monitor.is_healthy(&venue));
@@ -160,8 +172,8 @@ mod tests {
         let probe_symbol = Symbol::new("BTC", "USDT");
         let topic = Topic::quote(venue.clone(), probe_symbol.clone());
 
-        let monitor = Arc::new(LinkHealthMonitor::new(probe_symbol, 5000));
-        let handle = monitor.clone().spawn(bus.clone(), vec![venue.clone()]);
+        let monitor = Arc::new(LinkHealthMonitor::new(HashMap::from([(venue.clone(), probe_symbol)]), 5000));
+        let handle = monitor.clone().spawn(bus.clone());
 
         assert!(!monitor.is_healthy(&venue));
 

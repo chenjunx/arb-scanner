@@ -1265,14 +1265,19 @@ async fn run_monitor_command(args: &[String]) -> anyhow::Result<()> {
 
     let bus = Arc::new(TopicBus::new());
 
-    // 每条参与价差计算的 venue 链路额外订阅一个 BTC/USDT 心跳探针：只要在
+    // 每条参与价差计算的 venue 链路额外订阅一个心跳探针交易对：只要在
     // link_health_window_ms 内持续收到它的报价推送，就认为该链路健康。见
-    // `LinkHealthMonitor`。
-    let heartbeat_symbol = Symbol::new("BTC", "USDT");
-    let link_health = Arc::new(LinkHealthMonitor::new(heartbeat_symbol.clone(), link_health_window_ms));
+    // `LinkHealthMonitor`。探针币种按 venue 分别指定——kraken 用 BTC/USD
+    // (kraken 的原生报价币种)，binance 沿用 BTC/USDT。
+    let binance_venue = Venue::new("binance_spot");
+    let kraken_venue = Venue::new("kraken");
+    let binance_probe = Symbol::new("BTC", "USDT");
+    let kraken_probe = Symbol::new("BTC", "USD");
+    let probe_symbols =
+        HashMap::from([(binance_venue.clone(), binance_probe.clone()), (kraken_venue.clone(), kraken_probe.clone())]);
+    let link_health = Arc::new(LinkHealthMonitor::new(probe_symbols, link_health_window_ms));
     let mut source_handles = Vec::new();
-    source_handles
-        .push(link_health.clone().spawn(bus.clone(), vec![Venue::new("binance_spot"), Venue::new("kraken")]));
+    source_handles.push(link_health.clone().spawn(bus.clone()));
 
     let strategies: Vec<Box<dyn Strategy>> = coin_fees
         .iter()
@@ -1288,12 +1293,12 @@ async fn run_monitor_command(args: &[String]) -> anyhow::Result<()> {
         .collect();
     let engine = ArbitrageEngine::new(strategies);
 
-    // WS 实际订阅的 symbol 列表，在套利币种之外补上心跳探针（若不在其中），
-    // 确保 link_health 真的能收到 BTC/USDT 的行情推送。
-    let ws_symbols: Vec<Symbol> = {
+    // WS 实际订阅的 symbol 列表，在套利币种之外补上各自的心跳探针（若不在
+    // 其中），确保 link_health 真的能收到探针币种的行情推送。
+    let with_probe = |probe: &Symbol| -> Vec<Symbol> {
         let mut s = symbols.clone();
-        if !s.contains(&heartbeat_symbol) {
-            s.push(heartbeat_symbol.clone());
+        if !s.contains(probe) {
+            s.push(probe.clone());
         }
         s
     };
@@ -1304,14 +1309,14 @@ async fn run_monitor_command(args: &[String]) -> anyhow::Result<()> {
     // mark price 时，现货这条腿永远查不到 (之前拿 "binance" 存的行情)，导致
     // 现货 market_value/unrealized_pnl 恒为 None。
     let binance_source: Box<dyn MarketDataSource> = Box::new(BinanceSpotSource::new(
-        Venue::new("binance_spot"),
-        ws_symbols.clone(),
+        binance_venue,
+        with_probe(&binance_probe),
         testnet,
         proxy.clone(),
     ));
     source_handles.push(binance_source.spawn(bus.clone()));
     let kraken_source: Box<dyn MarketDataSource> =
-        Box::new(KrakenSpotSource::new(Venue::new("kraken"), ws_symbols.clone(), proxy.clone()));
+        Box::new(KrakenSpotSource::new(kraken_venue, with_probe(&kraken_probe), proxy.clone()));
     source_handles.push(kraken_source.spawn(bus.clone()));
 
     if !no_portfolio {
