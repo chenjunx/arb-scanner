@@ -8,9 +8,9 @@ use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 
+use crate::accounting::balance_stream::BalanceUpdate;
 use crate::order_manager::types::{AnyOrderRequest, OrderEvent};
 use crate::types::{Quote, Symbol, Venue};
-use crate::wallet::balance_stream::BalanceUpdate;
 
 const CHANNEL_CAPACITY: usize = 1024;
 

@@ -189,9 +189,97 @@ impl PositionManager {
         });
     }
 
-    /// 单个 venue+symbol 的净数量 (正=多头，负=空头)。
+    /// 单个 venue+symbol 的净数量 (正=多头，负=空头)。这是记账/估值口径，
+    /// 包含跨 venue 划转在途、尚未到账确认的部分——下单前的风控判断应该用
+    /// `available_position`，不要用这个。
     pub fn position(&self, venue: &Venue, symbol: &Symbol) -> Decimal {
         self.store.get(venue, symbol).map(|p| p.net_qty).unwrap_or(Decimal::ZERO)
+    }
+
+    /// 单个 venue+symbol 上真正"可用于下单"的数量：`net_qty` 扣掉还在途未
+    /// 确认到账的划转数量 (`pending_qty`)。供 `RiskService` 做下单前限额检查。
+    pub fn available_position(&self, venue: &Venue, symbol: &Symbol) -> Decimal {
+        self.store
+            .get(venue, symbol)
+            .map(|p| p.net_qty - p.pending_qty)
+            .unwrap_or(Decimal::ZERO)
+    }
+
+    /// 划转单提币受理时调用：标记 `qty` 数量记入了 `net_qty` 但还不能当可用
+    /// 敞口用，直到 `settle_transfer_in` 在到账确认时把它清掉。调用方需要在
+    /// 这之前先用 `on_filled` 把 `qty` 计入 `net_qty`——这里只加 pending 标记，
+    /// 不碰数量/均价/已实现盈亏。
+    pub fn mark_transfer_pending(&self, venue: &Venue, symbol: &Symbol, qty: Decimal, ts_ms: u64) {
+        let venue_for_closure = venue.clone();
+        let symbol_for_closure = symbol.clone();
+        self.store.update(
+            venue,
+            symbol,
+            Box::new(move |current: Option<VenuePosition>| {
+                let mut pos =
+                    current.unwrap_or_else(|| VenuePosition::flat(venue_for_closure.clone(), symbol_for_closure.clone()));
+                pos.pending_qty += qty;
+                pos.updated_at_ms = ts_ms;
+                pos
+            }),
+        );
+    }
+
+    /// 划转到账确认时调用：把目的地仓位从"申请转账时的乐观数量"修正为真实
+    /// 到账量，并清掉对应的 pending 标记。`actual_qty` 通常小于
+    /// `requested_qty`(提币手续费)，差额按当前均价折算成已实现盈亏的负向
+    /// 调整，与 `apply_adjustment` 走同一条审计日志；`actual_qty` 大于/等于
+    /// `requested_qty` 时同样成立(差额为零/正)。返回记入 `realized_pnl` 的
+    /// 调整额，供调用方打日志。
+    pub fn settle_transfer_in(
+        &self,
+        venue: &Venue,
+        symbol: &Symbol,
+        requested_qty: Decimal,
+        actual_qty: Decimal,
+        ts_ms: u64,
+    ) -> Decimal {
+        let venue_for_closure = venue.clone();
+        let symbol_for_closure = symbol.clone();
+        let correction = actual_qty - requested_qty;
+        let adjustment_slot = Arc::new(Mutex::new(Decimal::ZERO));
+        let before_after_slot = Arc::new(Mutex::new((Decimal::ZERO, Decimal::ZERO)));
+        let slot = adjustment_slot.clone();
+        let ba_slot = before_after_slot.clone();
+        self.store.update(
+            venue,
+            symbol,
+            Box::new(move |current: Option<VenuePosition>| {
+                let mut pos =
+                    current.unwrap_or_else(|| VenuePosition::flat(venue_for_closure.clone(), symbol_for_closure.clone()));
+                let realized_pnl_before = pos.realized_pnl;
+                pos.net_qty += correction;
+                if let Some(avg_price) = pos.avg_price {
+                    let adjustment = correction * avg_price;
+                    pos.realized_pnl += adjustment;
+                    *slot.lock().unwrap() = adjustment;
+                }
+                pos.pending_qty = (pos.pending_qty - requested_qty).max(Decimal::ZERO);
+                pos.updated_at_ms = ts_ms;
+                *ba_slot.lock().unwrap() = (realized_pnl_before, pos.realized_pnl);
+                pos
+            }),
+        );
+
+        let adjustment = *adjustment_slot.lock().unwrap();
+        if !adjustment.is_zero() {
+            let (realized_pnl_before, realized_pnl_after) = *before_after_slot.lock().unwrap();
+            self.adjustment_log.record(AdjustmentRecord {
+                venue: venue.clone(),
+                symbol: symbol.clone(),
+                amount: adjustment,
+                reason: AdjustmentReason::TransferFee,
+                realized_pnl_before,
+                realized_pnl_after,
+                ts_ms,
+            });
+        }
+        adjustment
     }
 
     /// 单个 venue+symbol 的完整快照 (含均价)。
@@ -710,5 +798,76 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].reason, AdjustmentReason::FeeUsdt);
         assert_eq!(records[0].amount, Decimal::new(-30, 0));
+    }
+
+    #[test]
+    fn mark_transfer_pending_reduces_available_but_not_net_qty() {
+        let pm = manager();
+        let venue = Venue::new("okx_spot");
+        let symbol = Symbol::new("BTC", "USDT");
+
+        pm.on_filled(&venue, &symbol, OrderSide::Buy, Decimal::ONE, Some(Decimal::new(50000, 0)), None, None, None, 1);
+        pm.mark_transfer_pending(&venue, &symbol, Decimal::new(4, 1), 2);
+
+        assert_eq!(pm.available_position(&venue, &symbol), Decimal::new(6, 1));
+        let pos = pm.venue_position(&venue, &symbol).unwrap();
+        assert_eq!(pos.net_qty, Decimal::ONE);
+        assert_eq!(pos.pending_qty, Decimal::new(4, 1));
+    }
+
+    #[test]
+    fn available_position_is_zero_when_no_position_exists() {
+        let pm = manager();
+        let venue = Venue::new("okx_spot");
+        let symbol = Symbol::new("BTC", "USDT");
+
+        assert_eq!(pm.available_position(&venue, &symbol), Decimal::ZERO);
+    }
+
+    #[test]
+    fn settle_transfer_in_with_shortfall_corrects_qty_and_records_realized_loss() {
+        let log = Arc::new(InMemoryAdjustmentLog::new());
+        let pm = PositionManager::new(Arc::new(InMemoryPositionStore::new())).with_adjustment_log(log.clone());
+        let venue = Venue::new("okx_spot");
+        let symbol = Symbol::new("BTC", "USDT");
+
+        // 目的地乐观记账：申请划转 1.0 BTC @ 50000
+        pm.on_filled(&venue, &symbol, OrderSide::Buy, Decimal::ONE, Some(Decimal::new(50000, 0)), None, None, None, 1);
+        pm.mark_transfer_pending(&venue, &symbol, Decimal::ONE, 1);
+
+        // 实际到账只有 0.98（提币手续费吃掉 0.02）
+        let adjustment = pm.settle_transfer_in(&venue, &symbol, Decimal::ONE, Decimal::new(98, 2), 2);
+
+        assert_eq!(adjustment, Decimal::new(-1000, 0)); // -0.02 * 50000 = -1000
+        let pos = pm.venue_position(&venue, &symbol).unwrap();
+        assert_eq!(pos.net_qty, Decimal::new(98, 2));
+        assert_eq!(pos.realized_pnl, Decimal::new(-1000, 0));
+        assert_eq!(pos.pending_qty, Decimal::ZERO);
+        assert_eq!(pm.available_position(&venue, &symbol), Decimal::new(98, 2));
+
+        let records = log.all();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].reason, AdjustmentReason::TransferFee);
+        assert_eq!(records[0].amount, Decimal::new(-1000, 0));
+    }
+
+    #[test]
+    fn settle_transfer_in_with_exact_match_leaves_realized_pnl_unchanged() {
+        let log = Arc::new(InMemoryAdjustmentLog::new());
+        let pm = PositionManager::new(Arc::new(InMemoryPositionStore::new())).with_adjustment_log(log.clone());
+        let venue = Venue::new("okx_spot");
+        let symbol = Symbol::new("BTC", "USDT");
+
+        pm.on_filled(&venue, &symbol, OrderSide::Buy, Decimal::ONE, Some(Decimal::new(50000, 0)), None, None, None, 1);
+        pm.mark_transfer_pending(&venue, &symbol, Decimal::ONE, 1);
+
+        let adjustment = pm.settle_transfer_in(&venue, &symbol, Decimal::ONE, Decimal::ONE, 2);
+
+        assert_eq!(adjustment, Decimal::ZERO);
+        let pos = pm.venue_position(&venue, &symbol).unwrap();
+        assert_eq!(pos.net_qty, Decimal::ONE);
+        assert_eq!(pos.realized_pnl, Decimal::ZERO);
+        assert_eq!(pos.pending_qty, Decimal::ZERO);
+        assert!(log.all().is_empty());
     }
 }

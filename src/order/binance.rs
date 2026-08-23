@@ -14,13 +14,13 @@ use serde::Deserialize;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
+use crate::accounting::balance_stream::{BalanceStreamSource, BalanceUpdate};
 use crate::market_data::now_ms;
 use crate::net::connect_tcp;
 use crate::order_manager::stream::{ExchangeOrderUpdate, OrderStreamSource, StreamHandle};
 use crate::order_manager::OrderManager;
 use crate::topic::{Topic, TopicBus};
 use crate::types::{Symbol, Venue};
-use crate::wallet::balance_stream::{BalanceStreamSource, BalanceUpdate};
 
 use super::OrderProvider;
 use super::types::{MarketOrderRequest, OrderAmount, OrderResult, OrderSide, OrderStatus};

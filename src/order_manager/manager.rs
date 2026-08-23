@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use log::warn;
+use log::{info, warn};
 use rust_decimal::Decimal;
 
 use crate::order::types::OrderStatus;
@@ -138,7 +138,7 @@ impl OrderManager {
 
         let trade = match order.request.as_trade() {
             Some(r) => r,
-            None => return, // Transfer 订单仓位由 ExecutionService 在提币成功时直接更新
+            None => return, // 不会发生：Transfer 订单在前面已经 early return，走 confirm_transfer 而非这条路径
         };
         let venue = trade.venue.clone();
         let symbol = trade.symbol.clone();
@@ -204,12 +204,69 @@ impl OrderManager {
                 order_id: order_id.clone(),
                 reason: format!("exchange order stream reported status={status:?}"),
             }),
-            OrderStatus::New | OrderStatus::DepositConfirmed => None,
+            OrderStatus::New | OrderStatus::Transferred | OrderStatus::DepositConfirmed => None,
         };
 
         if let Some(event) = event {
             self.bus.publish(Topic::order_event(&strategy_id), event);
         }
+    }
+
+    /// `TransferMonitor` 探测到目的地余额变动、认定到账确认后调用的唯一入口。
+    /// 把 `Transferred → DepositConfirmed` 的状态推进、事件发布、仓位修正
+    /// （按实际到账量修正乐观记账、清掉 pending 标记）收在同一个方法里完成，
+    /// 和 `handle_exchange_update` 对交易单的处理是同一种形状，只是触发源不同
+    /// （trade 是交易所 WS 推送，transfer 是 `TransferMonitor` 探测到的余额变动）。
+    pub fn confirm_transfer(&self, order_id: &OrderId, actual_delta: Decimal, ts_ms: u64) {
+        let outcome = self.order_store.update(
+            order_id,
+            Box::new(|order| {
+                if order.status == OrderStatus::Transferred {
+                    order.status = OrderStatus::DepositConfirmed;
+                    order.updated_at_ms = ts_ms;
+                    true
+                } else {
+                    false
+                }
+            }),
+        );
+
+        let order = match outcome {
+            OrderUpdateOutcome::NotFound => {
+                warn!("OrderManager: order_id={order_id} not found when confirming transfer deposit");
+                return;
+            }
+            OrderUpdateOutcome::Skipped => {
+                warn!(
+                    "OrderManager: order_id={order_id} skipped confirming transfer deposit (status was not Transferred)"
+                );
+                return;
+            }
+            OrderUpdateOutcome::Applied(order) => order,
+        };
+
+        let transfer = match order.request.as_transfer() {
+            Some(t) => t,
+            None => {
+                warn!("OrderManager: order_id={order_id} confirm_transfer called on a non-transfer order");
+                return;
+            }
+        };
+        let to_venue = transfer.to_venue.clone();
+        let symbol = transfer.symbol.clone();
+        let requested_qty = transfer.amount;
+        let strategy_id = transfer.strategy_id.clone();
+        let asset = symbol.base.as_ref().to_string();
+
+        self.bus.publish(
+            Topic::order_event(&strategy_id),
+            OrderEvent::TransferConfirmed { order_id: order_id.clone(), to_venue: to_venue.clone(), asset, actual_delta },
+        );
+
+        let adjustment = self.position_manager.settle_transfer_in(&to_venue, &symbol, requested_qty, actual_delta, ts_ms);
+        info!(
+            "OrderManager: order_id={order_id} transfer deposit confirmed to_venue={to_venue} symbol={symbol} requested={requested_qty} actual={actual_delta} realized_pnl_adjustment={adjustment}"
+        );
     }
 
     fn resolve_order_id(&self, update: &ExchangeOrderUpdate) -> Option<OrderId> {
@@ -290,5 +347,108 @@ impl OrderManager {
 
     pub fn all_orders(&self) -> Vec<Order> {
         self.order_store.all()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures_util::StreamExt;
+
+    use crate::order::types::OrderSide;
+    use crate::order_manager::store::InMemoryOrderStore;
+    use crate::order_manager::types::{AnyOrderRequest, TransferRequest};
+    use crate::position::InMemoryPositionStore;
+    use crate::types::{Symbol, Venue};
+
+    fn transfer_order(order_id: &str, status: OrderStatus) -> Order {
+        Order {
+            order_id: OrderId::new(order_id),
+            request: AnyOrderRequest::Transfer(TransferRequest {
+                strategy_id: "test-strategy".to_string(),
+                from_venue: Venue::new("okx_spot"),
+                to_venue: Venue::new("binance_spot"),
+                symbol: Symbol::new("BTC", "USDT"),
+                amount: Decimal::ONE,
+                network: None,
+                dry_run: false,
+                client_order_id: None,
+                group_id: None,
+                metadata: None,
+                order_id: Some(OrderId::new(order_id)),
+            }),
+            status,
+            filled_qty: Decimal::ONE,
+            avg_price: None,
+            exchange_order_id: None,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            reject_reason: None,
+        }
+    }
+
+    fn manager_with_order(order: Order) -> OrderManager {
+        let bus = Arc::new(TopicBus::new());
+        let position_manager = Arc::new(PositionManager::new(Arc::new(InMemoryPositionStore::new())));
+        let order_store: Arc<dyn OrderStore> = Arc::new(InMemoryOrderStore::new());
+        order_store.upsert(order);
+        OrderManager::new(bus, position_manager, order_store, None)
+    }
+
+    #[tokio::test]
+    async fn confirm_transfer_advances_status_publishes_event_and_settles_position() {
+        let venue = Venue::new("binance_spot");
+        let symbol = Symbol::new("BTC", "USDT");
+        let order_id = OrderId::new("ORD-1");
+        let om = manager_with_order(transfer_order("ORD-1", OrderStatus::Transferred));
+
+        // 模拟 ExecutionService::handle_transfer 在提币受理时已经做过的乐观记账 + pending 标记
+        om.position_manager.on_filled(
+            &venue,
+            &symbol,
+            OrderSide::Buy,
+            Decimal::ONE,
+            Some(Decimal::new(50000, 0)),
+            None,
+            None,
+            None,
+            1,
+        );
+        om.position_manager.mark_transfer_pending(&venue, &symbol, Decimal::ONE, 1);
+
+        let mut events = om.bus.subscribe::<OrderEvent>(Topic::order_event("test-strategy"));
+
+        om.confirm_transfer(&order_id, Decimal::new(98, 2), 2);
+
+        let (_, event) = events.next().await.unwrap();
+        match event {
+            OrderEvent::TransferConfirmed { order_id: id, to_venue, asset, actual_delta } => {
+                assert_eq!(id, order_id);
+                assert_eq!(to_venue, venue);
+                assert_eq!(asset, "BTC");
+                assert_eq!(actual_delta, Decimal::new(98, 2));
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        let stored = om.order_store.get(&order_id).unwrap();
+        assert_eq!(stored.status, OrderStatus::DepositConfirmed);
+
+        let pos = om.position_manager.venue_position(&venue, &symbol).unwrap();
+        assert_eq!(pos.net_qty, Decimal::new(98, 2));
+        assert_eq!(pos.pending_qty, Decimal::ZERO);
+    }
+
+    #[tokio::test]
+    async fn confirm_transfer_skips_when_status_is_not_transferred() {
+        let order_id = OrderId::new("ORD-2");
+        let om = manager_with_order(transfer_order("ORD-2", OrderStatus::DepositConfirmed));
+
+        om.confirm_transfer(&order_id, Decimal::ONE, 2);
+
+        // 状态不是 Transferred(已经被确认过/竞态)：不应重复推进状态或修正仓位
+        let stored = om.order_store.get(&order_id).unwrap();
+        assert_eq!(stored.status, OrderStatus::DepositConfirmed);
+        assert_eq!(stored.updated_at_ms, 1);
     }
 }

@@ -1,7 +1,7 @@
-pub mod balance_stream;
 pub mod binance;
 pub mod kraken;
 pub mod transfer;
+pub mod transfer_monitor;
 pub mod types;
 
 use async_trait::async_trait;

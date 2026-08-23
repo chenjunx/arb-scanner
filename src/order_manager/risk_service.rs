@@ -171,7 +171,7 @@ impl RiskService {
         }
 
         {
-            let current_position = self.position_manager.position(venue, symbol);
+            let current_position = self.position_manager.available_position(venue, symbol);
             let delta = match request.side {
                 crate::order::types::OrderSide::Buy => order_qty,
                 crate::order::types::OrderSide::Sell => -order_qty,

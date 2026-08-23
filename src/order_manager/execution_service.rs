@@ -47,8 +47,9 @@ impl ExchangeAdapter {
 /// 执行服务：订阅 `Topic::OrderExecute`，按订单类型路由。
 /// - `Trade`：路由到对应 `ExchangeAdapter` 下单
 /// - `Transfer`：调用源 venue 的 `WalletProvider::withdraw`，
-///   成功后调 `PositionManager::on_transfer` 更新双边仓位，
-///   发布 `OrderEvent::Transferred`
+///   成功后调 `PositionManager::on_filled`(双边) + `mark_transfer_pending`
+///   乐观更新仓位，发布 `OrderEvent::Transferred`；到账确认后的仓位修正见
+///   `OrderManager::confirm_transfer`
 pub struct ExecutionService {
     bus: Arc<TopicBus>,
     adapters: HashMap<Venue, Arc<ExchangeAdapter>>,
@@ -217,14 +218,16 @@ impl ExecutionService {
                     withdraw_result.id
                 );
 
-                // 更新订单记录：写入 withdraw_id + 状态置 Filled
+                // 更新订单记录：写入 withdraw_id + 状态置 Transferred(提币已提交，
+                // 尚未到账确认；到账确认由 TransferMonitor 探测到后经
+                // OrderManager::confirm_transfer 推进到 DepositConfirmed)
                 let withdraw_id = withdraw_result.id.clone();
                 let updated_at_ms = current_timestamp_ms();
                 self.order_store.update(
                     &order_id,
                     Box::new(move |order| {
                         order.exchange_order_id = Some(withdraw_id);
-                        order.status = OrderStatus::Filled;
+                        order.status = OrderStatus::Transferred;
                         order.filled_qty = qty;
                         order.updated_at_ms = updated_at_ms;
                         true
@@ -259,6 +262,10 @@ impl ExecutionService {
                         None,
                         ts_ms,
                     );
+                    // 目的地这笔数量已计入 net_qty，但在到账确认前不能当可用
+                    // 敞口用——标记为 pending，等 OrderManager::confirm_transfer
+                    // 在到账确认时通过 settle_transfer_in 清掉。
+                    pm.mark_transfer_pending(&request.to_venue, &request.symbol, qty, ts_ms);
                 }
 
                 // 通知策略

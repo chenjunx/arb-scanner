@@ -48,7 +48,9 @@ pub enum OrderStatus {
     New,
     PartiallyFilled,
     Filled,
-    /// 划转单：提币已提交（`Filled`），到账事件已通过余额变动确认
+    /// 划转单：提币已提交、资金已从源头划出，但尚未通过余额变动确认到账
+    Transferred,
+    /// 划转单：到账事件已通过余额变动确认
     DepositConfirmed,
     Rejected,
     Expired,

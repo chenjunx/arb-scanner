@@ -30,6 +30,11 @@ pub struct VenuePosition {
     /// `#[serde(default)]` 兼容这个字段引入之前写入的旧 Redis 记录。
     #[serde(default)]
     pub realized_pnl: Decimal,
+    /// 已计入 `net_qty`、但还不能当可用敞口用的数量（跨 venue 划转在途、尚未
+    /// 到账确认的部分）。只影响下单前的可用性判断，不影响记账/估值口径。
+    /// `#[serde(default)]` 兼容这个字段引入之前写入的旧 Redis 记录。
+    #[serde(default)]
+    pub pending_qty: Decimal,
     pub updated_at_ms: u64,
 }
 
@@ -42,6 +47,7 @@ impl VenuePosition {
             avg_price: None,
             total_fees: HashMap::new(),
             realized_pnl: Decimal::ZERO,
+            pending_qty: Decimal::ZERO,
             updated_at_ms: 0,
         }
     }
@@ -71,6 +77,8 @@ pub enum AdjustmentReason {
     Funding,
     /// 手续费换算成 USDT 后冲减已实现盈亏
     FeeUsdt,
+    /// 划转到账确认后，实际到账量与申请量的差额（通常是负的，提币手续费）
+    TransferFee,
     /// 人工修正
     Manual,
 }

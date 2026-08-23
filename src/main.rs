@@ -716,6 +716,7 @@ async fn run_set_position_command(args: &[String]) -> anyhow::Result<()> {
             avg_price,
             total_fees: std::collections::HashMap::new(),
             realized_pnl: Decimal::ZERO,
+            pending_qty: Decimal::ZERO,
             updated_at_ms: ts_ms,
         }),
     );
