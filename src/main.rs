@@ -552,9 +552,12 @@ async fn run_reconcile_order_command(args: &[String]) -> anyhow::Result<()> {
     let order = order_store
         .get(&order_id)
         .with_context(|| format!("order {order_id} not found in redis"))?;
+    let trade = order.request.as_trade()
+        .with_context(|| format!("order {order_id} 是划转单而非交易单，reconcile-order 不适用"))?;
+
     info!(
         "reconcile-order: 从 Redis 读到订单 venue={} symbol={} status={:?} filled_qty={} avg_price={:?} exchange_order_id={:?}",
-        order.request.venue, order.request.symbol, order.status, order.filled_qty, order.avg_price, order.exchange_order_id
+        trade.venue, trade.symbol, order.status, order.filled_qty, order.avg_price, order.exchange_order_id
     );
 
     let exchange_order_id = order
@@ -565,16 +568,16 @@ async fn run_reconcile_order_command(args: &[String]) -> anyhow::Result<()> {
     let proxy = net::proxy_from_env();
     let spot_venue = Venue::new("binance_spot");
     let futures_venue = Venue::new("binance_futures");
-    let provider: Arc<dyn OrderProvider> = if order.request.venue == spot_venue {
+    let provider: Arc<dyn OrderProvider> = if trade.venue == spot_venue {
         Arc::new(BinanceOrderProvider::from_env(spot_venue.clone(), testnet, proxy.as_deref())?)
-    } else if order.request.venue == futures_venue {
+    } else if trade.venue == futures_venue {
         Arc::new(BinanceFuturesOrderProvider::from_env(futures_venue.clone(), testnet, proxy.as_deref())?)
     } else {
-        anyhow::bail!("reconcile-order: venue {} 不支持 REST 核对(目前只实现了 binance_spot/binance_futures)", order.request.venue);
+        anyhow::bail!("reconcile-order: venue {} 不支持 REST 核对(目前只实现了 binance_spot/binance_futures)", trade.venue);
     };
 
     let result = provider
-        .query_order(&order.request.symbol, &exchange_order_id)
+        .query_order(&trade.symbol, &exchange_order_id)
         .await
         .with_context(|| format!("REST query_order 失败 (exchange_order_id={exchange_order_id})"))?;
 
@@ -604,9 +607,9 @@ async fn run_reconcile_order_command(args: &[String]) -> anyhow::Result<()> {
 
     order_manager
         .handle_exchange_update(ExchangeOrderUpdate {
-            venue: order.request.venue.clone(),
-            symbol: order.request.symbol.clone(),
-            client_order_id: order.request.client_order_id.clone(),
+            venue: trade.venue.clone(),
+            symbol: trade.symbol.clone(),
+            client_order_id: trade.client_order_id.clone(),
             exchange_order_id: Some(exchange_order_id),
             status: result.status,
             filled_qty: result.filled_qty,

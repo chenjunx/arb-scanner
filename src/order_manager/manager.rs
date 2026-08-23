@@ -72,6 +72,11 @@ impl OrderManager {
             }
         };
 
+        // Transfer 订单没有 WS 回流，handle_exchange_update 不会被调用
+        if self.order_store.get(&order_id).map(|o| o.request.as_transfer().is_some()).unwrap_or(false) {
+            return;
+        }
+
         // 补录 exchange_order_id 索引
         if let Some(exchange_order_id) = &update.exchange_order_id {
             self.exchange_order_index
@@ -131,10 +136,14 @@ impl OrderManager {
             OrderUpdateOutcome::Applied(order) => order,
         };
 
-        let venue = order.request.venue.clone();
-        let symbol = order.request.symbol.clone();
-        let side = order.request.side;
-        let strategy_id = order.request.strategy_id.clone();
+        let trade = match order.request.as_trade() {
+            Some(r) => r,
+            None => return, // Transfer 订单仓位由 ExecutionService 在提币成功时直接更新
+        };
+        let venue = trade.venue.clone();
+        let symbol = trade.symbol.clone();
+        let side = trade.side;
+        let strategy_id = trade.strategy_id.clone();
         let status = order.status;
         let filled_qty = order.filled_qty;
         let avg_price = order.avg_price;
@@ -195,7 +204,7 @@ impl OrderManager {
                 order_id: order_id.clone(),
                 reason: format!("exchange order stream reported status={status:?}"),
             }),
-            OrderStatus::New => None,
+            OrderStatus::New | OrderStatus::DepositConfirmed => None,
         };
 
         if let Some(event) = event {
@@ -225,8 +234,8 @@ impl OrderManager {
         let all_orders = self.order_store.all();
         for order in all_orders {
             // 构建索引
-            if let Some(cid) = &order.request.client_order_id {
-                self.client_order_index.lock().unwrap().insert(cid.clone(), order.order_id.clone());
+            if let Some(cid) = order.request.client_order_id() {
+                self.client_order_index.lock().unwrap().insert(cid.to_string(), order.order_id.clone());
             }
             if let Some(eid) = &order.exchange_order_id {
                 self.exchange_order_index.lock().unwrap().insert(eid.clone(), order.order_id.clone());
@@ -234,7 +243,7 @@ impl OrderManager {
 
             // 匹配当前 update
             if let Some(cid) = &update.client_order_id {
-                if order.request.client_order_id.as_ref() == Some(cid) {
+                if order.request.client_order_id() == Some(cid.as_str()) {
                     return Some(order.order_id.clone());
                 }
             }
@@ -261,8 +270,7 @@ impl OrderManager {
         // 内存索引没有，从 Redis 扫描
         let all_orders = self.order_store.all();
         for order in all_orders {
-            if order.request.client_order_id.as_deref() == Some(client_order_id) {
-                // 顺便建立索引
+            if order.request.client_order_id() == Some(client_order_id) {
                 self.client_order_index.lock().unwrap().insert(client_order_id.to_string(), order.order_id.clone());
                 return Some(order);
             }
@@ -272,17 +280,11 @@ impl OrderManager {
 
     /// 把一笔从 Redis 读出来的历史订单加载到内存索引，仅用于 reconcile-order 命令
     pub fn seed_order(&self, order: Order) {
-        if let Some(client_order_id) = &order.request.client_order_id {
-            self.client_order_index
-                .lock()
-                .unwrap()
-                .insert(client_order_id.clone(), order.order_id.clone());
+        if let Some(cid) = order.request.client_order_id() {
+            self.client_order_index.lock().unwrap().insert(cid.to_string(), order.order_id.clone());
         }
         if let Some(exchange_order_id) = &order.exchange_order_id {
-            self.exchange_order_index
-                .lock()
-                .unwrap()
-                .insert(exchange_order_id.clone(), order.order_id.clone());
+            self.exchange_order_index.lock().unwrap().insert(exchange_order_id.clone(), order.order_id.clone());
         }
     }
 

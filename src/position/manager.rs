@@ -93,7 +93,7 @@ impl PositionManager {
                 }
 
                 pos.avg_price = match (pos.avg_price, fill_price) {
-                    (_, None) => pos.avg_price,
+                    (_, None) => if new_qty.is_zero() { None } else { pos.avg_price },
                     (None, Some(price)) => Some(price),
                     (Some(avg), Some(price)) => {
                         if new_qty.is_zero() {

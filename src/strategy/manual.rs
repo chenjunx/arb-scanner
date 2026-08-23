@@ -596,8 +596,11 @@ impl ManualStrategy {
             .clone()
             .with_context(|| format!("order {order_id} has no exchange_order_id yet, cannot reconcile via REST"))?;
 
+        let trade = order.request.as_trade()
+            .with_context(|| format!("order {order_id} is not a trade order, cannot reconcile via REST"))?;
+
         let result = provider
-            .query_order(&order.request.symbol, &exchange_order_id)
+            .query_order(&trade.symbol, &exchange_order_id)
             .await
             .with_context(|| format!("REST query_order failed for order {order_id} (exchange_order_id={exchange_order_id})"))?;
 
@@ -611,9 +614,9 @@ impl ManualStrategy {
 
         self.order_manager
             .handle_exchange_update(ExchangeOrderUpdate {
-                venue: order.request.venue.clone(),
-                symbol: order.request.symbol.clone(),
-                client_order_id: order.request.client_order_id.clone(),
+                venue: trade.venue.clone(),
+                symbol: trade.symbol.clone(),
+                client_order_id: trade.client_order_id.clone(),
                 exchange_order_id: Some(exchange_order_id),
                 status: result.status,
                 filled_qty: result.filled_qty,
@@ -1029,7 +1032,7 @@ mod tests {
             if let Some(order) = order_manager
                 .all_orders()
                 .into_iter()
-                .find(|o| o.request.client_order_id.as_deref() == Some(client_order_id))
+                .find(|o| o.request.client_order_id() == Some(client_order_id))
             {
                 return order;
             }
@@ -1047,10 +1050,12 @@ mod tests {
         avg_price: Decimal,
     ) {
         let order = poll_order_by_client_id(order_manager, client_order_id).await;
+        let symbol = order.request.as_trade().map(|t| t.symbol.clone())
+            .unwrap_or_else(|| order.request.as_transfer().unwrap().symbol.clone());
         order_manager
             .handle_exchange_update(ExchangeOrderUpdate {
                 venue: venue.clone(),
-                symbol: order.request.symbol.clone(),
+                symbol,
                 client_order_id: Some(client_order_id.to_string()),
                 exchange_order_id: order.exchange_order_id.clone(),
                 status: OrderStatus::Filled,

@@ -1,3 +1,4 @@
+pub mod balance_stream;
 pub mod binance;
 pub mod kraken;
 pub mod transfer;

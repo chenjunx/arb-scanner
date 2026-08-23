@@ -61,21 +61,33 @@ impl ReportSection for OrderSection {
             lines.push("当前挂单:".to_string());
         }
         for order in shown {
-            // filled_qty 始终是成交的 base 数量；下单量 amount 可能是 base 也可能是
-            // quote(按金额下单)，两者单位不一致时不能直接拼成一个分数，否则会把
-            // quote 金额误读成 base 数量(例如"以 10 USDT 下单"显示成 filled=0/10)。
-            let base = &order.request.symbol.base;
-            let filled_vs_target = match order.request.amount {
-                OrderAmount::Base(target) => format!("filled={} {base}/{} {base}", order.filled_qty, target),
-                OrderAmount::Quote(target) => {
-                    let quote = &order.request.symbol.quote;
-                    format!("filled={} {base} target={} {quote}", order.filled_qty, target)
+            let line = match order.request.as_trade() {
+                Some(trade) => {
+                    // filled_qty 始终是成交的 base 数量；下单量 amount 可能是 base 也可能是
+                    // quote(按金额下单)，两者单位不一致时不能直接拼成一个分数。
+                    let base = &trade.symbol.base;
+                    let filled_vs_target = match trade.amount {
+                        OrderAmount::Base(target) => format!("filled={} {base}/{} {base}", order.filled_qty, target),
+                        OrderAmount::Quote(target) => {
+                            let quote = &trade.symbol.quote;
+                            format!("filled={} {base} target={} {quote}", order.filled_qty, target)
+                        }
+                    };
+                    format!(
+                        "  {} {} {} {:?} side={:?} {}",
+                        order.order_id, trade.venue, trade.symbol, order.status, trade.side, filled_vs_target,
+                    )
+                }
+                None => {
+                    // 划转单
+                    let t = order.request.as_transfer().unwrap();
+                    format!(
+                        "  {} transfer {}->{} {} qty={} {:?}",
+                        order.order_id, t.from_venue, t.to_venue, t.symbol, order.filled_qty, order.status,
+                    )
                 }
             };
-            lines.push(format!(
-                "  {} {} {} {:?} side={:?} {}",
-                order.order_id, order.request.venue, order.request.symbol, order.status, order.request.side, filled_vs_target,
-            ));
+            lines.push(line);
         }
         lines.join("\n")
     }
@@ -94,7 +106,7 @@ mod tests {
     fn order(id: &str, status: OrderStatus, created_at_ms: u64) -> Order {
         Order {
             order_id: OrderId::new(id),
-            request: OrderRequest {
+            request: crate::order_manager::types::AnyOrderRequest::Trade(OrderRequest {
                 strategy_id: "test".to_string(),
                 venue: Venue::new("binance_spot"),
                 symbol: Symbol::new("BTC", "USDT"),
@@ -104,7 +116,7 @@ mod tests {
                 group_id: None,
                 metadata: None,
                 order_id: None,
-            },
+            }),
             status,
             filled_qty: Decimal::ZERO,
             avg_price: None,

@@ -8,8 +8,9 @@ use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 
-use crate::order_manager::types::{OrderEvent, OrderRequest};
+use crate::order_manager::types::{AnyOrderRequest, OrderEvent};
 use crate::types::{Quote, Symbol, Venue};
+use crate::wallet::balance_stream::BalanceUpdate;
 
 const CHANNEL_CAPACITY: usize = 1024;
 
@@ -26,6 +27,8 @@ pub enum Topic {
     OrderExecute,
     /// 订单事件：执行层/OrderManager -> 策略，按 strategy_id 路由，payload=`OrderEvent`
     OrderEvent { strategy_id: String },
+    /// 余额变动事件：venue 级别，payload=`BalanceUpdate`
+    BalanceUpdate { venue: Venue },
 }
 
 impl fmt::Display for Topic {
@@ -35,6 +38,7 @@ impl fmt::Display for Topic {
             Self::OrderSubmit => write!(f, "orders.submit"),
             Self::OrderExecute => write!(f, "orders.execute"),
             Self::OrderEvent { strategy_id } => write!(f, "events.order.{}", strategy_id),
+            Self::BalanceUpdate { venue } => write!(f, "balance.{}", venue),
         }
     }
 }
@@ -56,6 +60,10 @@ impl Topic {
         Self::OrderEvent {
             strategy_id: strategy_id.into(),
         }
+    }
+
+    pub fn balance_update(venue: Venue) -> Self {
+        Self::BalanceUpdate { venue }
     }
 }
 
@@ -90,9 +98,10 @@ where
 pub struct TopicBus {
     quote_channels: DashMap<Topic, broadcast::Sender<Quote>>,
     quote_latest: DashMap<Topic, Quote>,
-    order_submit_channel: broadcast::Sender<OrderRequest>,
-    order_execute_channel: broadcast::Sender<OrderRequest>,
+    order_submit_channel: broadcast::Sender<AnyOrderRequest>,
+    order_execute_channel: broadcast::Sender<AnyOrderRequest>,
     order_event_channels: DashMap<String, broadcast::Sender<OrderEvent>>,
+    balance_update_channels: DashMap<Venue, broadcast::Sender<BalanceUpdate>>,
 }
 
 impl TopicBus {
@@ -103,6 +112,7 @@ impl TopicBus {
             order_submit_channel: broadcast::channel(CHANNEL_CAPACITY).0,
             order_execute_channel: broadcast::channel(CHANNEL_CAPACITY).0,
             order_event_channels: DashMap::new(),
+            balance_update_channels: DashMap::new(),
         }
     }
 
@@ -148,6 +158,13 @@ impl TopicBus {
             .or_insert_with(|| broadcast::channel(CHANNEL_CAPACITY).0)
             .clone()
     }
+
+    fn balance_update_sender_for(&self, venue: &Venue) -> broadcast::Sender<BalanceUpdate> {
+        self.balance_update_channels
+            .entry(venue.clone())
+            .or_insert_with(|| broadcast::channel(CHANNEL_CAPACITY).0)
+            .clone()
+    }
 }
 
 impl Default for TopicBus {
@@ -188,7 +205,7 @@ impl BusMessage for Quote {
     }
 }
 
-impl BusMessage for OrderRequest {
+impl BusMessage for AnyOrderRequest {
     fn publish(bus: &TopicBus, topic: Topic, data: Self) {
         match topic {
             Topic::OrderSubmit => {
@@ -197,7 +214,7 @@ impl BusMessage for OrderRequest {
             Topic::OrderExecute => {
                 let _ = bus.order_execute_channel.send(data);
             }
-            _ => warn!("TopicBus::publish: topic {topic} does not carry OrderRequest data"),
+            _ => warn!("TopicBus::publish: topic {topic} does not carry AnyOrderRequest data"),
         }
     }
 
@@ -212,7 +229,7 @@ impl BusMessage for OrderRequest {
                 Box::pin(lagged_filter_map(topic, receiver))
             }
             _ => {
-                warn!("TopicBus::subscribe: topic {topic} does not carry OrderRequest data");
+                warn!("TopicBus::subscribe: topic {topic} does not carry AnyOrderRequest data");
                 Box::pin(futures_util::stream::empty())
             }
         }
@@ -240,6 +257,27 @@ impl BusMessage for OrderEvent {
                 warn!("TopicBus::subscribe: topic {topic} does not carry OrderEvent data");
                 Box::pin(futures_util::stream::empty())
             }
+        }
+    }
+}
+
+impl BusMessage for BalanceUpdate {
+    fn publish(bus: &TopicBus, topic: Topic, data: Self) {
+        if let Topic::BalanceUpdate { ref venue } = topic {
+            let sender = bus.balance_update_sender_for(venue);
+            let _ = sender.send(data);
+        } else {
+            warn!("TopicBus::publish: topic {topic} does not carry BalanceUpdate data");
+        }
+    }
+
+    fn subscribe(bus: &TopicBus, topic: Topic) -> BoxTopicStream<Self> {
+        if let Topic::BalanceUpdate { ref venue } = topic {
+            let receiver = bus.balance_update_sender_for(venue).subscribe();
+            Box::pin(lagged_filter_map(topic.clone(), receiver))
+        } else {
+            warn!("TopicBus::subscribe: topic {topic} does not carry BalanceUpdate data");
+            Box::pin(futures_util::stream::empty())
         }
     }
 }
