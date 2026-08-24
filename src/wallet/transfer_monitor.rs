@@ -11,10 +11,10 @@ use crate::order_manager::OrderManager;
 use crate::topic::{Topic, TopicBus};
 use crate::types::Venue;
 
-const TOLERANCE: Decimal = Decimal::from_parts(5, 0, 0, false, 2); // 0.05
+const TOLERANCE: Decimal = Decimal::from_parts(1, 0, 0, false, 1); // 0.10
 
 /// 划转到账监控器：订阅 `Topic::BalanceUpdate`，宽松匹配状态为 `Transferred` 的
-/// Transfer 订单。当余额增量与划转量之差在 5% 以内时，认为到账，把这件事交给
+/// Transfer 订单。当余额增量与划转量之差在 10% 以内时，认为到账，把这件事交给
 /// `OrderManager::confirm_transfer` 完成"状态推进 → 发布完成事件 → 按实际到账量
 /// 修正仓位"这一整套动作——本服务只做纯探测/匹配，不直接改 order_store，也不碰
 /// `PositionManager`。

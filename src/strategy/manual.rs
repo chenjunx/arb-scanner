@@ -148,6 +148,16 @@ pub struct ClosePositionReport {
     pub futures_order: Option<OrderResult>,
 }
 
+/// 划转提交结果：提币已受理(`OrderEvent::Transferred`，仓位已乐观记账并标记
+/// pending)，尚未到账确认。到账确认是否等待、超时如何处理由调用方
+/// (`transfer` CLI 命令)决定，不属于这个报告的范围。
+#[derive(Debug, Clone)]
+pub struct TransferAcceptedReport {
+    pub order_id: OrderId,
+    pub qty: Decimal,
+    pub withdraw_id: String,
+}
+
 impl ManualStrategy {
     /// live 路径：现货买入、合约对冲两条腿都通过 `submit_order` 发布到
     /// `Topic::OrderSubmit`，由 `RiskService -> ExecutionService -> WS 成交
@@ -512,6 +522,44 @@ impl ManualStrategy {
         Ok(Some(self.build_order_result(fill)?))
     }
 
+    /// 提交一笔划转请求并等待 `OrderEvent::Transferred`(提币已受理，仓位已
+    /// 乐观记账，尚未到账确认)——和 `submit_and_wait_for_fill` 同构，复用
+    /// `resolve_order_id`。`dry_run` 恒为 `false`：CLI 层的 dry-run 分支在更早
+    /// 的地方直接短路调用 `wallet::transfer::transfer_asset`，完全不会走到
+    /// 这个方法。
+    pub async fn submit_transfer_and_wait(
+        &self,
+        from_venue: Venue,
+        to_venue: Venue,
+        symbol: Symbol,
+        amount: Decimal,
+        network: Option<String>,
+        client_order_id: String,
+        timeout: Duration,
+    ) -> anyhow::Result<TransferAcceptedReport> {
+        let mut event_stream = self.bus.subscribe::<OrderEvent>(Topic::order_event(self.name()));
+        self.submit_transfer(
+            from_venue,
+            to_venue,
+            symbol,
+            amount,
+            network,
+            false,
+            Some(client_order_id.clone()),
+            None,
+            None,
+        );
+
+        let order_id = self.resolve_order_id(&client_order_id).await?;
+        tokio::time::timeout(timeout, wait_for_transfer_event(&mut event_stream, &order_id))
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "transfer order_id={order_id} client_order_id={client_order_id} was not accepted (Transferred) within {timeout:?}"
+                )
+            })?
+    }
+
     /// 订阅一份独立的 `OrderEvent` 流、提交订单、反查 order_id、再在这份独立
     /// 的事件流里按 order_id 过滤等待——每条腿各等各的，可以安全并发（同一
     /// `strategy_id` 下多条腿共用同一个 broadcast sender，如果不按 order_id
@@ -678,6 +726,31 @@ async fn wait_for_order_event(
             }
             Some(_) => continue,
             None => anyhow::bail!("order event stream closed while waiting for order {target} to fill"),
+        }
+    }
+}
+
+/// 循环消费事件流，只处理匹配 `target` order_id 的 `Transferred`/
+/// `RejectedByRisk`/`RejectedByExchange`，其余跳过继续等——和
+/// `wait_for_order_event` 同一模式，用于等待划转单"提币已受理"这一步(不是
+/// 到账确认，到账确认是 `OrderEvent::TransferConfirmed`，由调用方另外等)。
+async fn wait_for_transfer_event(
+    event_stream: &mut BoxTopicStream<OrderEvent>,
+    target: &OrderId,
+) -> anyhow::Result<TransferAcceptedReport> {
+    loop {
+        match event_stream.next().await {
+            Some((_, OrderEvent::Transferred { order_id, qty, withdraw_id, .. })) if &order_id == target => {
+                return Ok(TransferAcceptedReport { order_id, qty, withdraw_id });
+            }
+            Some((_, OrderEvent::RejectedByRisk { order_id, reason })) if &order_id == target => {
+                anyhow::bail!("transfer order {order_id} rejected by risk: {reason}");
+            }
+            Some((_, OrderEvent::RejectedByExchange { order_id, reason })) if &order_id == target => {
+                anyhow::bail!("transfer order {order_id} rejected by exchange: {reason}");
+            }
+            Some(_) => continue,
+            None => anyhow::bail!("order event stream closed while waiting for transfer order {target} to be accepted"),
         }
     }
 }

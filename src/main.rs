@@ -9,6 +9,7 @@ use futures_util::stream;
 use log::info;
 use rust_decimal::Decimal;
 
+use arb_scanner::accounting::balance_stream::BalanceStreamSource;
 use arb_scanner::accounting::{FundingFeeProvider, FundingFeeTracker, RedisFundingCursorStore};
 use arb_scanner::config::{AppConfig, ScanConfig, VenueConfig};
 use arb_scanner::engine::ArbitrageEngine;
@@ -27,6 +28,8 @@ use arb_scanner::market_data::link_health::LinkHealthMonitor;
 use arb_scanner::market_data::mock::{MockSource, MockSymbolConfig};
 use arb_scanner::net;
 use arb_scanner::order::OrderProvider;
+use arb_scanner::accounting::binance::BinanceBalanceStream;
+use arb_scanner::accounting::kraken::KrakenBalanceStream;
 use arb_scanner::order::binance::{BinanceOrderProvider, BinanceUserDataStream};
 use arb_scanner::order::binance_futures::{BinanceFuturesOrderProvider, BinanceFuturesUserDataStream};
 use arb_scanner::order::kraken::{KrakenOrderProvider, KrakenPrivateOrderStream};
@@ -35,7 +38,7 @@ use arb_scanner::order_manager::{
     OrderStreamSource, RedisOrderIdAllocator, RedisOrderStore, RiskService,
 };
 use arb_scanner::order_manager::risk_service::RiskLimits;
-use arb_scanner::order_manager::types::OrderId;
+use arb_scanner::order_manager::types::{OrderEvent, OrderId};
 use arb_scanner::portfolio::PortfolioManager;
 use arb_scanner::position::{
     InMemoryPositionStore, PositionManager, PositionStore, RedisAdjustmentLog, RedisPositionStore, VenuePosition,
@@ -52,9 +55,11 @@ use arb_scanner::strategy::triangular::{LegSide, TriangularLeg, TriangularPath, 
 use arb_scanner::strategy::{FeeSchedule, Strategy};
 use arb_scanner::topic::{Topic, TopicBus};
 use arb_scanner::types::{Quote, Symbol, Venue};
+use arb_scanner::wallet::WalletProvider;
 use arb_scanner::wallet::binance::BinanceWalletProvider;
 use arb_scanner::wallet::kraken::KrakenWalletProvider;
-use arb_scanner::wallet::transfer::{TransferHalfParams, transfer_half_to_kraken};
+use arb_scanner::wallet::transfer::{TransferHalfParams, TransferParams, transfer_asset, transfer_half_to_kraken};
+use arb_scanner::wallet::transfer_monitor::TransferMonitor;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -91,6 +96,9 @@ async fn main() -> anyhow::Result<()> {
     }
     if args.get(1).map(String::as_str) == Some("set-position") {
         return run_set_position_command(&args[2..]).await;
+    }
+    if args.get(1).map(String::as_str) == Some("transfer") {
+        return run_transfer_command(&args[2..]).await;
     }
 
     let config_path = args.get(1).cloned().unwrap_or_else(|| "config.toml".to_string());
@@ -288,6 +296,310 @@ async fn build_manual_pipeline(
     }
 
     Ok(ManualPipeline { order_manager, stream_handles })
+}
+
+/// `transfer` 子命令专用的 live 流水线：只需要 RiskService/ExecutionService/
+/// OrderManager 三件套，不涉及任何 `OrderStreamSource`/`ExchangeAdapter`——
+/// 划转不是交易单，走的是 `ExecutionService::with_wallet_providers` 而不是
+/// 交易所私有 WS。`order_store` 单独保留一份，供调用方直接构造
+/// `TransferMonitor`(它需要 `Arc<dyn OrderStore>`，不经过 `OrderManager`)。
+struct TransferPipeline {
+    order_manager: Arc<OrderManager>,
+    order_store: Arc<dyn OrderStore>,
+}
+
+async fn build_transfer_pipeline(
+    redis_url: &str,
+    bus: Arc<TopicBus>,
+    wallet_providers: HashMap<Venue, Arc<dyn WalletProvider>>,
+) -> anyhow::Result<TransferPipeline> {
+    let order_store: Arc<dyn OrderStore> =
+        Arc::new(RedisOrderStore::new(redis_url).context("failed to connect RedisOrderStore to redis")?);
+    let order_id_allocator =
+        RedisOrderIdAllocator::new(redis_url).context("failed to connect RedisOrderIdAllocator to redis")?;
+    let (position_manager, _portfolio_manager) = build_portfolio_stack(redis_url, Arc::new(DashMap::new()))?;
+
+    // 空 risk_limits：RiskService 对 Transfer 分支恒 Approved，不查这个 map。
+    let risk_service = Arc::new(RiskService::new(
+        bus.clone(),
+        Arc::new(order_id_allocator),
+        order_store.clone(),
+        HashMap::new(),
+        position_manager.clone(),
+    ));
+    // 空 adapters：本命令不发 Trade 请求。
+    let execution_service = Arc::new(
+        ExecutionService::new(bus.clone(), HashMap::new(), order_store.clone())
+            .with_wallet_providers(wallet_providers, position_manager.clone()),
+    );
+    let order_manager = Arc::new(OrderManager::new(bus.clone(), position_manager, order_store.clone(), None));
+
+    let _risk_handle = risk_service.clone().start();
+    let _execution_handle = execution_service.clone().start();
+
+    Ok(TransferPipeline { order_manager, order_store })
+}
+
+/// 把 `"binance"`/`"kraken"` 映射到 `transfer` 子命令使用的划转 venue——刻意
+/// 和 `open`/`close` 交易腿用的 `binance_spot`/`kraken_spot` 完全一致，保证
+/// `ExecutionService::handle_transfer` 对 `PositionManager` 的乐观记账落到和
+/// 真实交易同一个仓位桶里，而不是另开一条无关记录。
+fn transfer_venue(name: &str) -> anyhow::Result<Venue> {
+    match name {
+        "binance" => Ok(Venue::new("binance_spot")),
+        "kraken" => Ok(Venue::new("kraken_spot")),
+        other => anyhow::bail!("unknown venue '{other}' for 'transfer' subcommand, expected 'binance' or 'kraken'"),
+    }
+}
+
+/// 和 [`transfer_venue`] 按同样的名字映射构造对应的 `WalletProvider`，用
+/// [`transfer_venue`] 算出的 venue 标注(而非 `scan`/`monitor` 等命令用的裸
+/// `"binance"`/`"kraken"`)，因为这个 venue 会被用作
+/// `ExecutionService::wallet_providers` 这个 HashMap 的 key，必须和
+/// `TransferRequest.from_venue`/`to_venue` 完全一致才能查到。
+fn build_transfer_wallet_provider(
+    name: &str,
+    testnet: bool,
+    proxy: Option<&str>,
+) -> anyhow::Result<Arc<dyn WalletProvider>> {
+    let venue = transfer_venue(name)?;
+    match name {
+        "binance" => Ok(Arc::new(BinanceWalletProvider::from_env(venue, testnet, proxy)?)),
+        "kraken" => Ok(Arc::new(KrakenWalletProvider::from_env(venue, proxy)?)),
+        _ => unreachable!("transfer_venue already validated name"),
+    }
+}
+
+/// `transfer` 子命令：手动发起一次跨交易所划转，走既有但此前从未被任何调用方
+/// 触达的划转订单管道 `RiskService -> ExecutionService::handle_transfer(真正
+/// 提币 + 乐观记账) -> TransferMonitor/OrderManager::confirm_transfer(到账确认
+/// + 手续费修正)`(见 037ce84/28e1b12)。
+///
+/// `--dry-run`(默认)在 CLI 层直接短路，只调用 `wallet::transfer::transfer_asset`
+/// 做链路校验(查 asset_info/deposit_address，真实网络请求但不产生资金变动)，
+/// 完全不碰 `TransferRequest`/`OrderManager`。**不能**简单把
+/// `TransferRequest.dry_run` 设为 true 后仍搭建完整流水线——`WalletProvider::
+/// withdraw` 的默认实现拦截 dry_run 时仍返回"成功"，会导致乐观记账真的执行、
+/// `mark_transfer_pending` 真的打上 pending，但因为没有真实提币，永远不会有
+/// `BalanceUpdate` 触发确认，留下一笔洗不掉的 `pending_qty`。所以 `--live`
+/// 路径下 `TransferRequest.dry_run` 恒为 `false`。
+///
+/// `--live` 默认额外阻塞等到账确认(`--no-wait` 可跳过)：目前代码库里没有任何
+/// 常驻服务在跑 `TransferMonitor`，提币受理后如果没人主动等，仓位会永远停在
+/// 乐观记账的 pending_qty，没有其它机制兜底。
+async fn run_transfer_command(args: &[String]) -> anyhow::Result<()> {
+    let mut symbol: Option<Symbol> = None;
+    let mut from_venue_name: Option<String> = None;
+    let mut to_venue_name: Option<String> = None;
+    let mut amount: Option<Decimal> = None;
+    let mut network: Option<String> = None;
+    let mut testnet = false;
+    let mut dry_run = true;
+    let mut client_order_id_prefix: Option<String> = None;
+    let mut no_wait = false;
+    let mut confirm_timeout_secs: u64 = 1800;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--symbol" => {
+                let v = args.get(i + 1).context("--symbol requires a value")?;
+                let (base, quote) = v
+                    .split_once('/')
+                    .context("--symbol must be in Base/Quote format, e.g. BTC/USDT")?;
+                symbol = Some(Symbol::new(base, quote));
+                i += 2;
+            }
+            "--from" => {
+                from_venue_name = Some(args.get(i + 1).context("--from requires a value")?.clone());
+                i += 2;
+            }
+            "--to" => {
+                to_venue_name = Some(args.get(i + 1).context("--to requires a value")?.clone());
+                i += 2;
+            }
+            "--amount" => {
+                let v = args.get(i + 1).context("--amount requires a value")?;
+                amount = Some(v.parse().context("--amount must be a valid decimal number")?);
+                i += 2;
+            }
+            "--network" => {
+                network = Some(args.get(i + 1).context("--network requires a value")?.clone());
+                i += 2;
+            }
+            "--testnet" => {
+                testnet = true;
+                i += 1;
+            }
+            "--dry-run" => {
+                dry_run = true;
+                i += 1;
+            }
+            "--live" => {
+                dry_run = false;
+                i += 1;
+            }
+            "--client-order-id-prefix" => {
+                client_order_id_prefix = Some(
+                    args.get(i + 1)
+                        .context("--client-order-id-prefix requires a value")?
+                        .clone(),
+                );
+                i += 2;
+            }
+            "--no-wait" => {
+                no_wait = true;
+                i += 1;
+            }
+            "--confirm-timeout-secs" => {
+                let v = args.get(i + 1).context("--confirm-timeout-secs requires a value")?;
+                confirm_timeout_secs =
+                    v.parse().context("--confirm-timeout-secs must be a valid non-negative integer")?;
+                i += 2;
+            }
+            other => anyhow::bail!("unknown argument '{other}' for 'transfer' subcommand"),
+        }
+    }
+
+    let symbol = symbol.context("--symbol is required, e.g. --symbol BTC/USDT")?;
+    let amount = amount.context("--amount is required, e.g. --amount 0.5")?;
+    let from_venue_name = from_venue_name.context("--from is required, e.g. --from binance")?;
+    let to_venue_name = to_venue_name.context("--to is required, e.g. --to kraken")?;
+    if from_venue_name == to_venue_name {
+        anyhow::bail!("--from and --to must be different venues, got '{from_venue_name}' for both");
+    }
+    let from_venue = transfer_venue(&from_venue_name)?;
+    let to_venue = transfer_venue(&to_venue_name)?;
+    let transfer_asset_name = symbol.base.to_string();
+
+    let proxy = net::proxy_from_env();
+    info!(
+        "transfer: symbol={symbol} asset={transfer_asset_name} from={from_venue} to={to_venue} amount={amount} testnet={testnet} dry_run={dry_run}"
+    );
+
+    if dry_run {
+        info!("transfer: dry_run=true (default), pass --live to actually withdraw");
+        let from_wallet = build_transfer_wallet_provider(&from_venue_name, testnet, proxy.as_deref())?;
+        let to_wallet = build_transfer_wallet_provider(&to_venue_name, testnet, proxy.as_deref())?;
+        let (transfer_qty, withdraw) = transfer_asset(
+            from_wallet.as_ref(),
+            to_wallet.as_ref(),
+            TransferParams {
+                asset: transfer_asset_name,
+                amount,
+                network,
+                dry_run: true,
+            },
+        )
+        .await?;
+        println!("transfer_qty={transfer_qty:?}");
+        println!("withdraw={withdraw:?}");
+        return Ok(());
+    }
+
+    // --live：走 RiskService -> ExecutionService -> OrderManager 全链路，真正
+    // 提币并对仓位做乐观记账，和 `open --live`/`rotate --live` 一样要求 Redis。
+    let redis_url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379/".to_string());
+    info!("transfer --live: connecting to redis at {redis_url}");
+    let bus = Arc::new(TopicBus::new());
+
+    let mut wallet_providers: HashMap<Venue, Arc<dyn WalletProvider>> = HashMap::new();
+    wallet_providers.insert(from_venue.clone(), build_transfer_wallet_provider(&from_venue_name, testnet, proxy.as_deref())?);
+    wallet_providers.insert(to_venue.clone(), build_transfer_wallet_provider(&to_venue_name, testnet, proxy.as_deref())?);
+
+    let pipeline = build_transfer_pipeline(&redis_url, bus.clone(), wallet_providers).await?;
+
+    let strategy = ManualStrategy::new(bus.clone(), pipeline.order_manager.clone());
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or_default();
+    let client_order_id = format!(
+        "{}transfer-{}",
+        client_order_id_prefix.map(|p| format!("{p}-")).unwrap_or_default(),
+        now_ms
+    );
+    let accepted = strategy
+        .submit_transfer_and_wait(
+            from_venue,
+            to_venue.clone(),
+            symbol,
+            amount,
+            network,
+            client_order_id,
+            Duration::from_secs(60),
+        )
+        .await?;
+    println!("提币已受理: {accepted:#?}");
+
+    if no_wait {
+        println!(
+            "--no-wait 已指定：未等待到账确认，订单 {} 的仓位将保持 pending，直到有人手动/后续对账工具核对。",
+            accepted.order_id
+        );
+        return Ok(());
+    }
+
+    info!("transfer: 等待到账确认 to_venue={to_venue} confirm_timeout_secs={confirm_timeout_secs}");
+
+    // 提前订阅，避免和后面启动的余额流/TransferMonitor 之间出现"事件已发出但
+    // 还没人订阅"的竞态。
+    let mut confirm_stream = bus.subscribe::<OrderEvent>(Topic::order_event(strategy.name()));
+
+    let balance_stream: Box<dyn BalanceStreamSource> = if to_venue == Venue::new("binance_spot") {
+        Box::new(BinanceBalanceStream::from_env(to_venue.clone(), testnet, proxy.as_deref())?)
+    } else {
+        Box::new(KrakenBalanceStream::from_env(to_venue.clone(), proxy.as_deref())?)
+    };
+
+    const STREAM_READY_TIMEOUT: Duration = Duration::from_secs(20);
+    let balance_handle = balance_stream.spawn(bus.clone());
+    tokio::time::timeout(STREAM_READY_TIMEOUT, balance_handle.ready)
+        .await
+        .with_context(|| format!("等待 {to_venue} 余额 WS 就绪超时"))?
+        .with_context(|| format!("{to_venue} 余额 WS 未能就绪就退出了(检查 API Key/网络)"))?;
+
+    let monitor = Arc::new(TransferMonitor::new(
+        bus.clone(),
+        pipeline.order_store.clone(),
+        pipeline.order_manager.clone(),
+        vec![to_venue.clone()],
+    ));
+    let _monitor_handles = monitor.start();
+
+    let order_id = accepted.order_id.clone();
+    let confirm_result = tokio::time::timeout(Duration::from_secs(confirm_timeout_secs), async {
+        loop {
+            match confirm_stream.next().await {
+                Some((_, OrderEvent::TransferConfirmed { order_id: oid, to_venue, asset, actual_delta })) if oid == order_id => {
+                    return Some((to_venue, asset, actual_delta));
+                }
+                Some(_) => continue,
+                None => return None,
+            }
+        }
+    })
+    .await;
+
+    balance_handle.join.abort();
+
+    match confirm_result {
+        Ok(Some((confirmed_venue, asset, actual_delta))) => {
+            println!("到账确认: to_venue={confirmed_venue} asset={asset} actual_delta={actual_delta}");
+            let final_order = pipeline.order_manager.get_order(&order_id);
+            println!("最终订单状态: {final_order:#?}");
+            Ok(())
+        }
+        Ok(None) => {
+            anyhow::bail!("order event stream closed while waiting for transfer order {order_id} deposit confirmation");
+        }
+        Err(_) => {
+            println!(
+                "提币已受理但到账未在 {confirm_timeout_secs}s 超时内确认，订单 {order_id} 仍处于 Transferred 状态，请之后人工用 TransferMonitor/后续对账工具核对。"
+            );
+            anyhow::bail!("timed out waiting for transfer order {order_id} deposit confirmation");
+        }
+    }
 }
 
 /// `open` 子命令：手动触发一次"币安现货按 USDT 金额买入 -> 币安 U 本位合约等量

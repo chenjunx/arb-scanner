@@ -14,12 +14,10 @@ use serde::Deserialize;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
-use crate::accounting::balance_stream::{BalanceStreamSource, BalanceUpdate};
 use crate::market_data::now_ms;
 use crate::net::connect_tcp;
-use crate::order_manager::stream::{ExchangeOrderUpdate, OrderStreamSource, StreamHandle};
+use crate::order_manager::stream::{ExchangeOrderUpdate, OrderStreamSource};
 use crate::order_manager::OrderManager;
-use crate::topic::{Topic, TopicBus};
 use crate::types::{Symbol, Venue};
 
 use super::OrderProvider;
@@ -30,15 +28,16 @@ const TESTNET_HOST: &str = "https://testnet.binance.vision";
 // 现货 listenKey REST 接口(POST/PUT/DELETE /api/v3/userDataStream)已在
 // 2026-02-20 下线，User Data Stream 改成在 WS API 连接内做 session.logon
 // 签名鉴权 + userDataStream.subscribe，见 BinanceUserDataStream。
-const WS_API_MAINNET_HOST: &str = "ws-api.binance.com";
-const WS_API_TESTNET_HOST: &str = "ws-api.testnet.binance.vision";
-const WS_API_PORT: u16 = 443;
-const WS_API_PATH: &str = "/ws-api/v3";
+// `pub(crate)`：`accounting::binance::BinanceBalanceStream` 复用同一个 WS API 端点。
+pub(crate) const WS_API_MAINNET_HOST: &str = "ws-api.binance.com";
+pub(crate) const WS_API_TESTNET_HOST: &str = "ws-api.testnet.binance.vision";
+pub(crate) const WS_API_PORT: u16 = 443;
+pub(crate) const WS_API_PATH: &str = "/ws-api/v3";
 // 5000 曾在并发下三条腿一起发请求时因调度延迟触发过一次 -1022(签名无效)，
 // 实际是时间戳超出 recvWindow 但被币安网关报成了签名错误，调大留出冗余。
 const RECV_WINDOW_MS: u64 = 10_000;
-const MIN_BACKOFF: Duration = Duration::from_secs(1);
-const MAX_BACKOFF: Duration = Duration::from_secs(30);
+pub(crate) const MIN_BACKOFF: Duration = Duration::from_secs(1);
+pub(crate) const MAX_BACKOFF: Duration = Duration::from_secs(30);
 
 /// 币安下单(执行层)客户端：查询交易对精度限制、提交市价单。签名方式和
 /// `wallet::binance::BinanceWalletProvider` 一致，用 Ed25519，凭证也复用同一套
@@ -236,7 +235,7 @@ fn build_query_string(params: &[(String, String)]) -> String {
 /// 推荐的生成方式)默认产出的是不带内嵌公钥的 PKCS8 v1，`from_pkcs8` 严格要求
 /// 带公钥的 v2 格式,遇到 v1 会报 `KeyRejected` 的 "VersionNotSupported"；
 /// `_maybe_unchecked` 同时兼容 v1/v2,v1 时只是跳过"内嵌公钥与私钥一致"的校验。
-fn load_ed25519_key(pem: &str) -> anyhow::Result<Ed25519KeyPair> {
+pub(crate) fn load_ed25519_key(pem: &str) -> anyhow::Result<Ed25519KeyPair> {
     let der = parse_pem_pkcs8(pem)?;
     Ed25519KeyPair::from_pkcs8_maybe_unchecked(&der)
         .map_err(|err| anyhow::anyhow!("invalid ed25519 pkcs8 key: {err}"))
@@ -252,7 +251,7 @@ fn parse_pem_pkcs8(pem: &str) -> anyhow::Result<Vec<u8>> {
 }
 
 /// 对 payload 做 Ed25519 签名，返回 base64 编码结果。
-fn sign_ed25519(key_pair: &Ed25519KeyPair, payload: &str) -> String {
+pub(crate) fn sign_ed25519(key_pair: &Ed25519KeyPair, payload: &str) -> String {
     let signature = key_pair.sign(payload.as_bytes());
     base64_engine.encode(signature.as_ref())
 }
@@ -546,7 +545,7 @@ impl OrderStreamSource for BinanceUserDataStream {
 }
 
 /// RFC 3986 未保留字符集之外的字节一律 percent-encode。
-fn percent_encode(input: &str) -> String {
+pub(crate) fn percent_encode(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     for byte in input.bytes() {
         match byte {
@@ -578,7 +577,7 @@ fn match_ws_api_response(text: &str, expected_id: &str) -> Option<bool> {
 /// 发送一条 WS API 请求并阻塞等待匹配 `id` 的响应；`status` 非 200 时把响应体
 /// 透传成错误。等待期间收到 `Ping` 帧会先回 `Pong`，避免在鉴权/订阅阶段就被
 /// 服务端因超时断连。
-async fn send_ws_api_request(
+pub(crate) async fn send_ws_api_request(
     ws: &mut WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
     expected_id: &str,
     req: &serde_json::Value,
@@ -605,9 +604,9 @@ async fn send_ws_api_request(
 }
 
 #[derive(Debug, Deserialize)]
-struct UserDataEventEnvelope {
+pub(crate) struct UserDataEventEnvelope {
     #[serde(rename = "e")]
-    event_type: String,
+    pub(crate) event_type: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -684,213 +683,6 @@ fn parse_execution_report(text: &str, venue: &Venue, symbol_map: &HashMap<String
         fee_asset: report.commission_asset.filter(|s| !s.is_empty()),
         ts_ms: report.event_time_ms,
     })
-}
-
-/// 币安现货余额变动流：和 `BinanceUserDataStream` 共用同一套 WS API 连接/鉴权
-/// 方式，仅关心 `balanceUpdate` 事件，将其转换为 `BalanceUpdate` 后通过
-/// `TopicBus` 发布。划转到账确认由 `TransferMonitor` 消费。
-pub struct BinanceBalanceStream {
-    venue: Venue,
-    api_key: String,
-    key_pair: Ed25519KeyPair,
-    ws_host: &'static str,
-    ws_port: u16,
-    proxy: Option<String>,
-}
-
-impl BinanceBalanceStream {
-    pub fn new(
-        venue: Venue,
-        api_key: String,
-        private_key_pem: &str,
-        testnet: bool,
-        proxy: Option<&str>,
-    ) -> anyhow::Result<Self> {
-        let key_pair = load_ed25519_key(private_key_pem)?;
-        let ws_host = if testnet { WS_API_TESTNET_HOST } else { WS_API_MAINNET_HOST };
-        Ok(Self {
-            venue,
-            api_key,
-            key_pair,
-            ws_host,
-            ws_port: WS_API_PORT,
-            proxy: proxy.map(str::to_string),
-        })
-    }
-
-    pub fn from_env(venue: Venue, testnet: bool, proxy: Option<&str>) -> anyhow::Result<Self> {
-        let api_key = std::env::var("BINANCE_API_KEY").context("BINANCE_API_KEY not set")?;
-        let private_key_pem = std::env::var("BINANCE_API_SECRET").context("BINANCE_API_SECRET not set")?;
-        Self::new(venue, api_key, &private_key_pem, testnet, proxy)
-    }
-
-    async fn connect(&self) -> anyhow::Result<WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>> {
-        let tcp = connect_tcp(self.ws_host, self.ws_port, self.proxy.as_deref()).await?;
-        let url = format!("wss://{}:{}{}", self.ws_host, self.ws_port, WS_API_PATH);
-        let (ws, _) = tokio_tungstenite::client_async_tls(url, tcp)
-            .await
-            .context("binance balance stream handshake failed")?;
-        Ok(ws)
-    }
-
-    fn sign_ws_params(&self, params: &[(&str, &str)]) -> String {
-        let mut sorted = params.to_vec();
-        sorted.sort_by_key(|(k, _)| *k);
-        let payload = sorted
-            .iter()
-            .map(|(k, v)| format!("{k}={}", percent_encode(v)))
-            .collect::<Vec<_>>()
-            .join("&");
-        sign_ed25519(&self.key_pair, &payload)
-    }
-
-    async fn session_logon(
-        &self,
-        ws: &mut WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
-    ) -> anyhow::Result<()> {
-        let timestamp = now_ms();
-        let timestamp_str = timestamp.to_string();
-        let signature = self.sign_ws_params(&[("apiKey", &self.api_key), ("timestamp", &timestamp_str)]);
-        let req = serde_json::json!({
-            "id": "logon",
-            "method": "session.logon",
-            "params": {
-                "apiKey": self.api_key,
-                "signature": signature,
-                "timestamp": timestamp,
-            }
-        });
-        send_ws_api_request(ws, "logon", &req).await.context("session.logon failed")
-    }
-
-    async fn subscribe_user_data(
-        &self,
-        ws: &mut WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
-    ) -> anyhow::Result<()> {
-        let req = serde_json::json!({"id": "sub", "method": "userDataStream.subscribe"});
-        send_ws_api_request(ws, "sub", &req).await.context("userDataStream.subscribe failed")
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct BalanceUpdatePayload {
-    #[serde(rename = "a")]
-    asset: String,
-    #[serde(rename = "d")]
-    delta: Decimal,
-    #[serde(rename = "E")]
-    event_time_ms: u64,
-}
-
-/// `balanceUpdate` 事件解析：取出 WS API 包装层的 `event` 字段后检查类型，
-/// 只处理 `balanceUpdate`，其它事件（`executionReport` 等）返回 `None`。
-fn parse_balance_update(text: &str, venue: &Venue) -> Option<BalanceUpdate> {
-    let raw: serde_json::Value = serde_json::from_str(text).ok()?;
-    let event = raw.get("event").cloned().unwrap_or(raw);
-
-    let envelope: UserDataEventEnvelope = serde_json::from_value(event.clone()).ok()?;
-    if envelope.event_type != "balanceUpdate" {
-        return None;
-    }
-
-    let payload: BalanceUpdatePayload = match serde_json::from_value(event) {
-        Ok(p) => p,
-        Err(err) => {
-            warn!("failed to parse binance balanceUpdate: {err}");
-            return None;
-        }
-    };
-
-    Some(BalanceUpdate {
-        venue: venue.clone(),
-        asset: payload.asset,
-        delta: payload.delta,
-        ts_ms: payload.event_time_ms,
-    })
-}
-
-impl BalanceStreamSource for BinanceBalanceStream {
-    fn venue(&self) -> Venue {
-        self.venue.clone()
-    }
-
-    fn spawn(self: Box<Self>, bus: std::sync::Arc<TopicBus>) -> StreamHandle {
-        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-        let join = tokio::spawn(async move {
-            let mut backoff = MIN_BACKOFF;
-            let mut ready_tx = Some(ready_tx);
-
-            loop {
-                let mut ws = match self.connect().await {
-                    Ok(ws) => ws,
-                    Err(err) => {
-                        warn!(
-                            "binance balance stream connect failed for venue={} err={err:#}, retrying in {:?}",
-                            self.venue, backoff
-                        );
-                        tokio::time::sleep(backoff).await;
-                        backoff = (backoff * 2).min(MAX_BACKOFF);
-                        continue;
-                    }
-                };
-
-                if let Err(err) = self.session_logon(&mut ws).await {
-                    warn!(
-                        "binance balance stream: session.logon failed for venue={} err={err:#}, retrying in {:?}",
-                        self.venue, backoff
-                    );
-                    tokio::time::sleep(backoff).await;
-                    backoff = (backoff * 2).min(MAX_BACKOFF);
-                    continue;
-                }
-                if let Err(err) = self.subscribe_user_data(&mut ws).await {
-                    warn!(
-                        "binance balance stream: userDataStream.subscribe failed for venue={} err={err:#}, retrying in {:?}",
-                        self.venue, backoff
-                    );
-                    tokio::time::sleep(backoff).await;
-                    backoff = (backoff * 2).min(MAX_BACKOFF);
-                    continue;
-                }
-                debug!("binance balance stream connected and subscribed for venue={}", self.venue);
-                backoff = MIN_BACKOFF;
-                if let Some(tx) = ready_tx.take() {
-                    let _ = tx.send(());
-                }
-
-                loop {
-                    let msg = match ws.next().await {
-                        Some(Ok(msg)) => msg,
-                        Some(Err(err)) => {
-                            warn!("binance balance stream error for venue={} err={err}", self.venue);
-                            break;
-                        }
-                        None => break,
-                    };
-                    match msg {
-                        Message::Ping(payload) => {
-                            if ws.send(Message::Pong(payload)).await.is_err() {
-                                break;
-                            }
-                        }
-                        Message::Text(text) => {
-                            let Some(update) = parse_balance_update(&text, &self.venue) else { continue };
-                            bus.publish(Topic::balance_update(self.venue.clone()), update);
-                        }
-                        _ => {}
-                    }
-                }
-
-                warn!(
-                    "binance balance stream disconnected for venue={}, reconnecting in {:?}",
-                    self.venue, backoff
-                );
-                tokio::time::sleep(backoff).await;
-                backoff = (backoff * 2).min(MAX_BACKOFF);
-            }
-        });
-        StreamHandle { join, ready: ready_rx }
-    }
 }
 
 #[cfg(test)]

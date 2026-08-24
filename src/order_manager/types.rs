@@ -198,7 +198,7 @@ pub enum OrderEvent {
         qty: Decimal,
         withdraw_id: String,
     },
-    /// 划转到账确认：余额变动事件与划转单匹配，到账量与请求量偏差在 5% 以内
+    /// 划转到账确认：余额变动事件与划转单匹配，到账量与请求量偏差在 10% 以内
     TransferConfirmed {
         order_id: OrderId,
         to_venue: Venue,

@@ -24,10 +24,11 @@ use super::OrderProvider;
 use super::types::{LimitIocOrderRequest, MarketOrderRequest, OrderAmount, OrderResult, OrderSide, OrderStatus};
 
 const HOST: &str = "https://api.kraken.com";
-const WS_HOST: &str = "ws-auth.kraken.com";
-const WS_PORT: u16 = 443;
-const MIN_BACKOFF: Duration = Duration::from_secs(1);
-const MAX_BACKOFF: Duration = Duration::from_secs(30);
+/// `pub(crate)`：`accounting::kraken::KrakenBalanceStream` 复用同一个私有 WS 端点。
+pub(crate) const WS_HOST: &str = "ws-auth.kraken.com";
+pub(crate) const WS_PORT: u16 = 443;
+pub(crate) const MIN_BACKOFF: Duration = Duration::from_secs(1);
+pub(crate) const MAX_BACKOFF: Duration = Duration::from_secs(30);
 
 /// Kraken 下单(执行层)客户端：查询交易对精度限制、提交市价单。签名方式和
 /// `wallet::kraken::KrakenWalletProvider` 一致，用标准 HMAC-SHA512，凭证也复用
@@ -130,9 +131,10 @@ impl OrderProvider for KrakenOrderProvider {
 }
 
 /// 签名并发起一次 Kraken 私有 POST 请求。抽成自由函数是因为
-/// `KrakenOrderProvider`(下单)和 `KrakenPrivateOrderStream`(私有订单流的
-/// token 获取)都需要同一套 HMAC 签名逻辑。
-async fn kraken_private_request(
+/// `KrakenOrderProvider`(下单)、`KrakenPrivateOrderStream`(私有订单流的
+/// token 获取)和 `accounting::kraken::KrakenBalanceStream` 都需要同一套 HMAC
+/// 签名逻辑，因此是 `pub(crate)`。
+pub(crate) async fn kraken_private_request(
     http: &reqwest::Client,
     api_key: &str,
     api_secret: &str,
@@ -167,7 +169,7 @@ async fn kraken_public_get(http: &reqwest::Client, path: &str, params: Vec<(Stri
     resp.text().await.context("failed to read kraken public response body")
 }
 
-fn build_http_client(proxy: Option<&str>) -> anyhow::Result<reqwest::Client> {
+pub(crate) fn build_http_client(proxy: Option<&str>) -> anyhow::Result<reqwest::Client> {
     let mut builder = reqwest::Client::builder();
     if let Some(proxy) = proxy {
         let proxy = reqwest::Proxy::all(format!("http://{proxy}")).context("invalid proxy address")?;
@@ -416,7 +418,7 @@ struct WsTokenResult {
     token: String,
 }
 
-fn parse_ws_token(text: &str) -> anyhow::Result<String> {
+pub(crate) fn parse_ws_token(text: &str) -> anyhow::Result<String> {
     let result: WsTokenResult = unwrap_result(text)?;
     Ok(result.token)
 }
@@ -432,9 +434,9 @@ fn map_kraken_ws_status(status: &str) -> OrderStatus {
 }
 
 #[derive(Debug, Deserialize)]
-struct ChannelEnvelope {
+pub(crate) struct ChannelEnvelope {
     #[serde(default)]
-    channel: Option<String>,
+    pub(crate) channel: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -843,4 +845,5 @@ mod tests {
         let venue = Venue::new("kraken");
         assert!(parse_kraken_execution("not json", &venue).is_empty());
     }
+
 }
