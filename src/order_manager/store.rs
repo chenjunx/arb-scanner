@@ -77,7 +77,7 @@ mod tests {
     fn sample_order(order_id: &str) -> Order {
         Order {
             order_id: OrderId::new(order_id),
-            request: OrderRequest {
+            request: crate::order_manager::types::AnyOrderRequest::Trade(OrderRequest {
                 strategy_id: "test".to_string(),
                 venue: Venue::new("binance_spot"),
                 symbol: Symbol::new("BTC", "USDT"),
@@ -87,7 +87,7 @@ mod tests {
                 group_id: None,
                 metadata: None,
                 order_id: None,
-            },
+            }),
             status: OrderStatus::New,
             filled_qty: Decimal::ZERO,
             avg_price: None,

@@ -83,6 +83,7 @@ mod tests {
                     avg_price: Some(Decimal::new(50000, 0)),
                     total_fees: std::collections::HashMap::new(),
                     realized_pnl: Decimal::ZERO,
+                    pending_qty: Decimal::ZERO,
                     updated_at_ms: 1,
                 }
             }),

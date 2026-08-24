@@ -1,4 +1,5 @@
 use rust_decimal::Decimal;
+use serde::de::Deserializer;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::oneshot;
@@ -22,92 +23,187 @@ impl std::fmt::Display for OrderId {
     }
 }
 
-/// 策略提交的订单请求
+/// 策略提交的交易订单请求
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrderRequest {
-    /// 策略名称，用于跟踪和风控。`#[serde(default)]` 兼容这个字段引入之前
-    /// 写入 Redis 的旧订单记录——否则反序列化直接失败，这些订单会从
-    /// `all_orders()`/reconcile 扫描/报表里彻底消失（不会像 `VenuePosition`
-    /// 那样被当成"不存在"回写覆盖，因为 `RedisOrderStore::update` 反序列化
-    /// 失败时只是跳过返回 NotFound，不会拿一个新对象覆盖旧记录）。
     #[serde(default)]
     pub strategy_id: String,
-    /// 目标交易所
     pub venue: Venue,
-    /// 交易对
     pub symbol: Symbol,
-    /// 买卖方向
     pub side: OrderSide,
-    /// 订单数量
     pub amount: OrderAmount,
-    /// 可选的客户端订单ID
     pub client_order_id: Option<String>,
-    /// 用于关联多条腿的组ID (如套利的买卖两条腿)
     pub group_id: Option<String>,
-    /// 策略附加元数据
     pub metadata: Option<String>,
-    /// 内部订单ID，由 RiskService 在风控通过、转发给 ExecutionService 之前
-    /// 填入；策略提交时始终为 None。ExecutionService/OrderManager 发布
-    /// OrderEvent 时都必须使用这个 ID，保证策略拿到的事件和自己提交的这笔
-    /// 请求能对上号。
     pub order_id: Option<OrderId>,
 }
 
-/// 经过 OrderManager 增强后的内部订单
+/// 策略提交的划转请求：从一个交易所钱包提币到另一个交易所。
+/// `symbol` 用于仓位追踪（如 BTC/USDT），`amount` 是 base 币种的数量。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransferRequest {
+    #[serde(default)]
+    pub strategy_id: String,
+    /// 提币方交易所
+    pub from_venue: Venue,
+    /// 收款方交易所
+    pub to_venue: Venue,
+    /// 仓位追踪用的交易对（如 BTC/USDT）；base 即为划转币种
+    pub symbol: Symbol,
+    /// 划转数量（base 币种单位）
+    pub amount: Decimal,
+    /// 链网络，None 时在 `from_venue`/`to_venue` 之间自动匹配共同链
+    #[serde(default)]
+    pub network: Option<String>,
+    /// true 时只做校验，不真正发起提币
+    #[serde(default)]
+    pub dry_run: bool,
+    pub client_order_id: Option<String>,
+    pub group_id: Option<String>,
+    pub metadata: Option<String>,
+    pub order_id: Option<OrderId>,
+}
+
+/// 统一的订单提交类型，走同一条总线管道。
+/// 序列化时写入 `"kind"` 标签字段；反序列化时若没有该字段（兼容旧 Redis 记录），
+/// 自动当作 `Trade` 处理。
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AnyOrderRequest {
+    Trade(OrderRequest),
+    Transfer(TransferRequest),
+}
+
+impl AnyOrderRequest {
+    pub fn strategy_id(&self) -> &str {
+        match self {
+            Self::Trade(r) => &r.strategy_id,
+            Self::Transfer(r) => &r.strategy_id,
+        }
+    }
+
+    pub fn order_id(&self) -> Option<&OrderId> {
+        match self {
+            Self::Trade(r) => r.order_id.as_ref(),
+            Self::Transfer(r) => r.order_id.as_ref(),
+        }
+    }
+
+    pub fn set_order_id(&mut self, id: OrderId) {
+        match self {
+            Self::Trade(r) => r.order_id = Some(id),
+            Self::Transfer(r) => r.order_id = Some(id),
+        }
+    }
+
+    pub fn client_order_id(&self) -> Option<&str> {
+        match self {
+            Self::Trade(r) => r.client_order_id.as_deref(),
+            Self::Transfer(r) => r.client_order_id.as_deref(),
+        }
+    }
+
+    /// 主 venue（Trade 的执行交易所；Transfer 的 from_venue）
+    pub fn from_venue(&self) -> &Venue {
+        match self {
+            Self::Trade(r) => &r.venue,
+            Self::Transfer(r) => &r.from_venue,
+        }
+    }
+
+    pub fn as_trade(&self) -> Option<&OrderRequest> {
+        if let Self::Trade(r) = self { Some(r) } else { None }
+    }
+
+    pub fn as_transfer(&self) -> Option<&TransferRequest> {
+        if let Self::Transfer(r) = self { Some(r) } else { None }
+    }
+}
+
+/// 兼容旧 Redis 记录（无 `kind` 字段）：若有 `kind` 标签按正常路径反序列化，
+/// 否则按 `OrderRequest` 反序列化并包装成 `Trade`。
+impl<'de> Deserialize<'de> for AnyOrderRequest {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = serde_json::Value::deserialize(deserializer)?;
+        if raw.get("kind").is_some() {
+            #[derive(Deserialize)]
+            #[serde(tag = "kind", rename_all = "snake_case")]
+            enum Tagged {
+                Trade(OrderRequest),
+                Transfer(TransferRequest),
+            }
+            serde_json::from_value::<Tagged>(raw)
+                .map(|t| match t {
+                    Tagged::Trade(r) => AnyOrderRequest::Trade(r),
+                    Tagged::Transfer(r) => AnyOrderRequest::Transfer(r),
+                })
+                .map_err(serde::de::Error::custom)
+        } else {
+            serde_json::from_value::<OrderRequest>(raw)
+                .map(AnyOrderRequest::Trade)
+                .map_err(serde::de::Error::custom)
+        }
+    }
+}
+
+/// 经过 RiskService 增强后的内部订单
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Order {
-    /// 内部订单ID
     pub order_id: OrderId,
-    /// 原始请求
-    pub request: OrderRequest,
-    /// 订单状态
+    pub request: AnyOrderRequest,
     pub status: OrderStatus,
-    /// 已成交数量
+    /// 已成交/已划转数量
     pub filled_qty: Decimal,
-    /// 平均成交价
+    /// 平均成交价（划转单始终为 None）
     pub avg_price: Option<Decimal>,
-    /// 交易所返回的订单ID
+    /// 交易所订单 ID 或提币 ID
     pub exchange_order_id: Option<String>,
-    /// 创建时间戳 (毫秒)
     pub created_at_ms: u64,
-    /// 最后更新时间戳 (毫秒)
     pub updated_at_ms: u64,
-    /// 拒绝原因 (如果被风控或交易所拒绝)
     pub reject_reason: Option<String>,
 }
 
 /// 订单事件，用于通知策略
 #[derive(Debug, Clone)]
 pub enum OrderEvent {
-    /// 订单已提交到风控引擎
     Submitted {
         order_id: OrderId,
     },
-    /// 订单通过风控，已发送到交易所
     Accepted {
         order_id: OrderId,
     },
-    /// 订单被风控拒绝
     RejectedByRisk {
         order_id: OrderId,
         reason: String,
     },
-    /// 订单被交易所拒绝
     RejectedByExchange {
         order_id: OrderId,
         reason: String,
     },
-    /// 部分成交
     PartiallyFilled {
         order_id: OrderId,
         filled_qty: Decimal,
         avg_price: Decimal,
     },
-    /// 完全成交
     Filled {
         order_id: OrderId,
         filled_qty: Decimal,
         avg_price: Decimal,
+    },
+    /// 划转单已成功提币（仓位已同步更新）
+    Transferred {
+        order_id: OrderId,
+        from_venue: Venue,
+        to_venue: Venue,
+        qty: Decimal,
+        withdraw_id: String,
+    },
+    /// 划转到账确认：余额变动事件与划转单匹配，到账量与请求量偏差在 5% 以内
+    TransferConfirmed {
+        order_id: OrderId,
+        to_venue: Venue,
+        asset: String,
+        actual_delta: Decimal,
     },
 }
 
@@ -121,6 +217,5 @@ pub enum RiskCheckResult {
 /// 订单提交的响应，包含订单ID和结果通道
 pub struct OrderResponse {
     pub order_id: OrderId,
-    /// 用于接收最终成交结果的通道
     pub result_rx: oneshot::Receiver<Result<Order, String>>,
 }

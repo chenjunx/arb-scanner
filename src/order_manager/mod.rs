@@ -14,3 +14,4 @@ pub use execution_service::{ExchangeAdapter, ExecutionService};
 pub use redis_store::{RedisOrderIdAllocator, RedisOrderStore};
 pub use store::{InMemoryOrderStore, OrderStore};
 pub use stream::{ExchangeOrderUpdate, OrderStreamSource};
+pub use types::{AnyOrderRequest, TransferRequest};

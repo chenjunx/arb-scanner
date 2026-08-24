@@ -8,7 +8,7 @@ use rust_decimal::Decimal;
 
 use crate::market_data::now_ms;
 use crate::order::types::{OrderAmount, OrderSide};
-use crate::order_manager::types::OrderRequest;
+use crate::order_manager::types::{AnyOrderRequest, OrderRequest, TransferRequest};
 use crate::topic::{Topic, TopicBus};
 use crate::types::{Quote, Symbol, Venue};
 
@@ -99,7 +99,39 @@ pub trait Strategy: Send + Sync {
             metadata,
             order_id: None,
         };
-        self.bus().publish(Topic::order_submit(), request);
+        self.bus().publish(Topic::order_submit(), AnyOrderRequest::Trade(request));
+    }
+
+    /// 提交划转单到风控层：在 `from_venue` 提币 `amount` 数量的 `symbol.base`，
+    /// 划转到 `to_venue`；成功后仓位自动更新（由 ExecutionService 在提币成功时调用
+    /// PositionManager::on_transfer 完成）。
+    fn submit_transfer(
+        &self,
+        from_venue: Venue,
+        to_venue: Venue,
+        symbol: Symbol,
+        amount: Decimal,
+        network: Option<String>,
+        dry_run: bool,
+        client_order_id: Option<String>,
+        group_id: Option<String>,
+        metadata: Option<String>,
+    ) {
+        let client_order_id = client_order_id.unwrap_or_else(|| self.generate_client_order_id());
+        let request = TransferRequest {
+            strategy_id: self.name().to_string(),
+            from_venue,
+            to_venue,
+            symbol,
+            amount,
+            network,
+            dry_run,
+            client_order_id: Some(client_order_id),
+            group_id,
+            metadata,
+            order_id: None,
+        };
+        self.bus().publish(Topic::order_submit(), AnyOrderRequest::Transfer(request));
     }
 
     /// 生成 client_order_id，带随机后缀避免同一策略在同一毫秒内提交多笔订单时

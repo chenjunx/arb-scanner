@@ -5,6 +5,55 @@ use rust_decimal::Decimal;
 use super::types::{WithdrawRequest, WithdrawResult};
 use super::WalletProvider;
 
+/// 通用划转参数，供 `transfer_asset` 使用。
+#[derive(Debug, Clone)]
+pub struct TransferParams {
+    pub asset: String,
+    pub amount: Decimal,
+    /// 链网络，None 时在两个钱包之间自动匹配唯一共同链
+    pub network: Option<String>,
+    pub dry_run: bool,
+}
+
+/// 通用划转：从 `from_wallet` 提币到 `to_wallet`。
+/// 网络未指定时自动在两端求共同链（要求唯一）；解析出的地址后再发起提币。
+/// 返回实际划转数量和提币结果。
+pub async fn transfer_asset(
+    from_wallet: &dyn WalletProvider,
+    to_wallet: &dyn WalletProvider,
+    params: TransferParams,
+) -> anyhow::Result<(Decimal, WithdrawResult)> {
+    if params.amount <= Decimal::ZERO {
+        anyhow::bail!("transfer amount must be > 0, got {}", params.amount);
+    }
+
+    let network = match params.network {
+        Some(n) => n,
+        None => resolve_transfer_network(from_wallet, to_wallet, &params.asset).await?,
+    };
+    log::info!(
+        "transfer_asset: resolved network={network} for asset={} from={} to={}",
+        params.asset,
+        from_wallet.venue(),
+        to_wallet.venue(),
+    );
+
+    let deposit_address = to_wallet.deposit_address(&params.asset, &network).await?;
+    let withdraw = from_wallet
+        .withdraw(WithdrawRequest {
+            asset: params.asset.clone(),
+            network,
+            address: deposit_address.address,
+            tag: deposit_address.tag,
+            amount: params.amount,
+            dry_run: params.dry_run,
+        })
+        .await?;
+    log::info!("transfer_asset: withdraw result = {:?}", withdraw);
+
+    Ok((params.amount, withdraw))
+}
+
 /// 划转参数：`filled_qty / 2` 截断到 8 位小数，用于"现货已买入、合约已对冲，
 /// 只从划转步骤继续"的场景（见 `main.rs` 里 `open --from-transfer`）。
 #[derive(Debug, Clone)]
