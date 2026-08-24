@@ -36,7 +36,6 @@ const KRAKEN_METHOD_TO_STANDARD: &[(&str, &str)] = &[
     // 下面两条格式和 "<TICKER> - <链名>" 外壳不一样，剥壳逻辑套不上，只能
     // 按完整原始字符串精确收录(均已用真实 `DepositMethods` 输出核对过)。
     ("S (Sonic)", "SONIC"),
-    ("USDC (SPL)", "SOL"),
     ("Stellar XLM", "XLM"),
     ("Tron", "TRX"),
     ("Solana", "SOL"),
@@ -435,7 +434,6 @@ mod tests {
     #[test]
     fn native_to_standard_maps_non_standard_wrapper_formats_exactly() {
         assert_eq!(native_to_standard("S (Sonic)"), "SONIC");
-        assert_eq!(native_to_standard("USDC (SPL)"), "SOL");
         assert_eq!(native_to_standard("USDC - Stellar XLM"), "XLM");
     }
 
