@@ -127,16 +127,6 @@ fn native_to_standard(native: &str) -> String {
     lookup(native).or_else(|| lookup(strip_unified_wrapper(native))).unwrap_or_else(|| native.to_string())
 }
 
-/// 标准链名 -> Kraken 原生方式名，大小写不敏感；查不到就原样透传(视为调用方
-/// 直接传入了原生名称)。
-fn standard_to_native(standard: &str) -> String {
-    KRAKEN_METHOD_TO_STANDARD
-        .iter()
-        .find(|(_, s)| s.eq_ignore_ascii_case(standard))
-        .map(|(native, _)| native.to_string())
-        .unwrap_or_else(|| standard.to_string())
-}
-
 /// Kraken 钱包(转账层)客户端：读取收款地址/链(方式)信息、发起提币。签名沿用
 /// Kraken 私有接口的标准 HMAC-SHA512 方案(Kraken 目前只支持这一种，不像币安
 /// 有 Ed25519/RSA 可选)。
@@ -206,7 +196,23 @@ impl WalletProvider for KrakenWalletProvider {
     }
 
     async fn deposit_address(&self, asset: &str, network: &str) -> anyhow::Result<DepositAddress> {
-        let native_method = standard_to_native(network);
+        // 不走静态反查表猜原生方式名：同一个标准链名可能对应多个原生方式名
+        // (如 "Solana" 通用方式和某些资产专属的 "<TICKER> - Solana" 变体)，
+        // 猜错了 Kraken 会报 `EFunding:No funding method`。改成先查一次这个
+        // 资产真实的 DepositMethods 列表，直接用它自带的原生方式名，保证和
+        // 资产精确匹配。
+        let info = self.asset_info(asset).await?;
+        let native_method = info
+            .networks
+            .iter()
+            .find(|n| n.network.eq_ignore_ascii_case(network))
+            .map(|n| n.name.clone())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "kraken has no deposit method for {asset} on network {network}; available networks: {:?}",
+                    info.networks.iter().map(|n| &n.network).collect::<Vec<_>>()
+                )
+            })?;
         let params = vec![
             ("asset".to_string(), asset.to_string()),
             ("method".to_string(), native_method),
@@ -443,17 +449,6 @@ mod tests {
         // Polkadot relay chain 与 Asset Hub 的对应关系有歧义，不在表里，保持
         // 原样透传，而不是猜一个标准链名。
         assert_eq!(native_to_standard("Polkadot"), "Polkadot");
-    }
-
-    #[test]
-    fn standard_to_native_round_trips_known_codes() {
-        assert_eq!(standard_to_native("BTC"), "Bitcoin");
-        assert_eq!(standard_to_native("btc"), "Bitcoin");
-    }
-
-    #[test]
-    fn standard_to_native_passes_through_unknown_codes() {
-        assert_eq!(standard_to_native("SHIB"), "SHIB");
     }
 
     #[test]
