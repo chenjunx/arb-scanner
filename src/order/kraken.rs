@@ -21,7 +21,7 @@ use crate::order_manager::stream::{ExchangeOrderUpdate, OrderStreamSource};
 use crate::types::{Symbol, Venue};
 
 use super::OrderProvider;
-use super::types::{MarketOrderRequest, OrderAmount, OrderResult, OrderSide, OrderStatus};
+use super::types::{LimitIocOrderRequest, MarketOrderRequest, OrderAmount, OrderResult, OrderSide, OrderStatus};
 
 const HOST: &str = "https://api.kraken.com";
 const WS_HOST: &str = "ws-auth.kraken.com";
@@ -37,7 +37,11 @@ const MAX_BACKOFF: Duration = Duration::from_secs(30);
 /// 告知是否已成交/成交多少——本实现里 `place_market_order_raw` 因此固定返回
 /// `OrderStatus::New`、`filled_qty=0`、`avg_price=None`，调用方需要清楚这不是
 /// 遗漏而是接口本身的限制；要拿到真实成交结果需要额外调用 `QueryOrders`
-/// (本模块暂未实现)。
+/// (本模块暂未实现)。限价 IOC 单(`place_limit_ioc_order_raw`)同样适用这个
+/// 限制——`AddOrder` 无论 `ordertype`/`timeinforce` 是什么，同步响应都只有
+/// `txid`；真实成交结果要靠 `KrakenPrivateOrderStream` 的 `executions` WS
+/// 推送获取，其 `map_kraken_ws_status` 已覆盖 filled/partially_filled/
+/// canceled/expired，不需要改动。
 pub struct KrakenOrderProvider {
     venue: Venue,
     api_key: String,
@@ -89,6 +93,22 @@ impl OrderProvider for KrakenOrderProvider {
             ("type".to_string(), map_side(req.side).to_string()),
             ("ordertype".to_string(), "market".to_string()),
             ("volume".to_string(), quantity.to_string()),
+        ];
+        if let Some(client_order_id) = &req.client_order_id {
+            params.push(("cl_ord_id".to_string(), client_order_id.clone()));
+        }
+        let text = self.private_request("/0/private/AddOrder", params).await?;
+        parse_add_order_result(&text)
+    }
+
+    async fn place_limit_ioc_order_raw(&self, req: &LimitIocOrderRequest) -> anyhow::Result<OrderResult> {
+        let mut params = vec![
+            ("pair".to_string(), Self::kraken_pair(&req.symbol)),
+            ("type".to_string(), map_side(req.side).to_string()),
+            ("ordertype".to_string(), "limit".to_string()),
+            ("price".to_string(), req.price.to_string()),
+            ("volume".to_string(), req.quantity.to_string()),
+            ("timeinforce".to_string(), "ioc".to_string()),
         ];
         if let Some(client_order_id) = &req.client_order_id {
             params.push(("cl_ord_id".to_string(), client_order_id.clone()));
@@ -577,6 +597,25 @@ mod tests {
         assert_eq!(result.avg_price, None);
         assert_eq!(result.fee, None);
         assert_eq!(result.fee_asset, None);
+    }
+
+    /// `parse_add_order_result` 对 IOC 形状的响应无需任何改动——AddOrder 同步
+    /// 响应无论 `ordertype`/`timeinforce` 是什么都只有 `txid`，本测试主要是
+    /// 文档性的，确认这个复用假设成立。
+    #[test]
+    fn parses_limit_ioc_add_order_result() {
+        let text = r#"{
+            "error": [],
+            "result": {
+                "descr": {"order": "buy 0.0002 XBTUSD @ limit 30000.0 with timeinforce IOC"},
+                "txid": ["OABCDE-12345-ZYXWVU"]
+            }
+        }"#;
+        let result = parse_add_order_result(text).expect("should parse");
+        assert_eq!(result.order_id, "OABCDE-12345-ZYXWVU");
+        assert_eq!(result.status, OrderStatus::New);
+        assert_eq!(result.filled_qty, Decimal::ZERO);
+        assert_eq!(result.avg_price, None);
     }
 
     #[test]

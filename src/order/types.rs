@@ -43,6 +43,26 @@ pub struct MarketOrderRequest {
     pub dry_run: bool,
 }
 
+/// 限价 IOC (Immediate-or-Cancel) 单请求：以指定价格立即成交，未成交部分
+/// 立刻撤销。三家交易所的限价单目前都只接受按基础币数量下单(没有市价单
+/// `quoteOrderQty` 那种按计价币金额下单的等价参数)，因此 `quantity` 直接用
+/// `Decimal`，不复用 `OrderAmount` 枚举。
+#[derive(Debug, Clone, PartialEq)]
+pub struct LimitIocOrderRequest {
+    pub symbol: Symbol,
+    pub side: OrderSide,
+    /// 基础币数量；精度由调用方通过 `PrecisionCache::round_qty` 提前算好，
+    /// 这一层只校验为正。
+    pub quantity: Decimal,
+    /// 限价；精度由调用方通过 `PrecisionCache::round_price` 提前对齐价格
+    /// 步长，这一层只校验为正。
+    pub price: Decimal,
+    /// 语义同 `MarketOrderRequest::client_order_id`。
+    pub client_order_id: Option<String>,
+    /// 语义同 `MarketOrderRequest::dry_run`。
+    pub dry_run: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OrderStatus {
     New,

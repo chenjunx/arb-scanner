@@ -22,7 +22,7 @@ use crate::order_manager::OrderManager;
 use crate::types::{Symbol, Venue};
 
 use super::OrderProvider;
-use super::types::{MarketOrderRequest, OrderAmount, OrderResult, OrderSide, OrderStatus};
+use super::types::{LimitIocOrderRequest, MarketOrderRequest, OrderAmount, OrderResult, OrderSide, OrderStatus};
 
 const MAINNET_HOST: &str = "https://fapi.binance.com";
 const TESTNET_HOST: &str = "https://testnet.binancefuture.com";
@@ -148,6 +148,25 @@ impl OrderProvider for BinanceFuturesOrderProvider {
             ("quantity".to_string(), quantity.to_string()),
             // 默认 MARKET 单只同步返回 ACK(无成交信息)，必须显式要求 RESULT
             // 才能在下单响应里同步拿到 avgPrice/executedQty。
+            ("newOrderRespType".to_string(), "RESULT".to_string()),
+        ];
+        if let Some(client_order_id) = &req.client_order_id {
+            params.push(("newClientOrderId".to_string(), client_order_id.clone()));
+        }
+        let text = self.signed_request(reqwest::Method::POST, "/fapi/v1/order", params).await?;
+        parse_order_response(&text)
+    }
+
+    async fn place_limit_ioc_order_raw(&self, req: &LimitIocOrderRequest) -> anyhow::Result<OrderResult> {
+        let mut params = vec![
+            ("symbol".to_string(), binance_symbol(&req.symbol)),
+            ("side".to_string(), map_side(req.side).to_string()),
+            ("type".to_string(), "LIMIT".to_string()),
+            ("timeInForce".to_string(), "IOC".to_string()),
+            ("quantity".to_string(), req.quantity.to_string()),
+            ("price".to_string(), req.price.to_string()),
+            // 默认 LIMIT 单只同步返回 ACK(无成交信息)，和市价单一样必须显式
+            // 要求 RESULT 才能在下单响应里同步拿到 avgPrice/executedQty。
             ("newOrderRespType".to_string(), "RESULT".to_string()),
         ];
         if let Some(client_order_id) = &req.client_order_id {
@@ -449,6 +468,9 @@ fn map_side(side: OrderSide) -> &'static str {
     }
 }
 
+/// 限价 IOC 单未成交部分被撤销后，终态是 `"EXPIRED"`(不是 `"CANCELED"`)，
+/// 但 `executedQty`/`avgPrice` 仍带真实已成交量——`Expired` 不代表零成交，
+/// 部分成交后剩余被撤销的 IOC 单也是这个终态。
 fn map_status(status: &str) -> OrderStatus {
     match status {
         "FILLED" => OrderStatus::Filled,
@@ -769,6 +791,77 @@ mod tests {
         assert_eq!(result.status, OrderStatus::Filled);
         assert_eq!(result.filled_qty, "10".parse().unwrap());
         assert_eq!(result.avg_price, Some("100.00000".parse().unwrap()));
+    }
+
+    #[test]
+    fn parses_limit_ioc_order_response_fully_filled() {
+        let text = r#"{
+            "orderId": 28,
+            "symbol": "BTCUSDT",
+            "status": "FILLED",
+            "clientOrderId": "abc",
+            "price": "100",
+            "avgPrice": "100.00000",
+            "origQty": "10",
+            "executedQty": "10",
+            "cumQuote": "1000",
+            "timeInForce": "IOC",
+            "type": "LIMIT",
+            "side": "BUY",
+            "positionSide": "BOTH"
+        }"#;
+        let result = parse_order_response(text).expect("should parse");
+        assert_eq!(result.status, OrderStatus::Filled);
+        assert_eq!(result.filled_qty, "10".parse().unwrap());
+        assert_eq!(result.avg_price, Some("100.00000".parse().unwrap()));
+    }
+
+    /// IOC 单部分成交、剩余被撤销后终态是 EXPIRED，但 filled_qty 要保留真实
+    /// 已成交量，不能因为状态是"过期"就误当成零成交处理。
+    #[test]
+    fn parses_limit_ioc_order_response_partially_filled_then_expired() {
+        let text = r#"{
+            "orderId": 29,
+            "symbol": "BTCUSDT",
+            "status": "EXPIRED",
+            "clientOrderId": "abc",
+            "price": "100",
+            "avgPrice": "100.00000",
+            "origQty": "10",
+            "executedQty": "4",
+            "cumQuote": "400",
+            "timeInForce": "IOC",
+            "type": "LIMIT",
+            "side": "BUY",
+            "positionSide": "BOTH"
+        }"#;
+        let result = parse_order_response(text).expect("should parse");
+        assert_eq!(result.status, OrderStatus::Expired);
+        assert_eq!(result.filled_qty, "4".parse().unwrap());
+        assert_eq!(result.avg_price, Some("100.00000".parse().unwrap()));
+    }
+
+    #[test]
+    fn parses_limit_ioc_order_response_fully_expired_no_fill() {
+        let text = r#"{
+            "orderId": 30,
+            "symbol": "BTCUSDT",
+            "status": "EXPIRED",
+            "clientOrderId": "abc",
+            "price": "100",
+            "avgPrice": "0",
+            "origQty": "10",
+            "executedQty": "0",
+            "cumQuote": "0",
+            "timeInForce": "IOC",
+            "type": "LIMIT",
+            "side": "BUY",
+            "positionSide": "BOTH"
+        }"#;
+        let result = parse_order_response(text).expect("should parse");
+        assert_eq!(result.status, OrderStatus::Expired);
+        assert_eq!(result.filled_qty, Decimal::ZERO);
+        assert_eq!(result.avg_price, None);
     }
 
     #[test]
