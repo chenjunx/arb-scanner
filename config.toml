@@ -63,3 +63,11 @@ side = "sell"
 # 两边交易所的交集匹配 —— 不查钱包信息、不监控行情、不计算价差。
 [scan]
 blacklist = ["BTC", "ETH", "SOL", "USDC", "XRP"]
+
+# CrossExchangeStrategy 的下单执行配置：enabled+live 都为 true 才会真实下单
+# (私有 WS + 下单接口)，用真实资金交易，谨慎修改。
+[cross_exchange_execution]
+enabled = true
+live = true
+kraken_venue = "kraken"
+binance_venue = "binance"
