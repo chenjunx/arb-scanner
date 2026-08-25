@@ -715,13 +715,13 @@ async fn wait_for_order_event(
 ) -> anyhow::Result<(OrderId, Decimal, Decimal)> {
     loop {
         match event_stream.next().await {
-            Some((_, OrderEvent::Filled { order_id, filled_qty, avg_price })) if &order_id == target => {
+            Some((_, OrderEvent::Filled { order_id, filled_qty, avg_price, .. })) if &order_id == target => {
                 return Ok((order_id, filled_qty, avg_price));
             }
-            Some((_, OrderEvent::RejectedByRisk { order_id, reason })) if &order_id == target => {
+            Some((_, OrderEvent::RejectedByRisk { order_id, reason, .. })) if &order_id == target => {
                 anyhow::bail!("order {order_id} rejected by risk: {reason}");
             }
-            Some((_, OrderEvent::RejectedByExchange { order_id, reason })) if &order_id == target => {
+            Some((_, OrderEvent::RejectedByExchange { order_id, reason, .. })) if &order_id == target => {
                 anyhow::bail!("order {order_id} rejected by exchange: {reason}");
             }
             Some(_) => continue,
@@ -743,10 +743,10 @@ async fn wait_for_transfer_event(
             Some((_, OrderEvent::Transferred { order_id, qty, withdraw_id, .. })) if &order_id == target => {
                 return Ok(TransferAcceptedReport { order_id, qty, withdraw_id });
             }
-            Some((_, OrderEvent::RejectedByRisk { order_id, reason })) if &order_id == target => {
+            Some((_, OrderEvent::RejectedByRisk { order_id, reason, .. })) if &order_id == target => {
                 anyhow::bail!("transfer order {order_id} rejected by risk: {reason}");
             }
-            Some((_, OrderEvent::RejectedByExchange { order_id, reason })) if &order_id == target => {
+            Some((_, OrderEvent::RejectedByExchange { order_id, reason, .. })) if &order_id == target => {
                 anyhow::bail!("transfer order {order_id} rejected by exchange: {reason}");
             }
             Some(_) => continue,

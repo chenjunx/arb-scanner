@@ -189,19 +189,23 @@ impl OrderManager {
         }
 
         // 发布事件
+        let client_order_id = trade.client_order_id.clone();
         let event = match status {
             OrderStatus::PartiallyFilled => Some(OrderEvent::PartiallyFilled {
                 order_id: order_id.clone(),
+                client_order_id,
                 filled_qty,
                 avg_price: avg_price.unwrap_or(Decimal::ZERO),
             }),
             OrderStatus::Filled => Some(OrderEvent::Filled {
                 order_id: order_id.clone(),
+                client_order_id,
                 filled_qty,
                 avg_price: avg_price.unwrap_or(Decimal::ZERO),
             }),
             OrderStatus::Rejected | OrderStatus::Expired => Some(OrderEvent::RejectedByExchange {
                 order_id: order_id.clone(),
+                client_order_id,
                 reason: format!("exchange order stream reported status={status:?}"),
             }),
             OrderStatus::New | OrderStatus::Transferred | OrderStatus::DepositConfirmed => None,
@@ -256,11 +260,18 @@ impl OrderManager {
         let symbol = transfer.symbol.clone();
         let requested_qty = transfer.amount;
         let strategy_id = transfer.strategy_id.clone();
+        let client_order_id = transfer.client_order_id.clone();
         let asset = symbol.base.as_ref().to_string();
 
         self.bus.publish(
             Topic::order_event(&strategy_id),
-            OrderEvent::TransferConfirmed { order_id: order_id.clone(), to_venue: to_venue.clone(), asset, actual_delta },
+            OrderEvent::TransferConfirmed {
+                order_id: order_id.clone(),
+                client_order_id,
+                to_venue: to_venue.clone(),
+                asset,
+                actual_delta,
+            },
         );
 
         let adjustment = self.position_manager.settle_transfer_in(&to_venue, &symbol, requested_qty, actual_delta, ts_ms);
@@ -422,7 +433,7 @@ mod tests {
 
         let (_, event) = events.next().await.unwrap();
         match event {
-            OrderEvent::TransferConfirmed { order_id: id, to_venue, asset, actual_delta } => {
+            OrderEvent::TransferConfirmed { order_id: id, to_venue, asset, actual_delta, .. } => {
                 assert_eq!(id, order_id);
                 assert_eq!(to_venue, venue);
                 assert_eq!(asset, "BTC");

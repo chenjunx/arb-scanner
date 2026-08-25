@@ -5,6 +5,7 @@ use std::time::Duration;
 use rust_decimal::Decimal;
 
 use arb_scanner::engine::ArbitrageEngine;
+use arb_scanner::market_data::link_health::LinkHealthMonitor;
 use arb_scanner::strategy::cross_exchange::CrossExchangeStrategy;
 use arb_scanner::strategy::{FeeSchedule, Strategy};
 use arb_scanner::topic::{Topic, TopicBus};
@@ -41,6 +42,7 @@ async fn engine_starts_and_consumes_quotes() {
         vec![symbol.clone()],
         fees,
         Decimal::from(10),
+        Arc::new(LinkHealthMonitor::always_healthy()),
         bus.clone(),
     ))];
 
@@ -78,6 +80,7 @@ async fn engine_handles_single_venue_gracefully() {
         vec![symbol.clone()],
         fees,
         Decimal::from(10),
+        Arc::new(LinkHealthMonitor::always_healthy()),
         bus.clone(),
     ))];
 

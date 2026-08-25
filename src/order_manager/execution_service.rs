@@ -129,7 +129,7 @@ impl ExecutionService {
             None => {
                 let reason = format!("no adapter registered for venue {}", request.venue);
                 error!("ExecutionService: order_id={order_id} {reason}");
-                self.publish_rejected(&request.strategy_id, order_id, reason);
+                self.publish_rejected(&request.strategy_id, order_id, request.client_order_id.clone(), reason);
                 return;
             }
         };
@@ -160,7 +160,7 @@ impl ExecutionService {
 
                 if result.status == OrderStatus::Rejected {
                     let reason = format!("exchange rejected: status={:?}", result.status);
-                    self.publish_rejected(&request.strategy_id, order_id, reason);
+                    self.publish_rejected(&request.strategy_id, order_id, request.client_order_id.clone(), reason);
                 } else {
                     let exchange_order_id = result.order_id.clone();
                     let updated_at_ms = current_timestamp_ms();
@@ -180,14 +180,14 @@ impl ExecutionService {
 
                     self.bus.publish(
                         Topic::order_event(&request.strategy_id),
-                        OrderEvent::Accepted { order_id },
+                        OrderEvent::Accepted { order_id, client_order_id: request.client_order_id.clone() },
                     );
                 }
             }
             Err(err) => {
                 let reason = format!("exchange error: {err:#}");
                 error!("ExecutionService: order_id={order_id} {reason}");
-                self.publish_rejected(&request.strategy_id, order_id, reason);
+                self.publish_rejected(&request.strategy_id, order_id, request.client_order_id.clone(), reason);
             }
         }
     }
@@ -201,7 +201,7 @@ impl ExecutionService {
             None => {
                 let reason = format!("no wallet provider registered for from_venue={}", request.from_venue);
                 error!("ExecutionService: order_id={order_id} {reason}");
-                self.publish_rejected(&strategy_id, order_id, reason);
+                self.publish_rejected(&strategy_id, order_id, request.client_order_id.clone(), reason);
                 return;
             }
         };
@@ -211,7 +211,7 @@ impl ExecutionService {
             None => {
                 let reason = format!("no wallet provider registered for to_venue={}", request.to_venue);
                 error!("ExecutionService: order_id={order_id} {reason}");
-                self.publish_rejected(&strategy_id, order_id, reason);
+                self.publish_rejected(&strategy_id, order_id, request.client_order_id.clone(), reason);
                 return;
             }
         };
@@ -291,6 +291,7 @@ impl ExecutionService {
                     Topic::order_event(&strategy_id),
                     OrderEvent::Transferred {
                         order_id,
+                        client_order_id: request.client_order_id.clone(),
                         from_venue: request.from_venue,
                         to_venue: request.to_venue,
                         qty,
@@ -301,13 +302,19 @@ impl ExecutionService {
             Err(err) => {
                 let reason = format!("transfer error: {err:#}");
                 error!("ExecutionService: order_id={order_id} {reason}");
-                self.publish_rejected(&strategy_id, order_id, reason);
+                self.publish_rejected(&strategy_id, order_id, request.client_order_id.clone(), reason);
             }
         }
     }
 
-    fn publish_rejected(&self, strategy_id: &str, order_id: super::types::OrderId, reason: String) {
-        let event = OrderEvent::RejectedByExchange { order_id, reason };
+    fn publish_rejected(
+        &self,
+        strategy_id: &str,
+        order_id: super::types::OrderId,
+        client_order_id: Option<String>,
+        reason: String,
+    ) {
+        let event = OrderEvent::RejectedByExchange { order_id, client_order_id, reason };
         self.bus.publish(Topic::order_event(strategy_id), event);
     }
 }

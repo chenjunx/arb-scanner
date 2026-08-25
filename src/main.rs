@@ -429,7 +429,7 @@ async fn build_cross_execution_config(
 
     let pipeline = build_manual_pipeline(
         &redis_url,
-        bus.clone(),
+        bus,
         symbols,
         vec![
             (kraken_venue.clone(), kraken_provider, kraken_stream, RiskLimits::default()),
@@ -452,8 +452,6 @@ async fn build_cross_execution_config(
         ioc_price_slippage_bps: cfg.ioc_price_slippage_bps,
         ioc_wait_timeout: Duration::from_millis(cfg.ioc_wait_timeout_ms),
         hedge_wait_timeout: Duration::from_millis(cfg.ioc_wait_timeout_ms),
-        bus,
-        strategy_name: "cross_exchange".to_string(),
     })
 }
 
@@ -730,7 +728,7 @@ async fn run_transfer_command(args: &[String]) -> anyhow::Result<()> {
     let confirm_result = tokio::time::timeout(Duration::from_secs(confirm_timeout_secs), async {
         loop {
             match confirm_stream.next().await {
-                Some((_, OrderEvent::TransferConfirmed { order_id: oid, to_venue, asset, actual_delta })) if oid == order_id => {
+                Some((_, OrderEvent::TransferConfirmed { order_id: oid, to_venue, asset, actual_delta, .. })) if oid == order_id => {
                     return Some((to_venue, asset, actual_delta));
                 }
                 Some(_) => continue,

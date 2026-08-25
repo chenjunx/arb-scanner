@@ -2,11 +2,13 @@ use std::sync::Arc;
 
 use futures_util::StreamExt;
 
+use crate::order_manager::types::OrderEvent;
 use crate::strategy::Strategy;
-use crate::topic::TopicBus;
+use crate::topic::{Topic, TopicBus};
 
-/// 套利引擎：编排器。为每个策略按其 `subscriptions()` 向 `TopicBus` 订阅，
-/// 各自独立跑一个 tokio task，收到行情后调用策略的 `on_quote` 回调。
+/// 套利引擎：编排器。为每个策略按其 `subscriptions()` 向 `TopicBus` 订阅行情，
+/// 并额外订阅该策略名下的 `Topic::order_event`，各自独立跑一个 tokio task，
+/// 收到行情调用 `on_quote`、收到订单事件调用 `on_order_event`。
 /// 策略自己维护内部状态并在发现机会时打日志，引擎本身不做业务逻辑。
 pub struct ArbitrageEngine {
     strategies: Vec<Box<dyn Strategy>>,
@@ -21,9 +23,19 @@ impl ArbitrageEngine {
         let mut strategy_handles = Vec::new();
         for strategy in self.strategies {
             let mut quotes = bus.subscribe_many(strategy.subscriptions());
+            let mut order_events = bus.subscribe::<OrderEvent>(Topic::order_event(strategy.name().to_string()));
             strategy_handles.push(tokio::spawn(async move {
-                while let Some((topic, quote)) = quotes.next().await {
-                    strategy.on_quote(&topic, &quote);
+                loop {
+                    tokio::select! {
+                        quote = quotes.next() => match quote {
+                            Some((topic, quote)) => strategy.on_quote(&topic, &quote),
+                            None => break,
+                        },
+                        event = order_events.next() => match event {
+                            Some((_, event)) => strategy.on_order_event(&event),
+                            None => break,
+                        },
+                    }
                 }
             }));
         }

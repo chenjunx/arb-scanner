@@ -185,31 +185,38 @@ pub struct Order {
 pub enum OrderEvent {
     Submitted {
         order_id: OrderId,
+        client_order_id: Option<String>,
     },
     Accepted {
         order_id: OrderId,
+        client_order_id: Option<String>,
     },
     RejectedByRisk {
         order_id: OrderId,
+        client_order_id: Option<String>,
         reason: String,
     },
     RejectedByExchange {
         order_id: OrderId,
+        client_order_id: Option<String>,
         reason: String,
     },
     PartiallyFilled {
         order_id: OrderId,
+        client_order_id: Option<String>,
         filled_qty: Decimal,
         avg_price: Decimal,
     },
     Filled {
         order_id: OrderId,
+        client_order_id: Option<String>,
         filled_qty: Decimal,
         avg_price: Decimal,
     },
     /// 划转单已成功提币（仓位已同步更新）
     Transferred {
         order_id: OrderId,
+        client_order_id: Option<String>,
         from_venue: Venue,
         to_venue: Venue,
         qty: Decimal,
@@ -218,10 +225,39 @@ pub enum OrderEvent {
     /// 划转到账确认：余额变动事件与划转单匹配，到账量与请求量偏差在 10% 以内
     TransferConfirmed {
         order_id: OrderId,
+        client_order_id: Option<String>,
         to_venue: Venue,
         asset: String,
         actual_delta: Decimal,
     },
+}
+
+impl OrderEvent {
+    pub fn order_id(&self) -> &OrderId {
+        match self {
+            Self::Submitted { order_id, .. }
+            | Self::Accepted { order_id, .. }
+            | Self::RejectedByRisk { order_id, .. }
+            | Self::RejectedByExchange { order_id, .. }
+            | Self::PartiallyFilled { order_id, .. }
+            | Self::Filled { order_id, .. }
+            | Self::Transferred { order_id, .. }
+            | Self::TransferConfirmed { order_id, .. } => order_id,
+        }
+    }
+
+    pub fn client_order_id(&self) -> Option<&str> {
+        match self {
+            Self::Submitted { client_order_id, .. }
+            | Self::Accepted { client_order_id, .. }
+            | Self::RejectedByRisk { client_order_id, .. }
+            | Self::RejectedByExchange { client_order_id, .. }
+            | Self::PartiallyFilled { client_order_id, .. }
+            | Self::Filled { client_order_id, .. }
+            | Self::Transferred { client_order_id, .. }
+            | Self::TransferConfirmed { client_order_id, .. } => client_order_id.as_deref(),
+        }
+    }
 }
 
 /// 风控检查结果

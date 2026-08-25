@@ -8,7 +8,7 @@ use rust_decimal::Decimal;
 
 use crate::market_data::now_ms;
 use crate::order::types::{OrderAmount, OrderSide};
-use crate::order_manager::types::{AnyOrderRequest, OrderKind, OrderRequest, TransferRequest};
+use crate::order_manager::types::{AnyOrderRequest, OrderEvent, OrderKind, OrderRequest, TransferRequest};
 use crate::topic::{Topic, TopicBus};
 use crate::types::{Quote, Symbol, Venue};
 
@@ -69,6 +69,15 @@ pub trait Strategy: Send + Sync {
 
     /// 行情回调：收到订阅的 topic 行情时被调用。策略内部维护状态，发现机会时打日志。
     fn on_quote(&self, topic: &Topic, quote: &Quote);
+
+    /// 订单事件回调：引擎为策略订阅了 `Topic::order_event(self.name())`，
+    /// 收到该策略名下任意订单的状态变化时被调用。默认空实现——只有需要被动
+    /// 感知订单状态（更新内部状态/记日志/触发后续动作）的策略才需要覆盖它；
+    /// 像 `cross_exchange.rs::try_execute` 那样"下单后原地等这一笔的终态"的
+    /// 同步流程不受影响，那是另一条独立的临时订阅。
+    fn on_order_event(&self, event: &OrderEvent) {
+        let _ = event;
+    }
 
     /// 策略构造时存下的 `TopicBus` 引用，供默认方法 `submit_order` 发布订单请求。
     fn bus(&self) -> &Arc<TopicBus>;

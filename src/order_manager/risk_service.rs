@@ -149,7 +149,8 @@ impl RiskService {
             RiskCheckResult::Rejected { reason } => {
                 warn!("RiskService: order_id={} rejected: {reason}", order_id);
                 let strategy_id = request.strategy_id().to_string();
-                let event = OrderEvent::RejectedByRisk { order_id, reason };
+                let client_order_id = request.client_order_id().map(str::to_string);
+                let event = OrderEvent::RejectedByRisk { order_id, client_order_id, reason };
                 self.bus.publish(Topic::order_event(&strategy_id), event);
             }
         }
