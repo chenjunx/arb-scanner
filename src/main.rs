@@ -415,13 +415,13 @@ async fn build_cross_execution_config(
     let asset_imbalance_limits: HashMap<String, AssetImbalanceLimit> = cfg
         .asset_imbalance_limits
         .iter()
-        .map(|(asset, max_diff)| {
+        .map(|(asset, max_diff_ratio)| {
             (
                 asset.clone(),
                 AssetImbalanceLimit {
                     venue_a: kraken_venue.clone(),
                     venue_b: binance_venue.clone(),
-                    max_diff: *max_diff,
+                    max_diff_ratio: *max_diff_ratio,
                 },
             )
         })

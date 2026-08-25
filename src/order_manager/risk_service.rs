@@ -36,13 +36,17 @@ impl Default for RiskLimits {
 }
 
 /// 按资产配置的"两 venue 持仓差"限额：`venue_a`/`venue_b` 各自的
-/// `PositionManager::available_position` 差值绝对值超过 `max_diff` 时拒单。
+/// `PositionManager::available_position` 差值绝对值，除以两者中较大的绝对值，
+/// 得到的比例超过 `max_diff_ratio` 时拒单——用比例而不是绝对数量，是因为不同
+/// 币种的正常持仓规模差异很大（比如 DOGE 和 BTC），绝对数量没法配一个通用阈值。
+/// 下单前两边库存都为 0（这个资产第一次交易，还没有"平衡"概念）时跳过这项
+/// 检查，放行第一腿建仓；一旦某一边有了库存，后续单子都按比例正常检查。
 /// 用于跨所策略防止币不断从一边流向另一边、直到一边被掏空。
 #[derive(Debug, Clone)]
 pub struct AssetImbalanceLimit {
     pub venue_a: Venue,
     pub venue_b: Venue,
-    pub max_diff: Decimal,
+    pub max_diff_ratio: Decimal,
 }
 
 /// 风控服务：订阅 `Topic::OrderSubmit`，为每个订单请求分配 OrderId、
@@ -233,22 +237,31 @@ impl RiskService {
                 if venue == &limit.venue_a || venue == &limit.venue_b {
                     let qty_a = self.position_manager.available_position(&limit.venue_a, symbol);
                     let qty_b = self.position_manager.available_position(&limit.venue_b, symbol);
-                    let delta = match request.side {
-                        crate::order::types::OrderSide::Buy => qty,
-                        crate::order::types::OrderSide::Sell => -qty,
-                    };
-                    let (proj_a, proj_b) = if venue == &limit.venue_a {
-                        (qty_a + delta, qty_b)
-                    } else {
-                        (qty_a, qty_b + delta)
-                    };
-                    if (proj_a - proj_b).abs() > limit.max_diff {
-                        return RiskCheckResult::Rejected {
-                            reason: format!(
-                                "projected {asset} holdings {}={proj_a} vs {}={proj_b} would exceed max_diff {}",
-                                limit.venue_a, limit.venue_b, limit.max_diff
-                            ),
+                    // 两边在这笔单子之前都还没有库存（这个资产第一次交易）：还没有
+                    // "平衡"这个概念可言，放行去建立第一腿仓位。一旦某一边有了库存，
+                    // 后续每一笔都要按比例检查。
+                    if !qty_a.is_zero() || !qty_b.is_zero() {
+                        let delta = match request.side {
+                            crate::order::types::OrderSide::Buy => qty,
+                            crate::order::types::OrderSide::Sell => -qty,
                         };
+                        let (proj_a, proj_b) = if venue == &limit.venue_a {
+                            (qty_a + delta, qty_b)
+                        } else {
+                            (qty_a, qty_b + delta)
+                        };
+                        let denom = proj_a.abs().max(proj_b.abs());
+                        if !denom.is_zero() {
+                            let ratio = (proj_a - proj_b).abs() / denom;
+                            if ratio > limit.max_diff_ratio {
+                                return RiskCheckResult::Rejected {
+                                    reason: format!(
+                                        "projected {asset} holdings {}={proj_a} vs {}={proj_b} imbalance ratio {ratio} would exceed max_diff_ratio {}",
+                                        limit.venue_a, limit.venue_b, limit.max_diff_ratio
+                                    ),
+                                };
+                            }
+                        }
                     }
                 }
             }
@@ -314,7 +327,7 @@ mod tests {
     }
 
     #[test]
-    fn imbalance_check_rejects_order_that_widens_the_gap_beyond_max_diff() {
+    fn imbalance_check_rejects_order_that_widens_the_gap_beyond_max_diff_ratio() {
         let pm = Arc::new(PositionManager::new(Arc::new(InMemoryPositionStore::new())));
         let symbol = Symbol::new("BTC", "USDT");
         let kraken = Venue::new("kraken_spot");
@@ -325,14 +338,18 @@ mod tests {
         let mut limits = HashMap::new();
         limits.insert(
             "BTC".to_string(),
-            AssetImbalanceLimit { venue_a: kraken.clone(), venue_b: binance.clone(), max_diff: Decimal::from(20) },
+            AssetImbalanceLimit {
+                venue_a: kraken.clone(),
+                venue_b: binance.clone(),
+                max_diff_ratio: Decimal::new(2, 1), // 20%
+            },
         );
         let service = risk_service(pm, limits);
 
-        // 从 kraken 卖出 30 个 BTC：kraken 变成 20，binance 仍是 50，差值 30 > max_diff 20，应被拒绝。
+        // 从 kraken 卖出 30 个 BTC：kraken 变成 20，binance 仍是 50，差值 30 / max(20,50)=50 = 60% > 20%，应被拒绝。
         let request = trade_request(kraken, symbol, OrderSide::Sell, Decimal::from(30));
         match service.check_trade(&request) {
-            RiskCheckResult::Rejected { reason } => assert!(reason.contains("max_diff")),
+            RiskCheckResult::Rejected { reason } => assert!(reason.contains("max_diff_ratio")),
             RiskCheckResult::Approved => panic!("expected rejection due to asset imbalance"),
         }
     }
@@ -350,7 +367,11 @@ mod tests {
         let mut limits = HashMap::new();
         limits.insert(
             "BTC".to_string(),
-            AssetImbalanceLimit { venue_a: kraken.clone(), venue_b: binance.clone(), max_diff: Decimal::from(10) },
+            AssetImbalanceLimit {
+                venue_a: kraken.clone(),
+                venue_b: binance.clone(),
+                max_diff_ratio: Decimal::new(1, 1), // 10%
+            },
         );
         let service = risk_service(pm, limits);
 
@@ -359,25 +380,82 @@ mod tests {
     }
 
     #[test]
-    fn imbalance_check_allows_order_that_brings_the_gap_back_within_max_diff() {
+    fn imbalance_check_allows_order_that_brings_the_gap_back_within_max_diff_ratio() {
         let pm = Arc::new(PositionManager::new(Arc::new(InMemoryPositionStore::new())));
         let symbol = Symbol::new("BTC", "USDT");
         let kraken = Venue::new("kraken_spot");
         let binance = Venue::new("binance_spot");
-        // 已经失衡：kraken 20 / binance 80，差值 60，已经超过下面配置的 max_diff 20。
-        seed_position(&pm, &kraken, &symbol, Decimal::from(20));
-        seed_position(&pm, &binance, &symbol, Decimal::from(80));
+        // 已经失衡：kraken 40 / binance 100，差值比例 60/100=60%，已经超过下面配置的 25%。
+        seed_position(&pm, &kraken, &symbol, Decimal::from(40));
+        seed_position(&pm, &binance, &symbol, Decimal::from(100));
 
         let mut limits = HashMap::new();
         limits.insert(
             "BTC".to_string(),
-            AssetImbalanceLimit { venue_a: kraken.clone(), venue_b: binance.clone(), max_diff: Decimal::from(20) },
+            AssetImbalanceLimit {
+                venue_a: kraken.clone(),
+                venue_b: binance.clone(),
+                max_diff_ratio: Decimal::new(25, 2), // 25%
+            },
         );
         let service = risk_service(pm, limits);
 
-        // 在 binance 卖出 45 个：binance 变成 35，kraken 仍是 20，差值收敛到 15（<= max_diff 20），应放行——
-        // 检查看的是"下单之后"的投影差值，不是"是否比之前更小"，所以收敛单必须真的把差值拉回限额内才会放行。
-        let request = trade_request(binance, symbol, OrderSide::Sell, Decimal::from(45));
+        // 在 binance 卖出 50 个：binance 变成 50，kraken 仍是 40，差值比例收敛到 10/50=20%（<=25%），应放行——
+        // 检查看的是"下单之后"的投影比例，不是"是否比之前更小"，所以收敛单必须真的把比例拉回限额内才会放行。
+        let request = trade_request(binance, symbol, OrderSide::Sell, Decimal::from(50));
         assert!(matches!(service.check_trade(&request), RiskCheckResult::Approved));
+    }
+
+    #[test]
+    fn imbalance_check_allows_first_leg_when_both_sides_start_flat() {
+        let pm = Arc::new(PositionManager::new(Arc::new(InMemoryPositionStore::new())));
+        let symbol = Symbol::new("BTC", "USDT");
+        let kraken = Venue::new("kraken_spot");
+        let binance = Venue::new("binance_spot");
+        // 两边都还没开仓：这个资产第一次交易，放行第一腿建仓单，即使它下单后
+        // 会造成 100%"投影"不平衡（一边有仓位、一边是 0）。
+
+        let mut limits = HashMap::new();
+        limits.insert(
+            "BTC".to_string(),
+            AssetImbalanceLimit {
+                venue_a: kraken.clone(),
+                venue_b: binance.clone(),
+                max_diff_ratio: Decimal::new(1, 1), // 10%
+            },
+        );
+        let service = risk_service(pm, limits);
+
+        let request = trade_request(kraken, symbol, OrderSide::Buy, Decimal::from(1));
+        assert!(matches!(service.check_trade(&request), RiskCheckResult::Approved));
+    }
+
+    #[test]
+    fn imbalance_check_rejects_piling_more_onto_an_already_unhedged_leg() {
+        let pm = Arc::new(PositionManager::new(Arc::new(InMemoryPositionStore::new())));
+        let symbol = Symbol::new("BTC", "USDT");
+        let kraken = Venue::new("kraken_spot");
+        let binance = Venue::new("binance_spot");
+        // kraken 已经成交了第一腿（10 个），binance 对冲腿还没跟上（仍是 0）。
+        seed_position(&pm, &kraken, &symbol, Decimal::from(10));
+
+        let mut limits = HashMap::new();
+        limits.insert(
+            "BTC".to_string(),
+            AssetImbalanceLimit {
+                venue_a: kraken.clone(),
+                venue_b: binance.clone(),
+                max_diff_ratio: Decimal::new(1, 1), // 10%
+            },
+        );
+        let service = risk_service(pm, limits);
+
+        // 这时候不是"第一次交易"了（kraken 已经有库存），binance 仍是 0，
+        // 再往 kraken 加仓只会让比例更接近 100%，应被拒绝，不能无限裸敞口下去。
+        let request = trade_request(kraken, symbol, OrderSide::Buy, Decimal::from(5));
+        match service.check_trade(&request) {
+            RiskCheckResult::Rejected { reason } => assert!(reason.contains("max_diff_ratio")),
+            RiskCheckResult::Approved => panic!("expected rejection: already unhedged and getting worse"),
+        }
     }
 }

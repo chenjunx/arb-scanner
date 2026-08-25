@@ -76,7 +76,8 @@ pub struct CrossExchangeExecutionConfig {
     pub ioc_price_slippage_bps: Decimal,
     #[serde(default = "default_ioc_wait_ms")]
     pub ioc_wait_timeout_ms: u64,
-    /// key 是 asset(如 "BTC"),value 是允许的 |kraken持仓 - binance持仓| 上限。
+    /// key 是 asset(如 "BTC"),value 是允许的 |kraken持仓 - binance持仓| / 较大一边持仓
+    /// 的比例上限(如 "0.2" 表示 20%)。两边当前持仓都为 0(还没交易过)时跳过该检查。
     #[serde(default)]
     pub asset_imbalance_limits: HashMap<String, Decimal>,
 }
