@@ -26,18 +26,11 @@ source = "kraken_spot"  # 接 Kraken 现货真实行情(ticker WebSocket v2)
 #   1) 配置 MockSource 在每个 venue 上模拟哪些交易对、初始价格和波动幅度
 #   2) 配置 CrossExchangeStrategy 需要跨 venue 比较哪些交易对
 [[symbols]]
-base = "DOGE"
+base = "TRUMP"
 quote = "USDT"
-initial_mid = "65000.00"
+initial_mid = "10.00"
 volatility = 0.0015
 spread = 0.0008
-
-[[symbols]]
-base = "ADA"
-quote = "USDT"
-initial_mid = "3200.00"
-volatility = 0.002
-spread = 0.001
 
 
 # 三角套利路径：从 1 单位起始货币出发，依次执行三腿，检查是否能获利后回到原货币。
