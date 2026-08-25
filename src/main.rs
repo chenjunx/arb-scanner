@@ -459,7 +459,6 @@ async fn build_cross_execution_config(
         binance_precision,
         order_manager: pipeline.order_manager,
         order_qty_by_symbol,
-        ioc_price_slippage_bps: cfg.ioc_price_slippage_bps,
         ioc_wait_timeout: Duration::from_millis(cfg.ioc_wait_timeout_ms),
         hedge_wait_timeout: Duration::from_millis(cfg.ioc_wait_timeout_ms),
     })

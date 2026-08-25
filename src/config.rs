@@ -72,8 +72,6 @@ pub struct CrossExchangeExecutionConfig {
     pub live: bool,
     pub kraken_venue: String,
     pub binance_venue: String,
-    #[serde(default = "default_ioc_slippage_bps")]
-    pub ioc_price_slippage_bps: Decimal,
     #[serde(default = "default_ioc_wait_ms")]
     pub ioc_wait_timeout_ms: u64,
     /// key 是 asset(如 "BTC"),value 是允许的 |kraken持仓 - binance持仓| / 较大一边持仓
@@ -85,10 +83,6 @@ pub struct CrossExchangeExecutionConfig {
     /// 不写(默认 None)时那些资产完全不受这项检查约束。
     #[serde(default)]
     pub default_asset_imbalance_ratio: Option<Decimal>,
-}
-
-fn default_ioc_slippage_bps() -> Decimal {
-    Decimal::from(10)
 }
 
 fn default_ioc_wait_ms() -> u64 {

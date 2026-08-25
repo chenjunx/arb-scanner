@@ -32,7 +32,6 @@ pub struct CrossExecutionConfig {
     pub order_manager: Arc<OrderManager>,
     /// 启动时预算好的每个 symbol 的下单量：两边交易所最小下单量里较大的那个。
     pub order_qty_by_symbol: HashMap<Symbol, Decimal>,
-    pub ioc_price_slippage_bps: Decimal,
     pub ioc_wait_timeout: Duration,
     pub hedge_wait_timeout: Duration,
 }
@@ -364,7 +363,7 @@ impl CrossExchangeStrategy {
         self.in_flight.lock().unwrap().remove(&leg.symbol);
     }
 
-    /// 下 kraken 限价 IOC 探路单：算滑点价、按精度取整、登记进
+    /// 下 kraken 限价 IOC 探路单：按精度取整参考价、登记进
     /// `pending_kraken_orders`、发布下单请求。全程同步操作，不需要
     /// `.await`，所以不用 spawn task——`in_flight` 的释放责任交给后续的
     /// `on_order_event`（成功 publish 之后）或本函数自己（提前失败时）。
@@ -375,12 +374,7 @@ impl CrossExchangeStrategy {
             return;
         };
 
-        let slippage = execution.ioc_price_slippage_bps / Decimal::from(10_000);
-        let raw_price = match kraken_side {
-            OrderSide::Buy => kraken_ref_price * (Decimal::ONE + slippage),
-            OrderSide::Sell => kraken_ref_price * (Decimal::ONE - slippage),
-        };
-        let price = match execution.kraken_precision.round_price(&symbol, raw_price) {
+        let price = match execution.kraken_precision.round_price(&symbol, kraken_ref_price) {
             Ok(p) => p,
             Err(err) => {
                 error!("cross_exchange: failed to round kraken IOC price for symbol={symbol}: {err:#}");
@@ -775,7 +769,6 @@ mod tests {
             binance_precision: Arc::new(precision_cache(symbol, "0.001", "0.001", "0.01")),
             order_manager: env.order_manager.clone(),
             order_qty_by_symbol: HashMap::from([(symbol.clone(), qty)]),
-            ioc_price_slippage_bps: Decimal::from(10),
             ioc_wait_timeout: Duration::from_millis(500),
             hedge_wait_timeout: Duration::from_millis(500),
         })
