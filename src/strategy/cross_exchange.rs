@@ -389,7 +389,7 @@ impl CrossExchangeStrategy {
             }
         };
 
-        let client_order_id = generate_client_order_id(self.name(), "kraken");
+        let client_order_id = generate_client_order_id("kraken");
         self.pending_kraken_orders.lock().unwrap().insert(
             client_order_id.clone(),
             PendingKrakenLeg {
@@ -433,7 +433,7 @@ impl CrossExchangeStrategy {
             OrderSide::Sell => OrderSide::Buy,
         };
 
-        let hedge_client_order_id = generate_client_order_id(self.name(), "binance");
+        let hedge_client_order_id = generate_client_order_id("binance");
         self.pending_binance_orders.lock().unwrap().insert(
             hedge_client_order_id.clone(),
             PendingBinanceLeg {
@@ -455,8 +455,17 @@ impl CrossExchangeStrategy {
     }
 }
 
-fn generate_client_order_id(strategy_name: &str, leg: &str) -> String {
-    format!("{strategy_name}-{leg}-{}-{:05}", now_ms(), rand::random::<u32>() % 100000)
+/// kraken 的 `cl_ord_id` 只接受 32 位 UUID 或 ≤18 个 ASCII 字符的自由文本，
+/// 超出格式会被直接拒单（`EGeneral:Invalid arguments:cl_ord_id`）——之前带
+/// `{strategy_name}-{leg}-` 前缀的版本超长，所以这里舍弃可读前缀，只留 leg
+/// 标记 + 十六进制时间戳 + 随机数，保证两条腿在各自 pending 期内不重复即可。
+fn generate_client_order_id(leg: &str) -> String {
+    let leg_tag = match leg {
+        "kraken" => "k",
+        "binance" => "b",
+        other => other,
+    };
+    format!("x{leg_tag}{:x}{:03x}", now_ms() & 0xFFFF_FFFF, rand::random::<u16>() & 0xFFF)
 }
 
 #[cfg(test)]
@@ -680,7 +689,7 @@ mod tests {
 
     /// 轮询直到 order_manager 里出现 client_order_id 带指定前缀的订单——
     /// try_execute 内部随机生成 client_order_id，测试没法提前知道完整值，
-    /// 只知道 "{strategy_name}-kraken-"/"{strategy_name}-binance-" 前缀。
+    /// 只知道 "xk"/"xb"（kraken/binance 两条腿）前缀。
     async fn poll_order_by_prefix(order_manager: &OrderManager, prefix: &str) -> Order {
         for _ in 0..500 {
             if let Some(order) = order_manager
@@ -798,10 +807,10 @@ mod tests {
 
         let order_manager = env.order_manager.clone();
         let driver = tokio::spawn(async move {
-            let kraken_order = poll_order_by_prefix(&order_manager, "cross_exchange-kraken-").await;
+            let kraken_order = poll_order_by_prefix(&order_manager, "xk").await;
             push_exchange_update(&order_manager, &kraken_venue, &kraken_order, OrderStatus::Filled, qty, Decimal::from(100)).await;
 
-            let binance_order = poll_order_by_prefix(&order_manager, "cross_exchange-binance-").await;
+            let binance_order = poll_order_by_prefix(&order_manager, "xb").await;
             push_exchange_update(&order_manager, &binance_venue, &binance_order, OrderStatus::Filled, qty, Decimal::from(100)).await;
         });
 
@@ -840,7 +849,7 @@ mod tests {
 
         let order_manager = env.order_manager.clone();
         let driver = tokio::spawn(async move {
-            let kraken_order = poll_order_by_prefix(&order_manager, "cross_exchange-kraken-").await;
+            let kraken_order = poll_order_by_prefix(&order_manager, "xk").await;
             // IOC 完全没有成交：交易所推送 Expired，filled_qty=0。
             push_exchange_update(&order_manager, &kraken_venue, &kraken_order, OrderStatus::Expired, Decimal::ZERO, Decimal::ZERO).await;
         });
@@ -880,12 +889,12 @@ mod tests {
 
         let order_manager = env.order_manager.clone();
         let driver = tokio::spawn(async move {
-            let kraken_order = poll_order_by_prefix(&order_manager, "cross_exchange-kraken-").await;
+            let kraken_order = poll_order_by_prefix(&order_manager, "xk").await;
             // IOC 部分成交后剩余部分过期：仓位记账里 filled_qty 已经正确写入
             // 0.6，但事件本身是不带 filled_qty 的 RejectedByExchange。
             push_exchange_update(&order_manager, &kraken_venue, &kraken_order, OrderStatus::Expired, partial_fill, Decimal::from(100)).await;
 
-            let binance_order = poll_order_by_prefix(&order_manager, "cross_exchange-binance-").await;
+            let binance_order = poll_order_by_prefix(&order_manager, "xb").await;
             push_exchange_update(&order_manager, &binance_venue, &binance_order, OrderStatus::Filled, partial_fill, Decimal::from(100)).await;
         });
 
