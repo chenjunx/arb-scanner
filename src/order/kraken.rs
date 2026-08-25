@@ -529,7 +529,7 @@ fn parse_kraken_execution(text: &str, venue: &Venue) -> Vec<ExchangeOrderUpdate>
         .filter_map(|item| {
             let Some(symbol) = item.symbol.as_deref().and_then(parse_kraken_symbol) else {
                 warn!(
-                    "kraken private order stream: missing/malformed symbol {:?}, dropping update",
+                    "kraken private order stream: missing/malformed symbol {:?}, dropping update, raw message: {text}",
                     item.symbol
                 );
                 return None;
