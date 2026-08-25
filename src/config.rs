@@ -78,8 +78,13 @@ pub struct CrossExchangeExecutionConfig {
     pub ioc_wait_timeout_ms: u64,
     /// key 是 asset(如 "BTC"),value 是允许的 |kraken持仓 - binance持仓| / 较大一边持仓
     /// 的比例上限(如 "0.2" 表示 20%)。两边当前持仓都为 0(还没交易过)时跳过该检查。
+    /// 未在这里单独列出的资产，退回用 `default_asset_imbalance_ratio`(如果配了的话)。
     #[serde(default)]
     pub asset_imbalance_limits: HashMap<String, Decimal>,
+    /// 没在 `asset_imbalance_limits` 里单独配置的资产，统一套用这个比例上限；
+    /// 不写(默认 None)时那些资产完全不受这项检查约束。
+    #[serde(default)]
+    pub default_asset_imbalance_ratio: Option<Decimal>,
 }
 
 fn default_ioc_slippage_bps() -> Decimal {

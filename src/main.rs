@@ -412,7 +412,7 @@ async fn build_cross_execution_config(
         symbols.to_vec(),
     )?) as Box<dyn OrderStreamSource>;
 
-    let asset_imbalance_limits: HashMap<String, AssetImbalanceLimit> = cfg
+    let mut asset_imbalance_limits: HashMap<String, AssetImbalanceLimit> = cfg
         .asset_imbalance_limits
         .iter()
         .map(|(asset, max_diff_ratio)| {
@@ -426,6 +426,16 @@ async fn build_cross_execution_config(
             )
         })
         .collect();
+    // 没在 asset_imbalance_limits 里单独配置的资产，退回用全局默认比例（如果配了的话）。
+    if let Some(default_ratio) = cfg.default_asset_imbalance_ratio {
+        for symbol in symbols {
+            asset_imbalance_limits.entry(symbol.base.to_string()).or_insert_with(|| AssetImbalanceLimit {
+                venue_a: kraken_venue.clone(),
+                venue_b: binance_venue.clone(),
+                max_diff_ratio: default_ratio,
+            });
+        }
+    }
 
     let pipeline = build_manual_pipeline(
         &redis_url,
