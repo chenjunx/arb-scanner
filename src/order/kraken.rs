@@ -526,16 +526,16 @@ fn parse_kraken_execution(text: &str, venue: &Venue) -> Vec<ExchangeOrderUpdate>
     let ts_ms = now_ms();
     full.data
         .into_iter()
-        .filter_map(|item| {
-            let Some(symbol) = item.symbol.as_deref().and_then(parse_kraken_symbol) else {
+        .map(|item| {
+            let symbol = item.symbol.as_deref().and_then(parse_kraken_symbol);
+            if symbol.is_none() {
                 warn!(
-                    "kraken private order stream: missing/malformed symbol {:?}, dropping update, raw message: {text}",
+                    "kraken private order stream: missing/malformed symbol {:?}, raw message: {text}",
                     item.symbol
                 );
-                return None;
-            };
+            }
             let (fee, fee_asset) = sum_kraken_fees(&item.fees);
-            Some(ExchangeOrderUpdate {
+            ExchangeOrderUpdate {
                 venue: venue.clone(),
                 symbol,
                 client_order_id: item.cl_ord_id.filter(|s| !s.is_empty()),
@@ -546,7 +546,7 @@ fn parse_kraken_execution(text: &str, venue: &Venue) -> Vec<ExchangeOrderUpdate>
                 fee,
                 fee_asset,
                 ts_ms,
-            })
+            }
         })
         .collect()
 }
@@ -703,7 +703,7 @@ mod tests {
         assert_eq!(updates.len(), 1);
         let update = &updates[0];
         assert_eq!(update.venue, venue);
-        assert_eq!(update.symbol, Symbol::new("BTC", "USD"));
+        assert_eq!(update.symbol, Some(Symbol::new("BTC", "USD")));
         assert_eq!(update.client_order_id, Some("ORD-000000000001".to_string()));
         assert_eq!(update.exchange_order_id, Some("OK4GJX-KSTLS-7DZZO5".to_string()));
         assert_eq!(update.status, OrderStatus::PartiallyFilled);
@@ -736,7 +736,7 @@ mod tests {
         let updates = parse_kraken_execution(text, &venue);
         assert_eq!(updates.len(), 1);
         let update = &updates[0];
-        assert_eq!(update.symbol, Symbol::new("BTC", "USD"));
+        assert_eq!(update.symbol, Some(Symbol::new("BTC", "USD")));
         assert_eq!(update.fee, Some("4.16".parse().unwrap()));
         assert_eq!(update.fee_asset, Some("USD".to_string()));
     }
@@ -763,7 +763,7 @@ mod tests {
         let updates = parse_kraken_execution(text, &venue);
         assert_eq!(updates.len(), 1);
         let update = &updates[0];
-        assert_eq!(update.symbol, Symbol::new("BTC", "USD"));
+        assert_eq!(update.symbol, Some(Symbol::new("BTC", "USD")));
         assert_eq!(update.fee, None);
         assert_eq!(update.fee_asset, None);
     }
@@ -789,7 +789,7 @@ mod tests {
         let updates = parse_kraken_execution(text, &venue);
         assert_eq!(updates.len(), 1);
         let update = &updates[0];
-        assert_eq!(update.symbol, Symbol::new("BTC", "USD"));
+        assert_eq!(update.symbol, Some(Symbol::new("BTC", "USD")));
         assert_eq!(update.client_order_id, None);
         assert_eq!(update.status, OrderStatus::New);
         assert_eq!(update.filled_qty, Decimal::ZERO);
@@ -799,7 +799,7 @@ mod tests {
     }
 
     #[test]
-    fn drops_execution_with_missing_symbol_without_affecting_rest_of_batch() {
+    fn keeps_execution_with_missing_symbol_as_none_instead_of_dropping() {
         let venue = Venue::new("kraken");
         let text = r#"{
             "channel": "executions",
@@ -824,9 +824,12 @@ mod tests {
             "sequence": 8
         }"#;
         let updates = parse_kraken_execution(text, &venue);
-        assert_eq!(updates.len(), 1);
-        assert_eq!(updates[0].exchange_order_id, Some("OK4GJX-KSTLS-7DZZO6".to_string()));
-        assert_eq!(updates[0].symbol, Symbol::new("ETH", "USD"));
+        assert_eq!(updates.len(), 2);
+        assert_eq!(updates[0].exchange_order_id, Some("OK4GJX-KSTLS-7DZZO5".to_string()));
+        assert_eq!(updates[0].symbol, None);
+        assert_eq!(updates[0].status, OrderStatus::PartiallyFilled);
+        assert_eq!(updates[1].exchange_order_id, Some("OK4GJX-KSTLS-7DZZO6".to_string()));
+        assert_eq!(updates[1].symbol, Some(Symbol::new("ETH", "USD")));
     }
 
     #[test]

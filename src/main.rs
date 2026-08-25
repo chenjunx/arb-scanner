@@ -1087,7 +1087,7 @@ async fn run_reconcile_order_command(args: &[String]) -> anyhow::Result<()> {
     order_manager
         .handle_exchange_update(ExchangeOrderUpdate {
             venue: trade.venue.clone(),
-            symbol: trade.symbol.clone(),
+            symbol: Some(trade.symbol.clone()),
             client_order_id: trade.client_order_id.clone(),
             exchange_order_id: Some(exchange_order_id),
             status: result.status,

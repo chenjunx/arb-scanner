@@ -14,7 +14,11 @@ use super::manager::OrderManager;
 #[derive(Debug, Clone)]
 pub struct ExchangeOrderUpdate {
     pub venue: Venue,
-    pub symbol: Symbol,
+    /// 仅供日志/调试参考——`OrderManager::handle_exchange_update` 靠
+    /// `client_order_id`/`exchange_order_id` 关联订单，真正落库/发布事件用的
+    /// symbol 取自已存的订单记录，不依赖这个字段，交易所推送里没带/带坏了
+    /// 也不影响这条更新被正常处理。
+    pub symbol: Option<Symbol>,
     /// 下单时透传给交易所的客户端订单号，用于关联回内部 `OrderId`。
     pub client_order_id: Option<String>,
     /// 交易所自己的订单号，client_order_id 关联失败时的兜底关联键。

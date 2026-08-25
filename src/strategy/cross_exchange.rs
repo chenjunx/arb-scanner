@@ -711,7 +711,7 @@ mod tests {
         order_manager
             .handle_exchange_update(ExchangeOrderUpdate {
                 venue: venue.clone(),
-                symbol,
+                symbol: Some(symbol),
                 client_order_id: order.request.client_order_id().map(|s| s.to_string()),
                 exchange_order_id: order.exchange_order_id.clone(),
                 status,

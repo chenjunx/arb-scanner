@@ -673,7 +673,7 @@ fn parse_execution_report(text: &str, venue: &Venue, symbol_map: &HashMap<String
 
     Some(ExchangeOrderUpdate {
         venue: venue.clone(),
-        symbol: symbol.clone(),
+        symbol: Some(symbol.clone()),
         client_order_id: Some(report.client_order_id).filter(|s| !s.is_empty()),
         exchange_order_id: Some(report.exchange_order_id.to_string()),
         status: map_status(&report.order_status),
@@ -1025,7 +1025,7 @@ mod tests {
         }"#;
         let update = parse_execution_report(text, &venue, &map).expect("should parse");
         assert_eq!(update.venue, venue);
-        assert_eq!(update.symbol, symbol);
+        assert_eq!(update.symbol, Some(symbol));
         assert_eq!(update.client_order_id, Some("ORD-000000000001".to_string()));
         assert_eq!(update.exchange_order_id, Some("123456".to_string()));
         assert_eq!(update.status, OrderStatus::PartiallyFilled);

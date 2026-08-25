@@ -663,7 +663,7 @@ impl ManualStrategy {
         self.order_manager
             .handle_exchange_update(ExchangeOrderUpdate {
                 venue: trade.venue.clone(),
-                symbol: trade.symbol.clone(),
+                symbol: Some(trade.symbol.clone()),
                 client_order_id: trade.client_order_id.clone(),
                 exchange_order_id: Some(exchange_order_id),
                 status: result.status,
@@ -1128,7 +1128,7 @@ mod tests {
         order_manager
             .handle_exchange_update(ExchangeOrderUpdate {
                 venue: venue.clone(),
-                symbol,
+                symbol: Some(symbol),
                 client_order_id: Some(client_order_id.to_string()),
                 exchange_order_id: order.exchange_order_id.clone(),
                 status: OrderStatus::Filled,
