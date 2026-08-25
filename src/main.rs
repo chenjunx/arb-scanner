@@ -11,13 +11,13 @@ use rust_decimal::Decimal;
 
 use arb_scanner::accounting::balance_stream::BalanceStreamSource;
 use arb_scanner::accounting::{FundingFeeProvider, FundingFeeTracker, RedisFundingCursorStore};
-use arb_scanner::config::{AppConfig, ScanConfig, VenueConfig};
+use arb_scanner::config::{AppConfig, CrossExchangeExecutionConfig, ScanConfig, VenueConfig};
 use arb_scanner::engine::ArbitrageEngine;
 use arb_scanner::exchange_info::ExchangeInfoProvider;
 use arb_scanner::exchange_info::PrecisionCache;
 use arb_scanner::exchange_info::binance::BinanceExchangeInfoProvider;
 use arb_scanner::exchange_info::kraken::KrakenExchangeInfoProvider;
-use arb_scanner::exchange_info::types::TradingFee;
+use arb_scanner::exchange_info::types::{PrecisionKind, TradingFee};
 use arb_scanner::logging;
 use arb_scanner::market_data::MarketDataSource;
 use arb_scanner::market_data::binance::BinanceSpotSource;
@@ -37,7 +37,7 @@ use arb_scanner::order_manager::{
     ExchangeAdapter, ExchangeOrderUpdate, ExecutionService, InMemoryOrderStore, OrderManager, OrderStore,
     OrderStreamSource, RedisOrderIdAllocator, RedisOrderStore, RiskService,
 };
-use arb_scanner::order_manager::risk_service::RiskLimits;
+use arb_scanner::order_manager::risk_service::{AssetImbalanceLimit, RiskLimits};
 use arb_scanner::order_manager::types::{OrderEvent, OrderId};
 use arb_scanner::portfolio::PortfolioManager;
 use arb_scanner::position::{
@@ -47,7 +47,7 @@ use arb_scanner::pricing::FeeUsdtConverter;
 use arb_scanner::report::channels::LogChannel;
 use arb_scanner::report::{OrderSection, PortfolioSection, ReportChannel, ReportTracker};
 use arb_scanner::scan;
-use arb_scanner::strategy::cross_exchange::CrossExchangeStrategy;
+use arb_scanner::strategy::cross_exchange::{CrossExchangeStrategy, CrossExecutionConfig};
 use arb_scanner::strategy::manual::{
     ClosePositionParams, ManualStrategy, OpenPositionParams, RotateInventoryParams, open_hedged_position_dry_run,
 };
@@ -187,14 +187,51 @@ async fn main() -> anyhow::Result<()> {
         })
         .collect();
 
+    // cross_exchange_execution 只有 enabled+live 都为真才会真正接 Redis/私有 WS
+    // 下单;enabled=true 但 live=false 时保持现状的"只记录机会、不下单"行为——
+    // OrderManager 流水线里成交只能靠交易所私有 WS 推送确认(见
+    // `ExecutionService::handle_trade`,同步 REST 结果不会直接产生
+    // `OrderEvent::Filled`),没有真实下单就没有真实 WS 推送,没法在这条流水线里
+    // 伪造出一条"完整链路成交"的 dry run,所以 live=false 时干脆不接
+    // `with_execution`,而不是接上一个永远等不到终态的假流水线。
+    let cross_execution: Option<Arc<CrossExecutionConfig>> = match &config.cross_exchange_execution {
+        Some(cfg) if cfg.enabled && cfg.live => {
+            let testnet = config
+                .venues
+                .iter()
+                .find(|v| v.name == cfg.binance_venue)
+                .map(|v| v.testnet)
+                .unwrap_or(false);
+            info!(
+                "cross_exchange_execution: live=true, wiring kraken_venue={} binance_venue={}",
+                cfg.kraken_venue, cfg.binance_venue
+            );
+            Some(Arc::new(
+                build_cross_execution_config(cfg, &symbols, testnet, proxy.clone(), bus.clone()).await?,
+            ))
+        }
+        Some(cfg) if cfg.enabled => {
+            info!(
+                "cross_exchange_execution: enabled but live=false, staying in observe-only mode (opportunities are logged, no orders placed); set live=true to trade"
+            );
+            None
+        }
+        _ => None,
+    };
+
+    let mut cross_exchange_strategy = CrossExchangeStrategy::new(
+        symbols,
+        fees.clone(),
+        config.min_profit_bps,
+        Arc::new(LinkHealthMonitor::always_healthy()),
+        bus.clone(),
+    );
+    if let Some(execution) = cross_execution {
+        cross_exchange_strategy = cross_exchange_strategy.with_execution(execution);
+    }
+
     let strategies: Vec<Box<dyn Strategy>> = vec![
-        Box::new(CrossExchangeStrategy::new(
-            symbols,
-            fees.clone(),
-            config.min_profit_bps,
-            Arc::new(LinkHealthMonitor::always_healthy()),
-            bus.clone(),
-        )),
+        Box::new(cross_exchange_strategy),
         Box::new(TriangularStrategy::new(
             triangular_paths,
             fees,
@@ -251,8 +288,9 @@ struct ManualPipeline {
 async fn build_manual_pipeline(
     redis_url: &str,
     bus: Arc<TopicBus>,
-    symbol: &Symbol,
+    symbols: &[Symbol],
     legs: Vec<(Venue, Arc<dyn OrderProvider>, Box<dyn OrderStreamSource>, RiskLimits)>,
+    asset_imbalance_limits: HashMap<String, AssetImbalanceLimit>,
 ) -> anyhow::Result<ManualPipeline> {
     let order_store = Arc::new(RedisOrderStore::new(redis_url).context("failed to connect RedisOrderStore to redis")?);
     let order_id_allocator =
@@ -263,19 +301,24 @@ async fn build_manual_pipeline(
     let mut adapters = HashMap::new();
     let mut fee_providers = HashMap::new();
     for (venue, provider, _stream, limits) in &legs {
-        risk_limits.insert((venue.clone(), symbol.clone()), limits.clone());
+        for symbol in symbols {
+            risk_limits.insert((venue.clone(), symbol.clone()), limits.clone());
+        }
         adapters.insert(venue.clone(), Arc::new(ExchangeAdapter::new(venue.clone(), provider.clone())));
         fee_providers.insert(venue.clone(), provider.clone());
     }
     let fee_converter = Some(Arc::new(FeeUsdtConverter::new(fee_providers)));
 
-    let risk_service = Arc::new(RiskService::new(
-        bus.clone(),
-        Arc::new(order_id_allocator),
-        order_store.clone(),
-        risk_limits,
-        position_manager.clone(),
-    ));
+    let risk_service = Arc::new(
+        RiskService::new(
+            bus.clone(),
+            Arc::new(order_id_allocator),
+            order_store.clone(),
+            risk_limits,
+            position_manager.clone(),
+        )
+        .with_asset_imbalance_limits(asset_imbalance_limits),
+    );
     let execution_service = Arc::new(ExecutionService::new(bus.clone(), adapters, order_store.clone()));
     let order_manager = Arc::new(OrderManager::new(bus.clone(), position_manager, order_store, fee_converter));
 
@@ -296,6 +339,122 @@ async fn build_manual_pipeline(
     }
 
     Ok(ManualPipeline { order_manager, stream_handles })
+}
+
+/// 为 `CrossExchangeStrategy` 的自动下单搭建执行依赖：加载两边现货精度缓存、
+/// 预算每个 symbol 的下单量(两边 min_qty 中较大者，再各自 floor 到合法步进)，
+/// 并通过 [`build_manual_pipeline`] 建好 RiskService(带资产失衡闸)/
+/// ExecutionService/OrderManager + 两条私有 WS 流。只在 `cross_exchange_execution.live
+/// = true` 时被调用——`live=false` 由调用方直接跳过、不建这整套流水线。
+async fn build_cross_execution_config(
+    cfg: &CrossExchangeExecutionConfig,
+    symbols: &[Symbol],
+    testnet: bool,
+    proxy: Option<String>,
+    bus: Arc<TopicBus>,
+) -> anyhow::Result<CrossExecutionConfig> {
+    let kraken_venue = Venue::new(cfg.kraken_venue.clone());
+    let binance_venue = Venue::new(cfg.binance_venue.clone());
+
+    let kraken_provider: Arc<dyn OrderProvider> =
+        Arc::new(KrakenOrderProvider::from_env(kraken_venue.clone(), proxy.as_deref())?);
+    let binance_provider: Arc<dyn OrderProvider> =
+        Arc::new(BinanceOrderProvider::from_env(binance_venue.clone(), testnet, proxy.as_deref())?);
+
+    let kraken_info = KrakenExchangeInfoProvider::from_env(Venue::new("kraken"), proxy.as_deref())?;
+    let binance_info = BinanceExchangeInfoProvider::from_env(Venue::new("binance"), testnet, proxy.as_deref())?;
+    let kraken_precision = Arc::new(
+        PrecisionCache::load_spot(&kraken_info)
+            .await
+            .context("failed to load kraken spot market precision cache")?,
+    );
+    let binance_precision = Arc::new(
+        PrecisionCache::load_spot(&binance_info)
+            .await
+            .context("failed to load binance spot market precision cache")?,
+    );
+
+    let mut order_qty_by_symbol = HashMap::new();
+    for symbol in symbols {
+        let kraken_min = match kraken_precision.min_qty(symbol, PrecisionKind::Limit) {
+            Ok(q) => q,
+            Err(err) => {
+                info!("cross_exchange_execution: symbol={symbol} 在 kraken 没有精度信息，跳过该 symbol 的自动下单: {err:#}");
+                continue;
+            }
+        };
+        let binance_min = match binance_precision.min_qty(symbol, PrecisionKind::Market) {
+            Ok(q) => q,
+            Err(err) => {
+                info!("cross_exchange_execution: symbol={symbol} 在 binance 没有精度信息，跳过该 symbol 的自动下单: {err:#}");
+                continue;
+            }
+        };
+        let raw_qty = kraken_min.max(binance_min);
+        let kraken_qty = kraken_precision.round_qty(symbol, PrecisionKind::Limit, raw_qty)?;
+        let binance_qty = binance_precision.round_qty(symbol, PrecisionKind::Market, raw_qty)?;
+        let qty = kraken_qty.min(binance_qty);
+        info!(
+            "cross_exchange_execution: symbol={symbol} 预加载下单量={qty} (kraken_min={kraken_min} binance_min={binance_min})"
+        );
+        order_qty_by_symbol.insert(symbol.clone(), qty);
+    }
+
+    let redis_url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379/".to_string());
+    info!("cross_exchange_execution: connecting to redis at {redis_url}");
+
+    let kraken_stream =
+        Box::new(KrakenPrivateOrderStream::from_env(kraken_venue.clone(), proxy.as_deref())?) as Box<dyn OrderStreamSource>;
+    let binance_stream = Box::new(BinanceUserDataStream::from_env(
+        binance_venue.clone(),
+        testnet,
+        proxy.as_deref(),
+        symbols.to_vec(),
+    )?) as Box<dyn OrderStreamSource>;
+
+    let asset_imbalance_limits: HashMap<String, AssetImbalanceLimit> = cfg
+        .asset_imbalance_limits
+        .iter()
+        .map(|(asset, max_diff)| {
+            (
+                asset.clone(),
+                AssetImbalanceLimit {
+                    venue_a: kraken_venue.clone(),
+                    venue_b: binance_venue.clone(),
+                    max_diff: *max_diff,
+                },
+            )
+        })
+        .collect();
+
+    let pipeline = build_manual_pipeline(
+        &redis_url,
+        bus.clone(),
+        symbols,
+        vec![
+            (kraken_venue.clone(), kraken_provider, kraken_stream, RiskLimits::default()),
+            (binance_venue.clone(), binance_provider, binance_stream, RiskLimits::default()),
+        ],
+        asset_imbalance_limits,
+    )
+    .await
+    .context("failed to build cross_exchange_execution OrderManager pipeline")?;
+
+    Ok(CrossExecutionConfig {
+        kraken_venue: kraken_venue.clone(),
+        kraken_trade_venue: kraken_venue,
+        binance_venue: binance_venue.clone(),
+        binance_trade_venue: binance_venue,
+        kraken_precision,
+        binance_precision,
+        order_manager: pipeline.order_manager,
+        order_qty_by_symbol,
+        ioc_price_slippage_bps: cfg.ioc_price_slippage_bps,
+        ioc_wait_timeout: Duration::from_millis(cfg.ioc_wait_timeout_ms),
+        hedge_wait_timeout: Duration::from_millis(cfg.ioc_wait_timeout_ms),
+        bus,
+        strategy_name: "cross_exchange".to_string(),
+    })
 }
 
 /// `transfer` 子命令专用的 live 流水线：只需要 RiskService/ExecutionService/
@@ -769,7 +928,7 @@ async fn run_open_command(args: &[String]) -> anyhow::Result<()> {
     let pipeline = build_manual_pipeline(
         &redis_url,
         bus.clone(),
-        &symbol,
+        std::slice::from_ref(&symbol),
         vec![
             (
                 spot_venue.clone(),
@@ -792,6 +951,7 @@ async fn run_open_command(args: &[String]) -> anyhow::Result<()> {
                 },
             ),
         ],
+        HashMap::new(),
     )
     .await?;
 
@@ -1159,11 +1319,12 @@ async fn run_rotate_command(args: &[String]) -> anyhow::Result<()> {
     let pipeline = build_manual_pipeline(
         &redis_url,
         bus.clone(),
-        &symbol,
+        std::slice::from_ref(&symbol),
         vec![
             (sell_provider.venue(), sell_provider.clone(), sell_stream, default_limits.clone()),
             (buy_provider.venue(), buy_provider.clone(), buy_stream, default_limits),
         ],
+        HashMap::new(),
     )
     .await?;
 
@@ -1339,7 +1500,7 @@ async fn run_close_command(args: &[String]) -> anyhow::Result<()> {
         legs.push((provider.venue(), provider.clone(), stream, default_limits.clone()));
     }
 
-    let pipeline = build_manual_pipeline(&redis_url, bus.clone(), &symbol, legs).await?;
+    let pipeline = build_manual_pipeline(&redis_url, bus.clone(), std::slice::from_ref(&symbol), legs, HashMap::new()).await?;
 
     let strategy = ManualStrategy::new(bus, pipeline.order_manager);
     let live_result = strategy

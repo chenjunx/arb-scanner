@@ -112,6 +112,7 @@ mod tests {
                 symbol: Symbol::new("BTC", "USDT"),
                 side: OrderSide::Buy,
                 amount: OrderAmount::Base(Decimal::ONE),
+                order_kind: Default::default(),
                 client_order_id: None,
                 group_id: None,
                 metadata: None,

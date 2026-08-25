@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::Context;
@@ -14,6 +15,8 @@ pub struct AppConfig {
     pub min_profit_bps: Decimal,
     #[serde(default = "default_tick_interval_ms")]
     pub tick_interval_ms: u64,
+    #[serde(default)]
+    pub cross_exchange_execution: Option<CrossExchangeExecutionConfig>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -57,6 +60,33 @@ pub struct TriangularLegConfig {
 pub struct TriangularPathConfig {
     pub venue: String,
     pub legs: [TriangularLegConfig; 3],
+}
+
+/// `CrossExchangeStrategy` 的下单执行配置。缺省(不写这一段)时策略退化为
+/// 现状:只在 `on_quote` 里打日志,不下单。
+#[derive(Debug, Deserialize, Clone)]
+pub struct CrossExchangeExecutionConfig {
+    pub enabled: bool,
+    /// false=dry_run(默认),true 才会真实下单,与 `open --live` 的约定一致。
+    #[serde(default)]
+    pub live: bool,
+    pub kraken_venue: String,
+    pub binance_venue: String,
+    #[serde(default = "default_ioc_slippage_bps")]
+    pub ioc_price_slippage_bps: Decimal,
+    #[serde(default = "default_ioc_wait_ms")]
+    pub ioc_wait_timeout_ms: u64,
+    /// key 是 asset(如 "BTC"),value 是允许的 |kraken持仓 - binance持仓| 上限。
+    #[serde(default)]
+    pub asset_imbalance_limits: HashMap<String, Decimal>,
+}
+
+fn default_ioc_slippage_bps() -> Decimal {
+    Decimal::from(10)
+}
+
+fn default_ioc_wait_ms() -> u64 {
+    5_000
 }
 
 fn default_source() -> String {

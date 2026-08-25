@@ -23,6 +23,21 @@ impl std::fmt::Display for OrderId {
     }
 }
 
+/// 订单类型：市价单，或限价 IOC (Immediate-or-Cancel) 单。
+/// `#[serde(default)]` 用在 `OrderRequest::order_kind` 上，反序列化旧 Redis
+/// 记录（没有这个字段）时自动当作 `Market` 处理，向后兼容。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum OrderKind {
+    Market,
+    LimitIoc { price: Decimal },
+}
+
+impl Default for OrderKind {
+    fn default() -> Self {
+        OrderKind::Market
+    }
+}
+
 /// 策略提交的交易订单请求
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrderRequest {
@@ -32,6 +47,8 @@ pub struct OrderRequest {
     pub symbol: Symbol,
     pub side: OrderSide,
     pub amount: OrderAmount,
+    #[serde(default)]
+    pub order_kind: OrderKind,
     pub client_order_id: Option<String>,
     pub group_id: Option<String>,
     pub metadata: Option<String>,

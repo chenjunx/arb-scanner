@@ -7,7 +7,7 @@ use rust_decimal::Decimal;
 use tokio::task::JoinHandle;
 
 use crate::order::OrderProvider;
-use crate::order::types::{MarketOrderRequest, OrderResult, OrderStatus};
+use crate::order::types::{LimitIocOrderRequest, MarketOrderRequest, OrderAmount, OrderResult, OrderStatus};
 use crate::position::PositionManager;
 use crate::topic::{Topic, TopicBus};
 use crate::types::Venue;
@@ -15,7 +15,7 @@ use crate::wallet::WalletProvider;
 use crate::wallet::transfer::{TransferParams, transfer_asset};
 
 use super::store::OrderStore;
-use super::types::{AnyOrderRequest, Order, OrderEvent, OrderRequest};
+use super::types::{AnyOrderRequest, Order, OrderEvent, OrderKind, OrderRequest};
 
 pub struct ExchangeAdapter {
     venue: Venue,
@@ -33,14 +33,32 @@ impl ExchangeAdapter {
 
     pub async fn submit(&self, order: &Order) -> anyhow::Result<OrderResult> {
         let trade = order.request.as_trade().expect("ExchangeAdapter::submit called on non-trade order");
-        let req = MarketOrderRequest {
-            symbol: trade.symbol.clone(),
-            side: trade.side,
-            amount: trade.amount,
-            client_order_id: trade.client_order_id.clone(),
-            dry_run: false,
-        };
-        self.provider.place_market_order(req).await
+        match &trade.order_kind {
+            OrderKind::Market => {
+                let req = MarketOrderRequest {
+                    symbol: trade.symbol.clone(),
+                    side: trade.side,
+                    amount: trade.amount,
+                    client_order_id: trade.client_order_id.clone(),
+                    dry_run: false,
+                };
+                self.provider.place_market_order(req).await
+            }
+            OrderKind::LimitIoc { price } => {
+                let OrderAmount::Base(quantity) = trade.amount else {
+                    anyhow::bail!("LimitIoc order requires OrderAmount::Base, got {:?}", trade.amount);
+                };
+                let req = LimitIocOrderRequest {
+                    symbol: trade.symbol.clone(),
+                    side: trade.side,
+                    quantity,
+                    price: *price,
+                    client_order_id: trade.client_order_id.clone(),
+                    dry_run: false,
+                };
+                self.provider.place_limit_ioc_order(req).await
+            }
+        }
     }
 }
 

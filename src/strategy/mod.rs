@@ -8,7 +8,7 @@ use rust_decimal::Decimal;
 
 use crate::market_data::now_ms;
 use crate::order::types::{OrderAmount, OrderSide};
-use crate::order_manager::types::{AnyOrderRequest, OrderRequest, TransferRequest};
+use crate::order_manager::types::{AnyOrderRequest, OrderKind, OrderRequest, TransferRequest};
 use crate::topic::{Topic, TopicBus};
 use crate::types::{Quote, Symbol, Venue};
 
@@ -94,6 +94,36 @@ pub trait Strategy: Send + Sync {
             symbol,
             side,
             amount,
+            order_kind: OrderKind::Market,
+            client_order_id: Some(client_order_id),
+            group_id,
+            metadata,
+            order_id: None,
+        };
+        self.bus().publish(Topic::order_submit(), AnyOrderRequest::Trade(request));
+    }
+
+    /// 提交限价 IOC 单到风控层：与 `submit_order` 相同的字段/发布逻辑，
+    /// 只是 `amount` 固定按基础币数量、`order_kind` 带上限价。
+    fn submit_limit_ioc_order(
+        &self,
+        venue: Venue,
+        symbol: Symbol,
+        side: OrderSide,
+        quantity: Decimal,
+        price: Decimal,
+        client_order_id: Option<String>,
+        group_id: Option<String>,
+        metadata: Option<String>,
+    ) {
+        let client_order_id = client_order_id.unwrap_or_else(|| self.generate_client_order_id());
+        let request = OrderRequest {
+            strategy_id: self.name().to_string(),
+            venue,
+            symbol,
+            side,
+            amount: OrderAmount::Base(quantity),
+            order_kind: OrderKind::LimitIoc { price },
             client_order_id: Some(client_order_id),
             group_id,
             metadata,
