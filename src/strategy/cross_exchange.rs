@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -46,11 +46,6 @@ pub struct CrossExchangeStrategy {
     latest: Mutex<HashMap<Symbol, HashMap<Venue, Quote>>>,
     bus: Arc<TopicBus>,
     execution: Option<Arc<CrossExecutionConfig>>,
-    /// 正在执行下单的 symbol 集合，防止同一 symbol 在上一次尝试完成前被
-    /// 重复触发。kraken 探路单、binance 对冲单的整条链路现在全靠
-    /// `on_order_event` 回调驱动、不再 `tokio::spawn`，释放动作全程持有
-    /// `&self`，所以不需要 `Arc`。
-    in_flight: Mutex<HashSet<Symbol>>,
     /// 已发出、还在等成交结果的 kraken 探路单：key 是 client_order_id。
     /// `on_order_event` 收到订单事件后按 order_id 反查出 client_order_id，
     /// 在这张表里找到对应条目才说明这是我们自己在等的 kraken 探路单
@@ -95,7 +90,6 @@ impl CrossExchangeStrategy {
             latest: Mutex::new(HashMap::new()),
             bus,
             execution: None,
-            in_flight: Mutex::new(HashSet::new()),
             pending_kraken_orders: Arc::new(Mutex::new(HashMap::new())),
             pending_binance_orders: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -244,13 +238,7 @@ impl Strategy for CrossExchangeStrategy {
         }
 
         if let (Some(execution), Some((symbol, kraken_side, kraken_ref_price))) = (&self.execution, to_execute) {
-            let mut in_flight = self.in_flight.lock().unwrap();
-            if !in_flight.contains(&symbol) {
-                in_flight.insert(symbol.clone());
-                drop(in_flight);
-
-                self.submit_kraken_probe(execution, symbol, kraken_side, kraken_ref_price);
-            }
+            self.submit_kraken_probe(execution, symbol, kraken_side, kraken_ref_price);
         }
     }
 
@@ -305,14 +293,12 @@ impl CrossExchangeStrategy {
                 );
                 let Some(order) = execution.order_manager.get_order(order_id) else {
                     warn!("cross_exchange: kraken IOC order_id={order_id} symbol={} not found in order manager, skip hedge", leg.symbol);
-                    self.in_flight.lock().unwrap().remove(&leg.symbol);
                     return;
                 };
                 (order.filled_qty, order.avg_price.unwrap_or(Decimal::ZERO))
             }
             OrderEvent::RejectedByRisk { reason, .. } => {
                 warn!("cross_exchange: kraken IOC order_id={order_id} symbol={} rejected by risk: {reason}", leg.symbol);
-                self.in_flight.lock().unwrap().remove(&leg.symbol);
                 return;
             }
             _ => unreachable!("filtered to terminal variants above"),
@@ -320,7 +306,6 @@ impl CrossExchangeStrategy {
 
         if filled_qty <= Decimal::ZERO {
             info!("cross_exchange: kraken IOC order_id={order_id} symbol={} filled_qty=0, opportunity vanished, skip hedge", leg.symbol);
-            self.in_flight.lock().unwrap().remove(&leg.symbol);
             return;
         }
 
@@ -332,9 +317,10 @@ impl CrossExchangeStrategy {
         self.submit_binance_hedge(execution, leg.symbol, leg.kraken_side, order_id.clone(), filled_qty);
     }
 
-    /// binance 对冲单命中终态后的处理：只负责记日志，`in_flight` 在这里才
-    /// 真正释放——跟 `submit_binance_hedge` 是同一套"登记表 + 事件回调"
-    /// 模式的另一半。
+    /// binance 对冲单命中终态后的处理：只负责记日志——同一 symbol 允许多笔
+    /// 探路单/对冲单并发在途（价格维度：只要新价格更好就继续吃，不因为上一
+    /// 笔还没走完就锁住等待），并发量上限交给 `RiskService` 的
+    /// `max_position`/`max_orders_per_window` 兜底。
     fn handle_binance_leg_event(&self, leg: PendingBinanceLeg, event: &OrderEvent) {
         let hedge_order_id = event.order_id();
         match event {
@@ -360,17 +346,14 @@ impl CrossExchangeStrategy {
             }
             _ => unreachable!("on_order_event only forwards Filled/RejectedByRisk/RejectedByExchange here"),
         }
-        self.in_flight.lock().unwrap().remove(&leg.symbol);
     }
 
     /// 下 kraken 限价 IOC 探路单：按精度取整参考价、登记进
     /// `pending_kraken_orders`、发布下单请求。全程同步操作，不需要
-    /// `.await`，所以不用 spawn task——`in_flight` 的释放责任交给后续的
-    /// `on_order_event`（成功 publish 之后）或本函数自己（提前失败时）。
+    /// `.await`，所以不用 spawn task。
     fn submit_kraken_probe(&self, execution: &Arc<CrossExecutionConfig>, symbol: Symbol, kraken_side: OrderSide, kraken_ref_price: Decimal) {
         let Some(&qty) = execution.order_qty_by_symbol.get(&symbol) else {
             warn!("cross_exchange: no preloaded order qty for symbol={symbol}, skip");
-            self.in_flight.lock().unwrap().remove(&symbol);
             return;
         };
 
@@ -378,7 +361,6 @@ impl CrossExchangeStrategy {
             Ok(p) => p,
             Err(err) => {
                 error!("cross_exchange: failed to round kraken IOC price for symbol={symbol}: {err:#}");
-                self.in_flight.lock().unwrap().remove(&symbol);
                 return;
             }
         };
@@ -398,9 +380,7 @@ impl CrossExchangeStrategy {
     /// kraken 探路单成交后的对冲：在 Binance Spot 下市价单对冲。跟
     /// `submit_kraken_probe` 是同一套模式——算精度取整量、登记进
     /// `pending_binance_orders`、发布下单请求，全程同步不需要 `.await`，
-    /// 不用 spawn task。`in_flight` 的释放责任交给后续的
-    /// `handle_binance_leg_event`（成功 publish 之后）或本函数自己
-    /// （提前失败时）。任何一步失败只记日志、不重试/不回滚——与
+    /// 不用 spawn task。任何一步失败只记日志、不重试/不回滚——与
     /// `manual.rs` 现有的失败处理哲学一致，失衡了需要人工介入。
     fn submit_binance_hedge(
         &self,
@@ -417,7 +397,6 @@ impl CrossExchangeStrategy {
                     "cross_exchange: kraken order_id={kraken_order_id} filled_qty={kraken_filled_qty} for symbol={symbol} cannot be rounded to a valid binance market qty ({err:#}), \
                      position is now imbalanced and needs manual hedge"
                 );
-                self.in_flight.lock().unwrap().remove(&symbol);
                 return;
             }
         };
