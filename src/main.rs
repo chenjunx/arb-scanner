@@ -356,8 +356,9 @@ async fn build_cross_execution_config(
     let kraken_venue = Venue::new(cfg.kraken_venue.clone());
     let binance_venue = Venue::new(cfg.binance_venue.clone());
 
-    let kraken_provider: Arc<dyn OrderProvider> =
-        Arc::new(KrakenOrderProvider::from_env(kraken_venue.clone(), proxy.as_deref())?);
+    let kraken_provider_concrete = KrakenOrderProvider::from_env(kraken_venue.clone(), proxy.as_deref())?;
+    let kraken_shared_ws = kraken_provider_concrete.shared_ws();
+    let kraken_provider: Arc<dyn OrderProvider> = Arc::new(kraken_provider_concrete);
     let binance_provider: Arc<dyn OrderProvider> =
         Arc::new(BinanceOrderProvider::from_env(binance_venue.clone(), testnet, proxy.as_deref())?);
 
@@ -404,7 +405,7 @@ async fn build_cross_execution_config(
     info!("cross_exchange_execution: connecting to redis at {redis_url}");
 
     let kraken_stream =
-        Box::new(KrakenPrivateOrderStream::from_env(kraken_venue.clone(), proxy.as_deref())?) as Box<dyn OrderStreamSource>;
+        Box::new(KrakenPrivateOrderStream::from_shared_ws(kraken_shared_ws)) as Box<dyn OrderStreamSource>;
     let binance_stream = Box::new(BinanceUserDataStream::from_env(
         binance_venue.clone(),
         testnet,
@@ -1432,11 +1433,13 @@ async fn run_close_command(args: &[String]) -> anyhow::Result<()> {
         .then(|| BinanceOrderProvider::from_env(Venue::new("binance_spot"), testnet, proxy.as_deref()))
         .transpose()?
         .map(|p| Arc::new(p) as Arc<dyn OrderProvider>);
-    let kraken_spot: Option<Arc<dyn OrderProvider>> = kraken_spot_qty
+    let kraken_spot_arc: Option<Arc<KrakenOrderProvider>> = kraken_spot_qty
         .is_some()
-        .then(|| KrakenOrderProvider::from_env(Venue::new("kraken_spot"), proxy.as_deref()))
-        .transpose()?
-        .map(|p| Arc::new(p) as Arc<dyn OrderProvider>);
+        .then(|| KrakenOrderProvider::from_env(Venue::new("kraken_spot"), proxy.as_deref()).map(Arc::new))
+        .transpose()?;
+    let kraken_spot: Option<Arc<dyn OrderProvider>> = kraken_spot_arc
+        .as_ref()
+        .map(|p| Arc::clone(p) as Arc<dyn OrderProvider>);
     let binance_futures: Option<Arc<dyn OrderProvider>> = futures_qty
         .is_some()
         .then(|| BinanceFuturesOrderProvider::from_env(Venue::new("binance_futures"), testnet, proxy.as_deref()))
@@ -1493,9 +1496,9 @@ async fn run_close_command(args: &[String]) -> anyhow::Result<()> {
         )?);
         legs.push((provider.venue(), provider.clone(), stream, default_limits.clone()));
     }
-    if let Some(provider) = &kraken_spot {
-        let stream = Box::new(KrakenPrivateOrderStream::from_env(Venue::new("kraken_spot"), proxy.as_deref())?);
-        legs.push((provider.venue(), provider.clone(), stream, default_limits.clone()));
+    if let Some(provider) = &kraken_spot_arc {
+        let stream = Box::new(KrakenPrivateOrderStream::from_shared_ws(provider.shared_ws()));
+        legs.push((provider.venue(), Arc::clone(kraken_spot.as_ref().unwrap()), stream, default_limits.clone()));
     }
     if let Some(provider) = &binance_futures {
         let stream = Box::new(BinanceFuturesUserDataStream::from_env(

@@ -13,9 +13,8 @@ use log::{debug, warn};
 use rust_decimal::Decimal;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 use crate::market_data::now_ms;
 use crate::net::connect_tcp;
@@ -57,14 +56,14 @@ pub(crate) const IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 pub struct KrakenOrderProvider {
     venue: Venue,
     http: reqwest::Client,
-    order_ws: KrakenOrderWsClient,
+    ws: Arc<KrakenPrivateWs>,
 }
 
 impl KrakenOrderProvider {
     pub fn new(venue: Venue, api_key: String, api_secret: String, proxy: Option<&str>) -> anyhow::Result<Self> {
         let http = build_http_client(proxy)?;
-        let order_ws = KrakenOrderWsClient::new(venue.clone(), api_key, api_secret, proxy)?;
-        Ok(Self { venue, http, order_ws })
+        let ws = Arc::new(KrakenPrivateWs::new(venue.clone(), api_key, api_secret, proxy)?);
+        Ok(Self { venue, http, ws })
     }
 
     /// 从环境变量读取凭证并构造实例，和 `wallet::kraken::KrakenWalletProvider::from_env`
@@ -74,6 +73,13 @@ impl KrakenOrderProvider {
         let api_secret =
             std::env::var("KRAKEN_SPOT_API_SECRET").context("KRAKEN_SPOT_API_SECRET not set")?;
         Self::new(venue, api_key, api_secret, proxy)
+    }
+
+    /// 返回共享的私有 WS 客户端，供同一账号的 `KrakenPrivateOrderStream` 复用，
+    /// 使两者共用一条 WS 连接——`executions` 订阅可保活 token，避免 token
+    /// 在 15 分钟后过期导致 `add_order` 报 `ESession:Invalid session`。
+    pub fn shared_ws(&self) -> Arc<KrakenPrivateWs> {
+        Arc::clone(&self.ws)
     }
 
     fn kraken_pair(symbol: &Symbol) -> String {
@@ -97,7 +103,7 @@ impl OrderProvider for KrakenOrderProvider {
             quantity,
             req.client_order_id.as_deref(),
         );
-        let result = self.order_ws.add_order(params).await?;
+        let result = self.ws.add_order(params).await?;
         Ok(order_result_from_ws(result))
     }
 
@@ -109,7 +115,7 @@ impl OrderProvider for KrakenOrderProvider {
             req.price,
             req.client_order_id.as_deref(),
         );
-        let result = self.order_ws.add_order(params).await?;
+        let result = self.ws.add_order(params).await?;
         Ok(order_result_from_ws(result))
     }
 
@@ -297,7 +303,7 @@ fn build_limit_ioc_add_order_params(
 }
 
 #[derive(Debug)]
-pub(crate) struct AddOrderWsResult {
+pub struct AddOrderWsResult {
     pub(crate) order_id: String,
 }
 
@@ -334,21 +340,25 @@ fn parse_add_order_ws_response(text: &str) -> Option<(u64, anyhow::Result<AddOrd
     }
 }
 
-/// 下单专用的私有 WS 长连接：和 `KrakenPrivateOrderStream`(只管接收
-/// `executions` 推送)完全解耦、各自独立重连。用 `req_id` 关联请求/响应——
-/// `add_order` 把待应答的 `oneshot::Sender` 存进 `pending`，后台读循环收到
-/// 带匹配 `req_id` 的响应后取出并回传。
+/// 下单与 `executions` 推送共用的私有 WS 长连接。连接建立后立刻订阅
+/// `executions` channel，让 token 在整个会话期间保活（Kraken 规则：token
+/// 有 15 分钟有效期，但只要有活跃的 private subscription 就不会过期）。
 ///
-/// 连接状态用 `active: Mutex<Option<ActiveConnection>>` 显式表达：只有连接
-/// 建立成功期间才是 `Some`，一旦读循环判定断线(错误/空闲超时)就立刻置回
-/// `None` 再进入重连退避——`add_order` 据此判断"未连接"必须快速失败，
-/// 不能靠一个跨重连世代持续存活的 channel 把请求悄悄排队等重连，那样会
-/// 违反"快速失败、不排队"的约定。
-pub(crate) struct KrakenOrderWsClient {
+/// `add_order` 请求走同一条连接，响应按 `req_id` 路由回对应的 caller；
+/// execution 推送按 channel 字段路由给 `KrakenPrivateOrderStream::spawn`
+/// 设置的 `execution_tx`（spawn 前收到的事件静默丢弃）。
+///
+/// 连接状态用 `active: Mutex<Option<ActiveConnection>>` 显式表达，断线时
+/// 清空 `pending`——所有未应答请求立刻收到错误，不排队等重连。
+pub struct KrakenPrivateWs {
     venue: Venue,
     next_req_id: AtomicU64,
     active: Arc<Mutex<Option<ActiveConnection>>>,
     pending: Arc<DashMap<u64, oneshot::Sender<anyhow::Result<AddOrderWsResult>>>>,
+    /// spawn() 设置，连接建立后 execution 推送发往此处；未设置时静默丢弃。
+    execution_tx: Arc<Mutex<Option<mpsc::UnboundedSender<Vec<ExchangeOrderUpdate>>>>>,
+    /// 后台任务在首次建连时发 `true`，断线时发 `false`。
+    connected: watch::Receiver<bool>,
 }
 
 struct ActiveConnection {
@@ -356,12 +366,14 @@ struct ActiveConnection {
     token: String,
 }
 
-impl KrakenOrderWsClient {
-    fn new(venue: Venue, api_key: String, api_secret: String, proxy: Option<&str>) -> anyhow::Result<Self> {
+impl KrakenPrivateWs {
+    pub fn new(venue: Venue, api_key: String, api_secret: String, proxy: Option<&str>) -> anyhow::Result<Self> {
         let http = build_http_client(proxy)?;
         let active = Arc::new(Mutex::new(None));
         let pending = Arc::new(DashMap::new());
-        tokio::spawn(run_kraken_order_ws(
+        let execution_tx = Arc::new(Mutex::new(None));
+        let (connected_tx, connected_rx) = watch::channel(false);
+        tokio::spawn(run_kraken_shared_ws(
             venue.clone(),
             api_key,
             api_secret,
@@ -369,15 +381,14 @@ impl KrakenOrderWsClient {
             proxy.map(str::to_string),
             active.clone(),
             pending.clone(),
+            execution_tx.clone(),
+            connected_tx,
         ));
-        Ok(Self { venue, next_req_id: AtomicU64::new(1), active, pending })
+        Ok(Self { venue, next_req_id: AtomicU64::new(1), active, pending, execution_tx, connected: connected_rx })
     }
 
-    /// 提交一次下单请求并等待响应。`params` 不需要包含 `token`——这里读取
-    /// 当前连接世代的 token 填进去，调用方不用感知 token 刷新/重连。
-    /// 未连接(还没首次连上/正在重连)或消息发送失败都直接快速返回错误，
-    /// 不排队等待重连。
-    pub(crate) async fn add_order(&self, mut params: serde_json::Value) -> anyhow::Result<AddOrderWsResult> {
+    /// 提交一次下单请求并等待响应。未连接或发送失败都快速返回错误，不排队。
+    pub async fn add_order(&self, mut params: serde_json::Value) -> anyhow::Result<AddOrderWsResult> {
         let (sender, token) = {
             let guard = self.active.lock().unwrap();
             let conn = guard
@@ -404,11 +415,10 @@ impl KrakenOrderWsClient {
     }
 }
 
-/// 后台连接循环：结构对齐 `KrakenPrivateOrderStream::spawn`，复用同样的
-/// token 获取/连接/ping/空闲超时判定逻辑，多一个 `select!` 分支处理
-/// `add_order` 发来的待发送消息。每次连接建立/断开都会更新 `active`，
-/// 断线时清空 `pending`——所有还没应答的请求立刻收到错误，不排队等重连。
-async fn run_kraken_order_ws(
+/// 后台连接循环：连接建立后订阅 `executions`，同时处理 `add_order` 的发送和
+/// 响应路由。收到的消息按 `req_id` 存在与否路由：有 req_id → add_order 响应；
+/// 无 req_id → 尝试解析为 execution 推送转发给 execution_tx。
+async fn run_kraken_shared_ws(
     venue: Venue,
     api_key: String,
     api_secret: String,
@@ -416,6 +426,8 @@ async fn run_kraken_order_ws(
     proxy: Option<String>,
     active: Arc<Mutex<Option<ActiveConnection>>>,
     pending: Arc<DashMap<u64, oneshot::Sender<anyhow::Result<AddOrderWsResult>>>>,
+    execution_tx: Arc<Mutex<Option<mpsc::UnboundedSender<Vec<ExchangeOrderUpdate>>>>>,
+    connected_tx: watch::Sender<bool>,
 ) {
     let mut backoff = MIN_BACKOFF;
 
@@ -426,7 +438,7 @@ async fn run_kraken_order_ws(
         {
             Ok(token) => token,
             Err(err) => {
-                warn!("kraken order ws: failed to fetch ws token for venue={venue} err={err:#}, retrying in {backoff:?}");
+                warn!("kraken shared ws: failed to fetch ws token for venue={venue} err={err:#}, retrying in {backoff:?}");
                 tokio::time::sleep(backoff).await;
                 backoff = (backoff * 2).min(MAX_BACKOFF);
                 continue;
@@ -436,7 +448,7 @@ async fn run_kraken_order_ws(
         let tcp = match connect_tcp(WS_HOST, WS_PORT, proxy.as_deref()).await {
             Ok(tcp) => tcp,
             Err(err) => {
-                warn!("kraken order ws connect failed for venue={venue} err={err:#}, retrying in {backoff:?}");
+                warn!("kraken shared ws connect failed for venue={venue} err={err:#}, retrying in {backoff:?}");
                 tokio::time::sleep(backoff).await;
                 backoff = (backoff * 2).min(MAX_BACKOFF);
                 continue;
@@ -446,17 +458,36 @@ async fn run_kraken_order_ws(
         let mut ws = match tokio_tungstenite::client_async_tls(url, tcp).await {
             Ok((ws, _)) => ws,
             Err(err) => {
-                warn!("kraken order ws handshake failed for venue={venue} err={err:#}, retrying in {backoff:?}");
+                warn!("kraken shared ws handshake failed for venue={venue} err={err:#}, retrying in {backoff:?}");
                 tokio::time::sleep(backoff).await;
                 backoff = (backoff * 2).min(MAX_BACKOFF);
                 continue;
             }
         };
-        debug!("kraken order ws connected for venue={venue}");
+
+        // 订阅 executions：让 token 在整个会话期间保活
+        let subscribe = serde_json::json!({
+            "method": "subscribe",
+            "params": {
+                "channel": "executions",
+                "token": token,
+                "snap_orders": false,
+                "snap_trades": false,
+            }
+        });
+        if let Err(err) = ws.send(Message::Text(subscribe.to_string())).await {
+            warn!("kraken shared ws: failed to send executions subscribe for venue={venue} err={err}, retrying in {backoff:?}");
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(MAX_BACKOFF);
+            continue;
+        }
+
+        debug!("kraken shared ws connected for venue={venue}");
         backoff = MIN_BACKOFF;
 
         let (conn_tx, mut conn_rx) = mpsc::unbounded_channel::<Message>();
         *active.lock().unwrap() = Some(ActiveConnection { sender: conn_tx, token });
+        let _ = connected_tx.send(true);
 
         let mut ping_interval = tokio::time::interval(PING_INTERVAL);
         ping_interval.tick().await; // 首次 tick 立即触发，跳过，避免刚连上就发一次多余的 ping
@@ -466,16 +497,14 @@ async fn run_kraken_order_ws(
                 _ = ping_interval.tick() => {
                     let ping = serde_json::json!({"method": "ping"});
                     if let Err(err) = ws.send(Message::Text(ping.to_string())).await {
-                        warn!("kraken order ws: failed to send ping for venue={venue} err={err}");
+                        warn!("kraken shared ws: failed to send ping for venue={venue} err={err}");
                         break;
                     }
                 }
                 outgoing = conn_rx.recv() => {
-                    // `conn_tx`/`conn_rx` 生命周期和这层内循环一致，只有 break 出去时
-                    // 才会一起被丢弃，`recv()` 返回 `None` 在正常运行时不会发生。
                     let Some(msg) = outgoing else { break };
                     if let Err(err) = ws.send(msg).await {
-                        warn!("kraken order ws: failed to send add_order request for venue={venue} err={err}");
+                        warn!("kraken shared ws: failed to send add_order request for venue={venue} err={err}");
                         break;
                     }
                 }
@@ -483,19 +512,36 @@ async fn run_kraken_order_ws(
                     let msg = match msg {
                         Ok(Some(Ok(msg))) => msg,
                         Ok(Some(Err(err))) => {
-                            warn!("kraken order ws error for venue={venue} err={err}");
+                            warn!("kraken shared ws error for venue={venue} err={err}");
                             break;
                         }
                         Ok(None) => break,
                         Err(_) => {
-                            warn!("kraken order ws idle timeout for venue={venue}, no message in {IDLE_TIMEOUT:?}");
+                            warn!("kraken shared ws idle timeout for venue={venue}, no message in {IDLE_TIMEOUT:?}");
                             break;
                         }
                     };
                     let Message::Text(text) = msg else { continue };
+
+                    // add_order 响应带 req_id；executions 推送带 channel 字段
                     if let Some((req_id, result)) = parse_add_order_ws_response(&text) {
+                        let is_session_err = result.as_ref()
+                            .err()
+                            .map_or(false, |e| e.to_string().contains("ESession"));
                         if let Some((_, tx)) = pending.remove(&req_id) {
                             let _ = tx.send(result);
+                        }
+                        if is_session_err {
+                            warn!("kraken shared ws: session invalid for venue={venue}, forcing reconnect");
+                            break;
+                        }
+                        continue;
+                    }
+
+                    let updates = parse_kraken_execution(&text, &venue);
+                    if !updates.is_empty() {
+                        if let Some(tx) = execution_tx.lock().unwrap().as_ref() {
+                            let _ = tx.send(updates);
                         }
                     }
                 }
@@ -503,14 +549,15 @@ async fn run_kraken_order_ws(
         }
 
         *active.lock().unwrap() = None;
+        let _ = connected_tx.send(false);
         let stale_req_ids: Vec<u64> = pending.iter().map(|entry| *entry.key()).collect();
         for req_id in stale_req_ids {
             if let Some((_, tx)) = pending.remove(&req_id) {
-                let _ = tx.send(Err(anyhow::anyhow!("kraken order ws for venue={venue} disconnected, reconnecting")));
+                let _ = tx.send(Err(anyhow::anyhow!("kraken shared ws for venue={venue} disconnected, reconnecting")));
             }
         }
 
-        warn!("kraken order ws disconnected for venue={venue}, reconnecting in {backoff:?}");
+        warn!("kraken shared ws disconnected for venue={venue}, reconnecting in {backoff:?}");
         tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(MAX_BACKOFF);
     }
@@ -539,152 +586,56 @@ fn parse_ticker_price(text: &str) -> anyhow::Result<Decimal> {
         .ok_or_else(|| anyhow::anyhow!("kraken Ticker response missing last trade price"))
 }
 
-/// Kraken 私有订单流客户端：通过 `GetWebSocketsToken` 拿到鉴权 token，连接
-/// WebSocket v2 `wss://ws-auth.kraken.com/v2` 并订阅 `executions` channel。
-/// 和 Binance 的 listenKey 不同，token 一旦用于建立连接就在整个会话期间有效，
-/// 不需要额外的心跳续期；断线重连时重新拿一个新 token 即可(旧 token 大概率
-/// 已经过期)。
+/// Kraken 私有订单流客户端：从 `KrakenPrivateWs` 接收 `executions` 推送，
+/// 不再自己管理 WS 连接——连接由 `KrakenPrivateWs` 统一维护，token 由
+/// `executions` 订阅持续保活。
+///
+/// 通常通过 `KrakenOrderProvider::shared_ws()` 构造，让下单连接和推送连接
+/// 共用同一条 WS；也可独立通过 `from_env()` 构造（此时自建连接）。
 pub struct KrakenPrivateOrderStream {
-    venue: Venue,
-    api_key: String,
-    api_secret: String,
-    http: reqwest::Client,
-    proxy: Option<String>,
+    ws: Arc<KrakenPrivateWs>,
 }
 
 impl KrakenPrivateOrderStream {
-    pub fn new(venue: Venue, api_key: String, api_secret: String, proxy: Option<&str>) -> anyhow::Result<Self> {
-        let http = build_http_client(proxy)?;
-        Ok(Self {
-            venue,
-            api_key,
-            api_secret,
-            http,
-            proxy: proxy.map(str::to_string),
-        })
-    }
-
     /// 和 `KrakenOrderProvider::from_env` 复用同一套凭证环境变量。
+    /// 独立建立自己的 WS 连接（不与任何 provider 共享），适合只需要流、
+    /// 不需要下单的场景。
     pub fn from_env(venue: Venue, proxy: Option<&str>) -> anyhow::Result<Self> {
         let api_key = std::env::var("KRAKEN_SPOT_API_KEY").context("KRAKEN_SPOT_API_KEY not set")?;
         let api_secret =
             std::env::var("KRAKEN_SPOT_API_SECRET").context("KRAKEN_SPOT_API_SECRET not set")?;
-        Self::new(venue, api_key, api_secret, proxy)
+        let ws = Arc::new(KrakenPrivateWs::new(venue, api_key, api_secret, proxy)?);
+        Ok(Self { ws })
     }
 
-    async fn fetch_token(&self) -> anyhow::Result<String> {
-        let text = kraken_private_request(&self.http, &self.api_key, &self.api_secret, "/0/private/GetWebSocketsToken", vec![]).await?;
-        parse_ws_token(&text)
-    }
-
-    async fn connect(&self, token: &str) -> anyhow::Result<WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>> {
-        let tcp = connect_tcp(WS_HOST, WS_PORT, self.proxy.as_deref()).await?;
-        let url = format!("wss://{WS_HOST}/v2");
-        let (mut ws, _) = tokio_tungstenite::client_async_tls(url, tcp)
-            .await
-            .context("kraken private order stream handshake failed")?;
-
-        let subscribe = serde_json::json!({
-            "method": "subscribe",
-            "params": {
-                "channel": "executions",
-                "token": token,
-                "snap_orders": false,
-                "snap_trades": false,
-            }
-        });
-        ws.send(Message::Text(subscribe.to_string()))
-            .await
-            .context("failed to send kraken executions subscribe message")?;
-        Ok(ws)
+    /// 复用已有的 `KrakenPrivateWs`（通常来自 `KrakenOrderProvider::shared_ws()`），
+    /// 下单连接和推送连接共用一条 WS，token 由 `executions` 订阅保活。
+    pub fn from_shared_ws(ws: Arc<KrakenPrivateWs>) -> Self {
+        Self { ws }
     }
 }
 
 impl OrderStreamSource for KrakenPrivateOrderStream {
     fn venue(&self) -> Venue {
-        self.venue.clone()
+        self.ws.venue.clone()
     }
 
     fn spawn(self: Box<Self>, order_manager: Arc<OrderManager>) -> crate::order_manager::stream::StreamHandle {
-        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (exec_tx, mut exec_rx) = mpsc::unbounded_channel::<Vec<ExchangeOrderUpdate>>();
+        *self.ws.execution_tx.lock().unwrap() = Some(exec_tx);
+
+        let (ready_tx, ready_rx) = oneshot::channel::<()>();
+        let mut connected_rx = self.ws.connected.clone();
+
         let join = tokio::spawn(async move {
-            let mut backoff = MIN_BACKOFF;
-            let mut ready_tx = Some(ready_tx);
-
-            loop {
-                let token = match self.fetch_token().await {
-                    Ok(token) => token,
-                    Err(err) => {
-                        warn!(
-                            "kraken private order stream: failed to fetch ws token for venue={} err={err:#}, retrying in {:?}",
-                            self.venue, backoff
-                        );
-                        tokio::time::sleep(backoff).await;
-                        backoff = (backoff * 2).min(MAX_BACKOFF);
-                        continue;
-                    }
-                };
-
-                let mut ws = match self.connect(&token).await {
-                    Ok(ws) => ws,
-                    Err(err) => {
-                        warn!(
-                            "kraken private order stream connect failed for venue={} err={err:#}, retrying in {:?}",
-                            self.venue, backoff
-                        );
-                        tokio::time::sleep(backoff).await;
-                        backoff = (backoff * 2).min(MAX_BACKOFF);
-                        continue;
-                    }
-                };
-                debug!("kraken private order stream connected for venue={}", self.venue);
-                backoff = MIN_BACKOFF;
-                if let Some(ready_tx) = ready_tx.take() {
-                    let _ = ready_tx.send(());
+            // 等首次建连后再发 ready，保证 execution 订阅已生效
+            if connected_rx.wait_for(|&b| b).await.is_ok() {
+                let _ = ready_tx.send(());
+            }
+            while let Some(updates) = exec_rx.recv().await {
+                for update in updates {
+                    order_manager.handle_exchange_update(update).await;
                 }
-
-                let mut ping_interval = tokio::time::interval(PING_INTERVAL);
-                ping_interval.tick().await; // 首次 tick 立即触发，跳过，避免刚连上就发一次多余的 ping
-
-                loop {
-                    tokio::select! {
-                        _ = ping_interval.tick() => {
-                            let ping = serde_json::json!({"method": "ping"});
-                            if let Err(err) = ws.send(Message::Text(ping.to_string())).await {
-                                warn!("kraken private order stream: failed to send ping for venue={} err={err}", self.venue);
-                                break;
-                            }
-                        }
-                        msg = tokio::time::timeout(IDLE_TIMEOUT, ws.next()) => {
-                            let msg = match msg {
-                                Ok(Some(Ok(msg))) => msg,
-                                Ok(Some(Err(err))) => {
-                                    warn!("kraken private order stream error for venue={} err={err}", self.venue);
-                                    break;
-                                }
-                                Ok(None) => break,
-                                Err(_) => {
-                                    warn!(
-                                        "kraken private order stream idle timeout for venue={}, no message in {:?}",
-                                        self.venue, IDLE_TIMEOUT
-                                    );
-                                    break;
-                                }
-                            };
-                            let Message::Text(text) = msg else { continue };
-                            for update in parse_kraken_execution(&text, &self.venue) {
-                                order_manager.handle_exchange_update(update).await;
-                            }
-                        }
-                    }
-                }
-
-                warn!(
-                    "kraken private order stream disconnected for venue={}, reconnecting in {:?}",
-                    self.venue, backoff
-                );
-                tokio::time::sleep(backoff).await;
-                backoff = (backoff * 2).min(MAX_BACKOFF);
             }
         });
         crate::order_manager::stream::StreamHandle { join, ready: ready_rx }
