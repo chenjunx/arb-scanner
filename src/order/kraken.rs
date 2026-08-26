@@ -244,13 +244,28 @@ fn order_result_from_ws(result: AddOrderWsResult) -> OrderResult {
     }
 }
 
+/// Kraken WS v2 `add_order` 要求 `order_qty`/`limit_price` 是 JSON number(其
+/// 校验器认的是 `number_float`)，不能像 REST 表单参数那样传字符串；而项目里
+/// `rust_decimal` 开的是 `serde-with-str` 特性，直接序列化 `Decimal` 只会得到
+/// 字符串，所以这里手动转成 `f64` 再包成 `serde_json::Number`。仅用于拼这几个
+/// WS 请求字段，不影响其它地方 Decimal 的序列化行为。
+fn decimal_to_json_number(value: Decimal) -> serde_json::Value {
+    value
+        .to_string()
+        .parse::<f64>()
+        .ok()
+        .and_then(serde_json::Number::from_f64)
+        .map(serde_json::Value::Number)
+        .unwrap_or_else(|| serde_json::Value::String(value.to_string()))
+}
+
 /// 组装 WS v2 `add_order` 市价单参数(不含 `token`——由 `KrakenOrderWsClient::add_order`
 /// 在实际发送前填入当前连接的 token，调用方不需要关心 token 何时刷新)。
 fn build_market_add_order_params(pair: &str, side: OrderSide, quantity: Decimal, client_order_id: Option<&str>) -> serde_json::Value {
     let mut params = serde_json::json!({
         "order_type": "market",
         "side": map_side(side),
-        "order_qty": quantity.to_string(),
+        "order_qty": decimal_to_json_number(quantity),
         "symbol": pair,
     });
     if let Some(client_order_id) = client_order_id {
@@ -270,8 +285,8 @@ fn build_limit_ioc_add_order_params(
     let mut params = serde_json::json!({
         "order_type": "limit",
         "side": map_side(side),
-        "order_qty": quantity.to_string(),
-        "limit_price": price.to_string(),
+        "order_qty": decimal_to_json_number(quantity),
+        "limit_price": decimal_to_json_number(price),
         "time_in_force": "ioc",
         "symbol": pair,
     });
@@ -851,7 +866,8 @@ mod tests {
         let params = build_market_add_order_params("BTC/USD", OrderSide::Buy, "0.1".parse().unwrap(), Some("cid-1"));
         assert_eq!(params["order_type"], "market");
         assert_eq!(params["side"], "buy");
-        assert_eq!(params["order_qty"], "0.1");
+        assert!(params["order_qty"].is_number(), "order_qty must be a JSON number, got {:?}", params["order_qty"]);
+        assert_eq!(params["order_qty"], 0.1);
         assert_eq!(params["symbol"], "BTC/USD");
         assert_eq!(params["cl_ord_id"], "cid-1");
         assert!(params.get("token").is_none());
@@ -869,8 +885,10 @@ mod tests {
         );
         assert_eq!(params["order_type"], "limit");
         assert_eq!(params["side"], "sell");
-        assert_eq!(params["order_qty"], "0.2");
-        assert_eq!(params["limit_price"], "30000");
+        assert!(params["order_qty"].is_number(), "order_qty must be a JSON number, got {:?}", params["order_qty"]);
+        assert_eq!(params["order_qty"], 0.2);
+        assert!(params["limit_price"].is_number(), "limit_price must be a JSON number, got {:?}", params["limit_price"]);
+        assert_eq!(params["limit_price"], 30000.0);
         assert_eq!(params["time_in_force"], "ioc");
         assert!(params.get("cl_ord_id").is_none());
     }
