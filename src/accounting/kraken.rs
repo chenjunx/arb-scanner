@@ -10,7 +10,8 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 use crate::net::connect_tcp;
 use crate::order::kraken::{
-    ChannelEnvelope, MAX_BACKOFF, MIN_BACKOFF, WS_HOST, WS_PORT, build_http_client, kraken_private_request, parse_ws_token,
+    ChannelEnvelope, IDLE_TIMEOUT, MAX_BACKOFF, MIN_BACKOFF, PING_INTERVAL, WS_HOST, WS_PORT, build_http_client,
+    kraken_private_request, parse_ws_token,
 };
 use crate::order_manager::stream::StreamHandle;
 use crate::topic::{Topic, TopicBus};
@@ -119,17 +120,39 @@ impl BalanceStreamSource for KrakenBalanceStream {
                     let _ = ready_tx.send(());
                 }
 
-                while let Some(msg) = ws.next().await {
-                    let msg = match msg {
-                        Ok(msg) => msg,
-                        Err(err) => {
-                            warn!("kraken balance stream error for venue={} err={err}", self.venue);
-                            break;
+                let mut ping_interval = tokio::time::interval(PING_INTERVAL);
+                ping_interval.tick().await; // 首次 tick 立即触发，跳过，避免刚连上就发一次多余的 ping
+
+                loop {
+                    tokio::select! {
+                        _ = ping_interval.tick() => {
+                            let ping = serde_json::json!({"method": "ping"});
+                            if let Err(err) = ws.send(Message::Text(ping.to_string())).await {
+                                warn!("kraken balance stream: failed to send ping for venue={} err={err}", self.venue);
+                                break;
+                            }
                         }
-                    };
-                    let Message::Text(text) = msg else { continue };
-                    for update in parse_kraken_balance_update(&text, &self.venue) {
-                        bus.publish(Topic::balance_update(self.venue.clone()), update);
+                        msg = tokio::time::timeout(IDLE_TIMEOUT, ws.next()) => {
+                            let msg = match msg {
+                                Ok(Some(Ok(msg))) => msg,
+                                Ok(Some(Err(err))) => {
+                                    warn!("kraken balance stream error for venue={} err={err}", self.venue);
+                                    break;
+                                }
+                                Ok(None) => break,
+                                Err(_) => {
+                                    warn!(
+                                        "kraken balance stream idle timeout for venue={}, no message in {:?}",
+                                        self.venue, IDLE_TIMEOUT
+                                    );
+                                    break;
+                                }
+                            };
+                            let Message::Text(text) = msg else { continue };
+                            for update in parse_kraken_balance_update(&text, &self.venue) {
+                                bus.publish(Topic::balance_update(self.venue.clone()), update);
+                            }
+                        }
                     }
                 }
 
