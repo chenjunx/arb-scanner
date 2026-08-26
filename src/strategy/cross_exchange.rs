@@ -50,6 +50,8 @@ pub struct CrossExchangeStrategy {
     /// `on_order_event` 收到订单事件后按 order_id 反查出 client_order_id，
     /// 在这张表里找到对应条目才说明这是我们自己在等的 kraken 探路单
     /// （而不是币安对冲单自己的事件），随后取出成交量去下对冲单。
+    /// 同时也是同价位去重的依据：`submit_kraken_probe` 下单前会扫描这张表，
+    /// 同一 symbol+side+price 已有在途单时跳过，不同价位仍然并发不受限。
     pending_kraken_orders: Arc<Mutex<HashMap<String, PendingKrakenLeg>>>,
     /// 已发出、还在等成交结果的 binance 对冲单：key 是 client_order_id。
     /// 与 `pending_kraken_orders` 同一套模式——`on_order_event` 按
@@ -60,9 +62,12 @@ pub struct CrossExchangeStrategy {
 
 /// `pending_kraken_orders` 表里的一条登记：足够 `on_order_event` 拿去下对冲单
 /// （symbol 决定精度/下单量四舍五入，kraken_side 翻转后就是对冲单方向）。
+/// `price` 是精度取整后实际挂到交易所的价格，供 `submit_kraken_probe` 做
+/// 同价位去重检查。
 struct PendingKrakenLeg {
     symbol: Symbol,
     kraken_side: OrderSide,
+    price: Decimal,
 }
 
 /// `pending_binance_orders` 表里的一条登记：`on_order_event` 收到币安对冲单
@@ -319,8 +324,9 @@ impl CrossExchangeStrategy {
 
     /// binance 对冲单命中终态后的处理：只负责记日志——同一 symbol 允许多笔
     /// 探路单/对冲单并发在途（价格维度：只要新价格更好就继续吃，不因为上一
-    /// 笔还没走完就锁住等待），并发量上限交给 `RiskService` 的
-    /// `max_position`/`max_orders_per_window` 兜底。
+    /// 笔还没走完就锁住等待；但同一 symbol+side+price 已有在途单时会被
+    /// `submit_kraken_probe` 去重跳过，见下方实现），并发量上限交给
+    /// `RiskService` 的 `max_position`/`max_orders_per_window` 兜底。
     fn handle_binance_leg_event(&self, leg: PendingBinanceLeg, event: &OrderEvent) {
         let hedge_order_id = event.order_id();
         match event {
@@ -348,8 +354,8 @@ impl CrossExchangeStrategy {
         }
     }
 
-    /// 下 kraken 限价 IOC 探路单：按精度取整参考价、登记进
-    /// `pending_kraken_orders`、发布下单请求。全程同步操作，不需要
+    /// 下 kraken 限价 IOC 探路单：按精度取整参考价、检查同价位是否已有在途单、
+    /// 登记进 `pending_kraken_orders`、发布下单请求。全程同步操作，不需要
     /// `.await`，所以不用 spawn task。
     fn submit_kraken_probe(&self, execution: &Arc<CrossExecutionConfig>, symbol: Symbol, kraken_side: OrderSide, kraken_ref_price: Decimal) {
         let Some(&qty) = execution.order_qty_by_symbol.get(&symbol) else {
@@ -365,14 +371,25 @@ impl CrossExchangeStrategy {
             }
         };
 
+        let mut pending = self.pending_kraken_orders.lock().unwrap();
+        let already_in_flight = pending
+            .values()
+            .any(|leg| leg.symbol == symbol && leg.kraken_side == kraken_side && leg.price == price);
+        if already_in_flight {
+            info!("cross_exchange: kraken IOC symbol={symbol} side={kraken_side:?} price={price} already has an in-flight probe order at this price, skip");
+            return;
+        }
+
         let client_order_id = generate_client_order_id("kraken");
-        self.pending_kraken_orders.lock().unwrap().insert(
+        pending.insert(
             client_order_id.clone(),
             PendingKrakenLeg {
                 symbol: symbol.clone(),
                 kraken_side,
+                price,
             },
         );
+        drop(pending);
 
         self.submit_limit_ioc_order(execution.kraken_trade_venue.clone(), symbol, kraken_side, qty, price, Some(client_order_id), None, None);
     }
@@ -879,6 +896,51 @@ mod tests {
         assert_eq!(hedge_calls[0], (OrderSide::Buy, partial_fill), "kraken 卖出部分成交后应该在 binance 买入对冲，数量是实际成交的 0.6 而不是下单量 1");
     }
 
+    #[tokio::test]
+    async fn submit_kraken_probe_skips_duplicate_same_price_in_flight_order() {
+        let symbol = btc_usdt();
+        let kraken_venue = Venue::new("kraken_spot");
+        let binance_venue = Venue::new("binance_spot");
+
+        let kraken_limit_calls = Arc::new(Mutex::new(Vec::new()));
+        let kraken_provider: Arc<dyn OrderProvider> = Arc::new(FakeExchangeProvider {
+            venue: kraken_venue.clone(),
+            market_calls: Arc::new(Mutex::new(Vec::new())),
+            limit_ioc_calls: kraken_limit_calls.clone(),
+        });
+        let binance_provider: Arc<dyn OrderProvider> = Arc::new(FakeExchangeProvider {
+            venue: binance_venue.clone(),
+            market_calls: Arc::new(Mutex::new(Vec::new())),
+            limit_ioc_calls: Arc::new(Mutex::new(Vec::new())),
+        });
+
+        let env = setup_env(vec![kraken_provider, binance_provider], symbol.clone()).await;
+        let qty = Decimal::ONE;
+        let execution = test_execution_config(&env, &symbol, kraken_venue.clone(), binance_venue, qty);
+        let strategy = build_strategy(&env, &symbol, execution.clone());
+
+        // 第一笔探路单发出后还没拿到终态（不驱动任何 fill 事件），此时同
+        // symbol/side/price 的第二次调用应该被去重跳过，不产生新的下单请求。
+        strategy.submit_kraken_probe(&execution, symbol.clone(), OrderSide::Buy, Decimal::from(100));
+        strategy.submit_kraken_probe(&execution, symbol.clone(), OrderSide::Buy, Decimal::from(100));
+
+        poll_order_by_prefix(&env.order_manager, "xk").await;
+        // 给第二次调用（如果它错误地真的下单了）留出时间落地。
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        assert_eq!(
+            kraken_limit_calls.lock().unwrap().len(),
+            1,
+            "同一 symbol+side+price 的在途探路单不应该被重复下单"
+        );
+
+        // 不同价位仍然应该并发不受限，不受同价位去重影响。
+        strategy.submit_kraken_probe(&execution, symbol, OrderSide::Buy, Decimal::from(101));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        assert_eq!(kraken_limit_calls.lock().unwrap().len(), 2, "不同价位的探路单不应该被去重跳过");
+    }
+
     /// 记录"价格决策"（`submit_kraken_probe` 被调用，等价于 `on_quote` 判定
     /// 出套利机会那一刻）到 `OrderProvider::place_limit_ioc_order_raw` 被调用
     /// （生产环境里这一步就是真实 HTTP 请求发出前）之间的纯内部调度耗时：
@@ -939,9 +1001,13 @@ mod tests {
         // 迭代次数留在限额以内。
         const ITERATIONS: usize = 80;
         let mut samples = Vec::with_capacity(ITERATIONS);
-        for _ in 0..ITERATIONS {
+        for i in 0..ITERATIONS {
+            // 这个基准只跑 `submit_kraken_probe`、从不驱动成交事件，探路单永远不
+            // 会从 `pending_kraken_orders` 里移除；每次用不同价格避开同价位去重
+            // （否则第 2 次开始都会被跳过，provider 永远等不到调用）。
+            let price = Decimal::from(100) + Decimal::new(i as i64, 2);
             let start = Instant::now();
-            strategy.submit_kraken_probe(&execution, symbol.clone(), OrderSide::Buy, Decimal::from(100));
+            strategy.submit_kraken_probe(&execution, symbol.clone(), OrderSide::Buy, price);
             let received_at = tokio::time::timeout(Duration::from_secs(2), rx.recv())
                 .await
                 .expect("provider was not called within timeout")
