@@ -239,6 +239,57 @@ mod tests {
         assert!(parse_book_ticker("not json", &map).is_none());
     }
 
+    /// `parse_book_ticker` 是纯函数（不依赖网络/bus），直接测它本身的 CPU
+    /// 开销：serde_json 反序列化 + Decimal 解析 + symbol_map 查表，不含任何
+    /// WS 收包/调度耗时。
+    #[test]
+    fn measures_json_parse_latency() {
+        use std::hint::black_box;
+        use std::time::{Duration, Instant};
+
+        let symbol = Symbol::new("BNB", "USDT");
+        let map = map_with(symbol);
+        let text = r#"{
+            "stream": "bnbusdt@bookTicker",
+            "data": {
+                "u": 400900217,
+                "s": "BNBUSDT",
+                "b": "25.35190000",
+                "B": "31.21000000",
+                "a": "25.36520000",
+                "A": "40.66000000"
+            }
+        }"#;
+
+        for _ in 0..1_000 {
+            black_box(parse_book_ticker(black_box(text), &map));
+        }
+
+        const ITERATIONS: usize = 20_000;
+        let mut samples = Vec::with_capacity(ITERATIONS);
+        for _ in 0..ITERATIONS {
+            let start = Instant::now();
+            let result = parse_book_ticker(black_box(text), &map);
+            let elapsed = start.elapsed();
+            black_box(result);
+            samples.push(elapsed);
+        }
+
+        samples.sort();
+        let sum: Duration = samples.iter().sum();
+        let mean = sum / samples.len() as u32;
+        let min = samples[0];
+        let p50 = samples[samples.len() / 2];
+        let p95 = samples[samples.len() * 95 / 100];
+        let p99 = samples[samples.len() * 99 / 100];
+        let max = *samples.last().unwrap();
+
+        println!(
+            "binance parse_book_ticker latency, n={}: min={min:?} p50={p50:?} mean={mean:?} p95={p95:?} p99={p99:?} max={max:?}",
+            samples.len(),
+        );
+    }
+
     #[test]
     fn builds_lowercase_combined_stream_url() {
         let source = BinanceSpotSource::new(

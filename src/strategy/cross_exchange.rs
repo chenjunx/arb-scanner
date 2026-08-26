@@ -899,4 +899,88 @@ mod tests {
         assert_eq!(hedge_calls.len(), 1, "部分成交也应该按实际成交量触发一次对冲");
         assert_eq!(hedge_calls[0], (OrderSide::Buy, partial_fill), "kraken 卖出部分成交后应该在 binance 买入对冲，数量是实际成交的 0.6 而不是下单量 1");
     }
+
+    /// 记录"价格决策"（`submit_kraken_probe` 被调用，等价于 `on_quote` 判定
+    /// 出套利机会那一刻）到 `OrderProvider::place_limit_ioc_order_raw` 被调用
+    /// （生产环境里这一步就是真实 HTTP 请求发出前）之间的纯内部调度耗时：
+    /// bus.publish -> RiskService -> bus.publish -> ExecutionService -> adapter.submit。
+    /// 不连接任何真实交易所，只测代码路径本身的开销。
+    #[tokio::test]
+    async fn measures_internal_dispatch_latency_from_price_decision_to_provider() {
+        use std::time::Instant;
+        use tokio::sync::mpsc;
+
+        let _ = env_logger::builder().filter_level(log::LevelFilter::Debug).is_test(true).try_init();
+
+        struct TimestampingProvider {
+            venue: Venue,
+            tx: mpsc::UnboundedSender<Instant>,
+        }
+
+        #[async_trait]
+        impl OrderProvider for TimestampingProvider {
+            fn venue(&self) -> Venue {
+                self.venue.clone()
+            }
+            async fn place_market_order_raw(&self, _req: &MarketOrderRequest) -> anyhow::Result<OrderResult> {
+                unreachable!("benchmark only drives the kraken IOC leg")
+            }
+            async fn place_limit_ioc_order_raw(&self, req: &LimitIocOrderRequest) -> anyhow::Result<OrderResult> {
+                let _ = self.tx.send(Instant::now());
+                Ok(OrderResult {
+                    order_id: format!("{}-{}", self.venue, req.symbol),
+                    status: OrderStatus::New,
+                    filled_qty: Decimal::ZERO,
+                    avg_price: None,
+                    fee: None,
+                    fee_asset: None,
+                })
+            }
+        }
+
+        let symbol = btc_usdt();
+        let kraken_venue = Venue::new("kraken_spot");
+        let binance_venue = Venue::new("binance_spot");
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let kraken_provider: Arc<dyn OrderProvider> = Arc::new(TimestampingProvider { venue: kraken_venue.clone(), tx });
+        let binance_provider: Arc<dyn OrderProvider> = Arc::new(FakeExchangeProvider {
+            venue: binance_venue.clone(),
+            market_calls: Arc::new(Mutex::new(Vec::new())),
+            limit_ioc_calls: Arc::new(Mutex::new(Vec::new())),
+        });
+
+        let env = setup_env(vec![kraken_provider, binance_provider], symbol.clone()).await;
+        let qty = Decimal::ONE;
+        let execution = test_execution_config(&env, &symbol, kraken_venue, binance_venue, qty);
+        let strategy = build_strategy(&env, &symbol, execution.clone());
+
+        // `setup_env` 固定给每个 (venue, symbol) 配 `max_orders_per_window: 100`
+        // 的风控限额，超过就会被 `RiskService` 拒单而不会走到 provider，所以这里
+        // 迭代次数留在限额以内。
+        const ITERATIONS: usize = 80;
+        let mut samples = Vec::with_capacity(ITERATIONS);
+        for _ in 0..ITERATIONS {
+            let start = Instant::now();
+            strategy.submit_kraken_probe(&execution, symbol.clone(), OrderSide::Buy, Decimal::from(100));
+            let received_at = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("provider was not called within timeout")
+                .expect("provider channel closed unexpectedly");
+            samples.push(received_at.duration_since(start));
+        }
+
+        samples.sort();
+        let sum: Duration = samples.iter().sum();
+        let mean = sum / samples.len() as u32;
+        let min = samples[0];
+        let p50 = samples[samples.len() / 2];
+        let p95 = samples[samples.len() * 95 / 100];
+        let max = *samples.last().unwrap();
+
+        println!(
+            "internal dispatch latency (price decision -> OrderProvider::place_limit_ioc_order_raw), n={}: min={min:?} p50={p50:?} mean={mean:?} p95={p95:?} max={max:?}",
+            samples.len(),
+        );
+    }
 }
