@@ -21,7 +21,7 @@ use crate::order_manager::OrderManager;
 use crate::types::{Symbol, Venue};
 
 use super::OrderProvider;
-use super::types::{LimitIocOrderRequest, MarketOrderRequest, OrderAmount, OrderResult, OrderSide, OrderStatus};
+use super::types::{LimitIocOrderRequest, LimitOrderRequest, MarketOrderRequest, OrderAmount, OrderResult, OrderSide, OrderStatus};
 
 const MAINNET_HOST: &str = "https://api.binance.com";
 const TESTNET_HOST: &str = "https://testnet.binance.vision";
@@ -145,6 +145,38 @@ impl OrderProvider for BinanceOrderProvider {
         }
         let text = self.signed_request(reqwest::Method::POST, "/api/v3/order", params).await?;
         parse_order_response(&text)
+    }
+
+    async fn place_limit_order_raw(&self, req: &LimitOrderRequest) -> anyhow::Result<OrderResult> {
+        let mut params = vec![
+            ("symbol".to_string(), binance_symbol(&req.symbol)),
+            ("side".to_string(), map_side(req.side).to_string()),
+            ("type".to_string(), "LIMIT".to_string()),
+            ("timeInForce".to_string(), "GTC".to_string()),
+            ("quantity".to_string(), req.quantity.to_string()),
+            ("price".to_string(), req.price.to_string()),
+        ];
+        if let Some(client_order_id) = &req.client_order_id {
+            params.push(("newClientOrderId".to_string(), client_order_id.clone()));
+        }
+        let text = self.signed_request(reqwest::Method::POST, "/api/v3/order", params).await?;
+        parse_order_response(&text)
+    }
+
+    /// `DELETE /api/v3/order` 按 orderId 撤销。响应体先按 `ErrorResponse`
+    /// 尝试解析，能解析出来就是撤单失败(比如订单已经成交/已经撤过)；否则视为
+    /// 撤单指令被交易所接受，不解析订单最终状态——见 `OrderProvider::cancel_order`
+    /// 说明，真正的终态仍然只信任私有 WS 推送。
+    async fn cancel_order(&self, symbol: &Symbol, exchange_order_id: &str) -> anyhow::Result<()> {
+        let params = vec![
+            ("symbol".to_string(), binance_symbol(symbol)),
+            ("orderId".to_string(), exchange_order_id.to_string()),
+        ];
+        let text = self.signed_request(reqwest::Method::DELETE, "/api/v3/order", params).await?;
+        if let Ok(err) = serde_json::from_str::<ErrorResponse>(&text) {
+            anyhow::bail!("binance error {}: {}", err.code, err.msg);
+        }
+        Ok(())
     }
 
     /// `GET /api/v3/order` 按 orderId 查询。响应不带 `avgPrice`/`fills`，但带

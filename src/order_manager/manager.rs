@@ -11,7 +11,7 @@ use crate::topic::{Topic, TopicBus};
 
 use super::store::{OrderStore, OrderUpdateOutcome};
 use super::stream::ExchangeOrderUpdate;
-use super::types::{Order, OrderEvent, OrderId};
+use super::types::{Order, OrderEvent, OrderId, OrderKind};
 
 /// 订单管理器（重构后）：只负责处理交易所 WS 推送的订单更新，
 /// 是订单成交状态的唯一权威来源。订单初始创建由 RiskService 写入 Redis，
@@ -105,16 +105,28 @@ impl OrderManager {
                     );
                     return false;
                 }
+                // IOC 单未完全成交就终结 → Expired(自动失效)；GTC 限价单
+                // (Limit)同样收到"未完全成交就终结"的推送，只可能是主动撤单
+                // → 重新解释成 Cancelled。所有交易所的 map_status 统一吐
+                // Expired，判定依据只看这一处的 order_kind，不碰交易所解析代码。
+                let effective_new_status = if new_status == OrderStatus::Expired {
+                    match order.request.as_trade().map(|trade| &trade.order_kind) {
+                        Some(OrderKind::LimitIoc { .. }) | None => OrderStatus::Expired,
+                        Some(_) => OrderStatus::Cancelled,
+                    }
+                } else {
+                    new_status
+                };
                 let already_terminal = matches!(
                     order.status,
-                    OrderStatus::Filled | OrderStatus::Rejected | OrderStatus::Expired
+                    OrderStatus::Filled | OrderStatus::Rejected | OrderStatus::Expired | OrderStatus::Cancelled
                 );
-                if already_terminal && new_filled_qty == order.filled_qty && new_status == order.status {
+                if already_terminal && new_filled_qty == order.filled_qty && effective_new_status == order.status {
                     return false;
                 }
 
                 fill_delta = new_filled_qty - order.filled_qty;
-                order.status = new_status;
+                order.status = effective_new_status;
                 order.filled_qty = new_filled_qty;
                 if new_avg_price.is_some() {
                     order.avg_price = new_avg_price;
@@ -207,6 +219,12 @@ impl OrderManager {
                 order_id: order_id.clone(),
                 client_order_id,
                 reason: format!("exchange order stream reported status={status:?}"),
+            }),
+            OrderStatus::Cancelled => Some(OrderEvent::Cancelled {
+                order_id: order_id.clone(),
+                client_order_id,
+                filled_qty,
+                avg_price: avg_price.unwrap_or(Decimal::ZERO),
             }),
             OrderStatus::New | OrderStatus::Transferred | OrderStatus::DepositConfirmed => None,
         };
@@ -368,9 +386,35 @@ mod tests {
 
     use crate::order::types::OrderSide;
     use crate::order_manager::store::InMemoryOrderStore;
-    use crate::order_manager::types::{AnyOrderRequest, TransferRequest};
+    use crate::order_manager::types::{AnyOrderRequest, OrderRequest, TransferRequest};
+    use crate::order_manager::stream::ExchangeOrderUpdate;
     use crate::position::InMemoryPositionStore;
     use crate::types::{Symbol, Venue};
+
+    fn trade_order(order_id: &str, order_kind: OrderKind, client_order_id: &str) -> Order {
+        Order {
+            order_id: OrderId::new(order_id),
+            request: AnyOrderRequest::Trade(OrderRequest {
+                strategy_id: "test-strategy".to_string(),
+                venue: Venue::new("kraken_spot"),
+                symbol: Symbol::new("BTC", "USDT"),
+                side: OrderSide::Buy,
+                amount: crate::order::types::OrderAmount::Base(Decimal::ONE),
+                order_kind,
+                client_order_id: Some(client_order_id.to_string()),
+                group_id: None,
+                metadata: None,
+                order_id: Some(OrderId::new(order_id)),
+            }),
+            status: OrderStatus::New,
+            filled_qty: Decimal::ZERO,
+            avg_price: None,
+            exchange_order_id: Some(format!("EX-{order_id}")),
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            reject_reason: None,
+        }
+    }
 
     fn transfer_order(order_id: &str, status: OrderStatus) -> Order {
         Order {
@@ -461,5 +505,64 @@ mod tests {
         let stored = om.order_store.get(&order_id).unwrap();
         assert_eq!(stored.status, OrderStatus::DepositConfirmed);
         assert_eq!(stored.updated_at_ms, 1);
+    }
+
+    fn expired_update(client_order_id: &str, exchange_order_id: &str) -> ExchangeOrderUpdate {
+        ExchangeOrderUpdate {
+            venue: Venue::new("kraken_spot"),
+            symbol: None,
+            client_order_id: Some(client_order_id.to_string()),
+            exchange_order_id: Some(exchange_order_id.to_string()),
+            status: OrderStatus::Expired,
+            filled_qty: Decimal::ZERO,
+            avg_price: None,
+            fee: None,
+            fee_asset: None,
+            ts_ms: 2,
+        }
+    }
+
+    #[tokio::test]
+    async fn limit_ioc_expired_wire_status_stays_expired_and_publishes_rejected() {
+        let order_id = OrderId::new("ORD-IOC");
+        let om = manager_with_order(trade_order(
+            "ORD-IOC",
+            OrderKind::LimitIoc { price: Decimal::new(50000, 0) },
+            "cid-ioc",
+        ));
+
+        let mut events = om.bus.subscribe::<OrderEvent>(Topic::order_event("test-strategy"));
+        om.handle_exchange_update(expired_update("cid-ioc", "EX-ORD-IOC")).await;
+
+        let stored = om.order_store.get(&order_id).unwrap();
+        assert_eq!(stored.status, OrderStatus::Expired);
+
+        let (_, event) = events.next().await.unwrap();
+        match event {
+            OrderEvent::RejectedByExchange { order_id: id, .. } => assert_eq!(id, order_id),
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn gtc_limit_expired_wire_status_becomes_cancelled_and_publishes_cancelled() {
+        let order_id = OrderId::new("ORD-GTC");
+        let om = manager_with_order(trade_order(
+            "ORD-GTC",
+            OrderKind::Limit { price: Decimal::new(50000, 0) },
+            "cid-gtc",
+        ));
+
+        let mut events = om.bus.subscribe::<OrderEvent>(Topic::order_event("test-strategy"));
+        om.handle_exchange_update(expired_update("cid-gtc", "EX-ORD-GTC")).await;
+
+        let stored = om.order_store.get(&order_id).unwrap();
+        assert_eq!(stored.status, OrderStatus::Cancelled);
+
+        let (_, event) = events.next().await.unwrap();
+        match event {
+            OrderEvent::Cancelled { order_id: id, .. } => assert_eq!(id, order_id),
+            other => panic!("unexpected event: {other:?}"),
+        }
     }
 }

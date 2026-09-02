@@ -9,7 +9,7 @@ use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 
 use crate::accounting::balance_stream::BalanceUpdate;
-use crate::order_manager::types::{AnyOrderRequest, OrderEvent};
+use crate::order_manager::types::{AnyOrderRequest, CancelRequest, OrderEvent};
 use crate::types::{Quote, Symbol, Venue};
 
 const CHANNEL_CAPACITY: usize = 1024;
@@ -25,6 +25,8 @@ pub enum Topic {
     OrderSubmit,
     /// 订单执行：风控层 -> 执行层，全局单一 topic，payload=`OrderRequest`
     OrderExecute,
+    /// 撤单请求：策略 -> 执行层，全局单一 topic，payload=`CancelRequest`
+    OrderCancel,
     /// 订单事件：执行层/OrderManager -> 策略，按 strategy_id 路由，payload=`OrderEvent`
     OrderEvent { strategy_id: String },
     /// 余额变动事件：venue 级别，payload=`BalanceUpdate`
@@ -37,6 +39,7 @@ impl fmt::Display for Topic {
             Self::Quote { venue, symbol } => write!(f, "quote.{}.{}", venue, symbol),
             Self::OrderSubmit => write!(f, "orders.submit"),
             Self::OrderExecute => write!(f, "orders.execute"),
+            Self::OrderCancel => write!(f, "orders.cancel"),
             Self::OrderEvent { strategy_id } => write!(f, "events.order.{}", strategy_id),
             Self::BalanceUpdate { venue } => write!(f, "balance.{}", venue),
         }
@@ -54,6 +57,10 @@ impl Topic {
 
     pub fn order_execute() -> Self {
         Self::OrderExecute
+    }
+
+    pub fn order_cancel() -> Self {
+        Self::OrderCancel
     }
 
     pub fn order_event(strategy_id: impl Into<String>) -> Self {
@@ -100,6 +107,7 @@ pub struct TopicBus {
     quote_latest: DashMap<Topic, Quote>,
     order_submit_channel: broadcast::Sender<AnyOrderRequest>,
     order_execute_channel: broadcast::Sender<AnyOrderRequest>,
+    order_cancel_channel: broadcast::Sender<CancelRequest>,
     order_event_channels: DashMap<String, broadcast::Sender<OrderEvent>>,
     balance_update_channels: DashMap<Venue, broadcast::Sender<BalanceUpdate>>,
 }
@@ -111,6 +119,7 @@ impl TopicBus {
             quote_latest: DashMap::new(),
             order_submit_channel: broadcast::channel(CHANNEL_CAPACITY).0,
             order_execute_channel: broadcast::channel(CHANNEL_CAPACITY).0,
+            order_cancel_channel: broadcast::channel(CHANNEL_CAPACITY).0,
             order_event_channels: DashMap::new(),
             balance_update_channels: DashMap::new(),
         }
@@ -230,6 +239,30 @@ impl BusMessage for AnyOrderRequest {
             }
             _ => {
                 warn!("TopicBus::subscribe: topic {topic} does not carry AnyOrderRequest data");
+                Box::pin(futures_util::stream::empty())
+            }
+        }
+    }
+}
+
+impl BusMessage for CancelRequest {
+    fn publish(bus: &TopicBus, topic: Topic, data: Self) {
+        match topic {
+            Topic::OrderCancel => {
+                let _ = bus.order_cancel_channel.send(data);
+            }
+            _ => warn!("TopicBus::publish: topic {topic} does not carry CancelRequest data"),
+        }
+    }
+
+    fn subscribe(bus: &TopicBus, topic: Topic) -> BoxTopicStream<Self> {
+        match topic {
+            Topic::OrderCancel => {
+                let receiver = bus.order_cancel_channel.subscribe();
+                Box::pin(lagged_filter_map(topic, receiver))
+            }
+            _ => {
+                warn!("TopicBus::subscribe: topic {topic} does not carry CancelRequest data");
                 Box::pin(futures_util::stream::empty())
             }
         }

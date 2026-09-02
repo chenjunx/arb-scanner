@@ -24,6 +24,7 @@ use arb_scanner::market_data::binance::BinanceSpotSource;
 use arb_scanner::market_data::binance_futures::BinanceFuturesSource;
 use arb_scanner::market_data::cache::MarketDataCache;
 use arb_scanner::market_data::coinex::CoinexSpotSource;
+use arb_scanner::market_data::gate::GateSpotSource;
 use arb_scanner::market_data::kraken::KrakenSpotSource;
 use arb_scanner::market_data::link_health::LinkHealthMonitor;
 use arb_scanner::market_data::mock::{MockSource, MockSymbolConfig};
@@ -33,6 +34,7 @@ use arb_scanner::accounting::binance::BinanceBalanceStream;
 use arb_scanner::accounting::kraken::KrakenBalanceStream;
 use arb_scanner::order::binance::{BinanceOrderProvider, BinanceUserDataStream};
 use arb_scanner::order::binance_futures::{BinanceFuturesOrderProvider, BinanceFuturesUserDataStream};
+use arb_scanner::order::gate::{GateOrderProvider, GatePrivateOrderStream};
 use arb_scanner::order::kraken::{KrakenOrderProvider, KrakenPrivateOrderStream};
 use arb_scanner::order_manager::{
     ExchangeAdapter, ExchangeOrderUpdate, ExecutionService, InMemoryOrderStore, OrderManager, OrderStore,
@@ -109,7 +111,10 @@ async fn main() -> anyhow::Result<()> {
     let fees: HashMap<Venue, FeeSchedule> = config
         .venues
         .iter()
-        .map(|v| (Venue::new(v.name.clone()), FeeSchedule::new(v.taker_fee_bps)))
+        .map(|v| {
+            let schedule = FeeSchedule::new(v.taker_fee_bps).with_maker_bps(v.maker_fee_bps.unwrap_or(v.taker_fee_bps));
+            (Venue::new(v.name.clone()), schedule)
+        })
         .collect();
     let symbols: Vec<Symbol> = config
         .symbols
@@ -156,6 +161,10 @@ async fn main() -> anyhow::Result<()> {
             "coinex_spot" => {
                 info!("starting coinex spot market data source for venue={venue}");
                 Box::new(CoinexSpotSource::new(venue.clone(), symbols.clone(), proxy.clone()))
+            }
+            "gate_spot" => {
+                info!("starting gate spot market data source for venue={venue}");
+                Box::new(GateSpotSource::new(venue.clone(), symbols.clone(), proxy.clone()))
             }
             _ => {
                 info!("starting mock market data source for venue={venue}");
@@ -329,6 +338,7 @@ async fn build_manual_pipeline(
 
     let _risk_handle = risk_service.clone().start();
     let _execution_handle = execution_service.clone().start();
+    let _cancel_handle = execution_service.clone().start_cancel_listener();
 
     // 等每条私有流真正建连+鉴权/订阅完成，再让调用方开始下单——否则市价单
     // 可能在 WS 就绪前就已成交，导致成交推送被永久错过（WS API 不重放）。
@@ -508,6 +518,7 @@ async fn build_transfer_pipeline(
 
     let _risk_handle = risk_service.clone().start();
     let _execution_handle = execution_service.clone().start();
+    let _cancel_handle = execution_service.clone().start_cancel_listener();
 
     Ok(TransferPipeline { order_manager, order_store })
 }
@@ -1992,7 +2003,8 @@ fn build_order_provider(name: &str, testnet: bool, proxy: Option<&str>) -> anyho
             proxy,
         )?)),
         "kraken" => Ok(Arc::new(KrakenOrderProvider::from_env(Venue::new("kraken_spot"), proxy)?)),
-        other => anyhow::bail!("unknown venue '{other}' for 'rotate' subcommand, expected 'binance' or 'kraken'"),
+        "gate" => Ok(Arc::new(GateOrderProvider::from_env(Venue::new("gate_spot"), proxy)?)),
+        other => anyhow::bail!("unknown venue '{other}' for 'rotate' subcommand, expected 'binance', 'kraken' or 'gate'"),
     }
 }
 
@@ -2013,7 +2025,8 @@ fn build_order_stream_source(
             vec![symbol.clone()],
         )?)),
         "kraken" => Ok(Box::new(KrakenPrivateOrderStream::from_env(Venue::new("kraken_spot"), proxy)?)),
-        other => anyhow::bail!("unknown venue '{other}' for 'rotate' subcommand, expected 'binance' or 'kraken'"),
+        "gate" => Ok(Box::new(GatePrivateOrderStream::from_env(Venue::new("gate_spot"), proxy, vec![symbol.clone()])?)),
+        other => anyhow::bail!("unknown venue '{other}' for 'rotate' subcommand, expected 'binance', 'kraken' or 'gate'"),
     }
 }
 

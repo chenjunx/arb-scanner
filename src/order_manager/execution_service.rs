@@ -7,15 +7,15 @@ use rust_decimal::Decimal;
 use tokio::task::JoinHandle;
 
 use crate::order::OrderProvider;
-use crate::order::types::{LimitIocOrderRequest, MarketOrderRequest, OrderAmount, OrderResult, OrderStatus};
+use crate::order::types::{LimitIocOrderRequest, LimitOrderRequest, MarketOrderRequest, OrderAmount, OrderResult, OrderStatus};
 use crate::position::PositionManager;
 use crate::topic::{Topic, TopicBus};
-use crate::types::Venue;
+use crate::types::{Symbol, Venue};
 use crate::wallet::WalletProvider;
 use crate::wallet::transfer::{TransferParams, transfer_asset};
 
 use super::store::OrderStore;
-use super::types::{AnyOrderRequest, Order, OrderEvent, OrderKind, OrderRequest};
+use super::types::{AnyOrderRequest, CancelRequest, Order, OrderEvent, OrderKind, OrderRequest};
 
 pub struct ExchangeAdapter {
     venue: Venue,
@@ -58,7 +58,25 @@ impl ExchangeAdapter {
                 };
                 self.provider.place_limit_ioc_order(req).await
             }
+            OrderKind::Limit { price } => {
+                let OrderAmount::Base(quantity) = trade.amount else {
+                    anyhow::bail!("Limit order requires OrderAmount::Base, got {:?}", trade.amount);
+                };
+                let req = LimitOrderRequest {
+                    symbol: trade.symbol.clone(),
+                    side: trade.side,
+                    quantity,
+                    price: *price,
+                    client_order_id: trade.client_order_id.clone(),
+                    dry_run: false,
+                };
+                self.provider.place_limit_order(req).await
+            }
         }
+    }
+
+    pub async fn cancel(&self, symbol: &Symbol, exchange_order_id: &str) -> anyhow::Result<()> {
+        self.provider.cancel_order(symbol, exchange_order_id).await
     }
 }
 
@@ -103,6 +121,95 @@ impl ExecutionService {
                 self.handle_order_request(request).await;
             }
         })
+    }
+
+    /// 独立订阅 `Topic::order_cancel()`：撤单和下单语义完全独立，不合并进
+    /// `start()` 的同一个 select 循环。
+    pub fn start_cancel_listener(self: Arc<Self>) -> JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut stream = self.bus.subscribe::<CancelRequest>(Topic::order_cancel());
+            while let Some((_topic, request)) = stream.next().await {
+                self.handle_cancel_request(request).await;
+            }
+        })
+    }
+
+    async fn handle_cancel_request(&self, request: CancelRequest) {
+        let Some(order) = self.order_store.find_by_client_order_id(&request.client_order_id) else {
+            warn!(
+                "ExecutionService: cancel_order strategy={} client_order_id={} not found",
+                request.strategy_id, request.client_order_id
+            );
+            return;
+        };
+
+        let already_terminal = matches!(
+            order.status,
+            OrderStatus::Filled
+                | OrderStatus::Rejected
+                | OrderStatus::Expired
+                | OrderStatus::Cancelled
+                | OrderStatus::Transferred
+                | OrderStatus::DepositConfirmed
+        );
+        let Some(exchange_order_id) = order.exchange_order_id.clone() else {
+            warn!(
+                "ExecutionService: cancel_order order_id={} client_order_id={} has no exchange_order_id yet",
+                order.order_id, request.client_order_id
+            );
+            self.publish_rejected(
+                &request.strategy_id,
+                order.order_id,
+                Some(request.client_order_id),
+                "cancel_order: order has no exchange_order_id yet".to_string(),
+            );
+            return;
+        };
+        if already_terminal {
+            warn!(
+                "ExecutionService: cancel_order order_id={} client_order_id={} already terminal status={:?}",
+                order.order_id, request.client_order_id, order.status
+            );
+            self.publish_rejected(
+                &request.strategy_id,
+                order.order_id,
+                Some(request.client_order_id),
+                format!("cancel_order: order already terminal status={:?}", order.status),
+            );
+            return;
+        }
+
+        let Some(trade) = order.request.as_trade() else {
+            warn!(
+                "ExecutionService: cancel_order order_id={} client_order_id={} is not a trade order",
+                order.order_id, request.client_order_id
+            );
+            return;
+        };
+
+        let adapter = match self.adapters.get(&trade.venue) {
+            Some(a) => a,
+            None => {
+                let reason = format!("no adapter registered for venue {}", trade.venue);
+                error!("ExecutionService: cancel_order order_id={} {reason}", order.order_id);
+                self.publish_rejected(&request.strategy_id, order.order_id, Some(request.client_order_id), reason);
+                return;
+            }
+        };
+
+        info!(
+            "ExecutionService: order_id={} cancel_order venue={} symbol={} exchange_order_id={exchange_order_id}",
+            order.order_id, adapter.venue(), trade.symbol
+        );
+
+        // 撤单请求本身成功/失败只代表"指令被接受"，不代表最终状态确认——
+        // 真正的终态由交易所私有 WS 推送 → OrderManager::handle_exchange_update
+        // 落地，这里不主动发布 OrderEvent::Cancelled，避免和 WS 权威来源冲突。
+        if let Err(err) = adapter.cancel(&trade.symbol, &exchange_order_id).await {
+            let reason = format!("cancel_order exchange error: {err:#}");
+            error!("ExecutionService: order_id={} {reason}", order.order_id);
+            self.publish_rejected(&request.strategy_id, order.order_id, Some(request.client_order_id), reason);
+        }
     }
 
     async fn handle_order_request(&self, request: AnyOrderRequest) {

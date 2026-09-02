@@ -24,8 +24,14 @@ pub struct VenueConfig {
     pub name: String,
     #[serde(default)]
     pub taker_fee_bps: Decimal,
+    /// 挂单(maker)手续费率，默认不配置(None 时按 `taker_fee_bps` 保守回退,
+    /// 见 `FeeSchedule::new`)。目前仅 `CrossExchangeStrategy` 的 Kraken 挂单
+    /// 判断会用到，其余用途一律按 taker 计算。
+    #[serde(default)]
+    pub maker_fee_bps: Option<Decimal>,
     /// 行情数据源实现: "mock"(默认,随机游走假行情) | "binance_spot"(币安现货真实行情)
-    /// | "kraken_spot"(Kraken 现货真实行情) | "coinex_spot"(CoinEx 现货真实行情)。
+    /// | "kraken_spot"(Kraken 现货真实行情) | "coinex_spot"(CoinEx 现货真实行情)
+    /// | "gate_spot"(Gate.io 现货真实行情)。
     #[serde(default = "default_source")]
     pub source: String,
     /// 仅当 source = "binance_spot" 时生效,是否连接币安测试网。

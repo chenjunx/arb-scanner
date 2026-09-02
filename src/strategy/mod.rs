@@ -8,21 +8,33 @@ use rust_decimal::Decimal;
 
 use crate::market_data::now_ms;
 use crate::order::types::{OrderAmount, OrderSide};
-use crate::order_manager::types::{AnyOrderRequest, OrderEvent, OrderKind, OrderRequest, TransferRequest};
+use crate::order_manager::types::{
+    AnyOrderRequest, CancelRequest, OrderEvent, OrderKind, OrderRequest, TransferRequest,
+};
 use crate::topic::{Topic, TopicBus};
 use crate::types::{Quote, Symbol, Venue};
 
-/// 某个 venue 的手续费配置，用于在计算套利收益时扣除成本。
+/// 某个 venue 的手续费配置，用于在计算套利收益时扣除成本。`maker_bps` 默认
+/// 等于 `taker_bps`（未显式配置更优的挂单费率时，不擅自假设成本更低）。
 #[derive(Debug, Clone, Copy)]
 pub struct FeeSchedule {
     pub taker_bps: Decimal,
+    pub maker_bps: Decimal,
 }
 
 impl FeeSchedule {
     pub fn new(taker_bps: impl Into<Decimal>) -> Self {
+        let taker_bps = taker_bps.into();
         Self {
-            taker_bps: taker_bps.into(),
+            taker_bps,
+            maker_bps: taker_bps,
         }
+    }
+
+    /// 覆盖 maker 费率（挂单成交时实际适用的费率，通常低于 taker）。
+    pub fn with_maker_bps(mut self, maker_bps: impl Into<Decimal>) -> Self {
+        self.maker_bps = maker_bps.into();
+        self
     }
 
     /// 买入时实际付出的价格 = ask * buy_multiplier（手续费推高实际成本）。
@@ -33,6 +45,16 @@ impl FeeSchedule {
     /// 卖出时实际收到的价格 = bid * sell_multiplier（手续费压低实际收益）。
     pub fn sell_multiplier(&self) -> Decimal {
         Decimal::ONE - self.taker_bps / Decimal::from(10_000)
+    }
+
+    /// 挂单(maker)买入时实际付出的价格 = ask * maker_buy_multiplier。
+    pub fn maker_buy_multiplier(&self) -> Decimal {
+        Decimal::ONE + self.maker_bps / Decimal::from(10_000)
+    }
+
+    /// 挂单(maker)卖出时实际收到的价格 = bid * maker_sell_multiplier。
+    pub fn maker_sell_multiplier(&self) -> Decimal {
+        Decimal::ONE - self.maker_bps / Decimal::from(10_000)
     }
 }
 
@@ -139,6 +161,55 @@ pub trait Strategy: Send + Sync {
             order_id: None,
         };
         self.bus().publish(Topic::order_submit(), AnyOrderRequest::Trade(request));
+    }
+
+    /// 提交 GTC 限价单到风控层：与 `submit_limit_ioc_order` 相同的字段/发布
+    /// 逻辑，只是 `order_kind` 换成 `Limit`（挂单直到主动撤单或完全成交）。
+    fn submit_limit_order(
+        &self,
+        venue: Venue,
+        symbol: Symbol,
+        side: OrderSide,
+        quantity: Decimal,
+        price: Decimal,
+        client_order_id: Option<String>,
+        group_id: Option<String>,
+        metadata: Option<String>,
+    ) {
+        let client_order_id = client_order_id.unwrap_or_else(|| self.generate_client_order_id());
+        let request = OrderRequest {
+            strategy_id: self.name().to_string(),
+            venue,
+            symbol,
+            side,
+            amount: OrderAmount::Base(quantity),
+            order_kind: OrderKind::Limit { price },
+            client_order_id: Some(client_order_id),
+            group_id,
+            metadata,
+            order_id: None,
+        };
+        self.bus().publish(Topic::order_submit(), AnyOrderRequest::Trade(request));
+    }
+
+    /// 撤销一笔已提交的订单（通常是 `submit_limit_order` 挂出的 GTC 单）。
+    /// 发布 `CancelRequest` 到 `Topic::order_cancel()`，真正的撤单执行和终态
+    /// 确认由 `ExecutionService`/`OrderManager` 完成，策略只管发起请求。
+    fn cancel_order(
+        &self,
+        venue: Venue,
+        client_order_id: String,
+        group_id: Option<String>,
+        metadata: Option<String>,
+    ) {
+        let request = CancelRequest {
+            strategy_id: self.name().to_string(),
+            venue,
+            client_order_id,
+            group_id,
+            metadata,
+        };
+        self.bus().publish(Topic::order_cancel(), request);
     }
 
     /// 提交划转单到风控层：在 `from_venue` 提币 `amount` 数量的 `symbol.base`，

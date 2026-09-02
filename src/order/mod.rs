@@ -1,5 +1,6 @@
 pub mod binance;
 pub mod binance_futures;
+pub mod gate;
 pub mod kraken;
 pub mod types;
 
@@ -7,7 +8,7 @@ use async_trait::async_trait;
 use rust_decimal::Decimal;
 
 use crate::types::{Symbol, Venue};
-use types::{LimitIocOrderRequest, MarketOrderRequest, OrderResult, OrderStatus};
+use types::{LimitIocOrderRequest, LimitOrderRequest, MarketOrderRequest, OrderResult, OrderStatus};
 
 /// 下单(执行层)扩展点：每个交易所实现市价单提交逻辑。这是按需调用的请求/响应
 /// 接口，和 `wallet::WalletProvider` 一样不接入 engine 主循环，供需要真实下单
@@ -77,6 +78,46 @@ pub trait OrderProvider: Send + Sync {
         self.place_limit_ioc_order_raw(&req).await
     }
 
+    /// 交易所具体的普通限价 (GTC) 单提交调用。只应由 `place_limit_order` 的
+    /// 默认实现在校验通过后调用。默认实现直接报错，约定同
+    /// `place_limit_ioc_order_raw`。
+    async fn place_limit_order_raw(&self, _req: &LimitOrderRequest) -> anyhow::Result<OrderResult> {
+        anyhow::bail!("place_limit_order not supported for venue {}", self.venue())
+    }
+
+    /// 普通限价 (GTC) 单提交统一入口：校验数量、价格均为正，精度由调用方
+    /// 负责(同 `place_market_order`)。`dry_run=true` 时校验通过后直接返回、
+    /// 不发起真实下单请求。
+    async fn place_limit_order(&self, req: LimitOrderRequest) -> anyhow::Result<OrderResult> {
+        if req.quantity <= Decimal::ZERO {
+            anyhow::bail!("order quantity must be positive, got {}", req.quantity);
+        }
+        if req.price <= Decimal::ZERO {
+            anyhow::bail!("order price must be positive, got {}", req.price);
+        }
+        if req.dry_run {
+            log::info!("limit order place dry_run passed venue={} req={:?}", self.venue(), req);
+            return Ok(OrderResult {
+                order_id: "dry-run".to_string(),
+                status: OrderStatus::New,
+                filled_qty: Decimal::ZERO,
+                avg_price: None,
+                fee: None,
+                fee_asset: None,
+            });
+        }
+        self.place_limit_order_raw(&req).await
+    }
+
+    /// 撤销一笔尚未完全成交的挂单(目前只服务于普通限价 GTC 单；限价 IOC 单
+    /// 立即成交或失效，没有可撤销的窗口)。只表示"撤单指令本身被交易所接受"，
+    /// 不携带撤单那一刻的成交状态——真正的终态(`Cancelled`/`Filled`)仍然只
+    /// 信任交易所私有 WS 的后续推送，见 `OrderManager::handle_exchange_update`。
+    /// 默认实现是报错，交易所没有实现撤单时不需要改动。
+    async fn cancel_order(&self, _symbol: &Symbol, _exchange_order_id: &str) -> anyhow::Result<()> {
+        anyhow::bail!("cancel_order not supported for venue {}", self.venue())
+    }
+
     /// 按交易所自己的订单号回查一笔订单当前的状态/成交量/均价，用于
     /// `wait_for_fill` 在私有 WS 迟迟没有推送确认时的 REST 兜底核对
     /// (见 `execution::wait_for_fill`)——只在这一条防御路径上使用，正常
@@ -113,6 +154,8 @@ mod tests {
     struct FakeProvider {
         raw_calls: Arc<AtomicUsize>,
         limit_raw_calls: Arc<AtomicUsize>,
+        limit_gtc_raw_calls: Arc<AtomicUsize>,
+        cancel_calls: Arc<AtomicUsize>,
         supports_quote: bool,
     }
 
@@ -163,6 +206,23 @@ mod tests {
                 fee_asset: None,
             })
         }
+
+        async fn place_limit_order_raw(&self, req: &LimitOrderRequest) -> anyhow::Result<OrderResult> {
+            self.limit_gtc_raw_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(OrderResult {
+                order_id: format!("real-limit-gtc-{}", req.symbol),
+                status: OrderStatus::New,
+                filled_qty: Decimal::ZERO,
+                avg_price: None,
+                fee: None,
+                fee_asset: None,
+            })
+        }
+
+        async fn cancel_order(&self, _symbol: &Symbol, _exchange_order_id: &str) -> anyhow::Result<()> {
+            self.cancel_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
     }
 
     fn request(amount: OrderAmount, dry_run: bool) -> MarketOrderRequest {
@@ -186,20 +246,37 @@ mod tests {
         }
     }
 
-    fn provider(supports_quote: bool) -> (FakeProvider, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+    fn limit_gtc_request(quantity: Decimal, price: Decimal, dry_run: bool) -> LimitOrderRequest {
+        LimitOrderRequest {
+            symbol: Symbol::new("BTC", "USDT"),
+            side: OrderSide::Buy,
+            quantity,
+            price,
+            client_order_id: None,
+            dry_run,
+        }
+    }
+
+    fn provider(
+        supports_quote: bool,
+    ) -> (FakeProvider, Arc<AtomicUsize>, Arc<AtomicUsize>, Arc<AtomicUsize>, Arc<AtomicUsize>) {
         let calls = Arc::new(AtomicUsize::new(0));
         let limit_calls = Arc::new(AtomicUsize::new(0));
+        let limit_gtc_calls = Arc::new(AtomicUsize::new(0));
+        let cancel_calls = Arc::new(AtomicUsize::new(0));
         let provider = FakeProvider {
             raw_calls: calls.clone(),
             limit_raw_calls: limit_calls.clone(),
+            limit_gtc_raw_calls: limit_gtc_calls.clone(),
+            cancel_calls: cancel_calls.clone(),
             supports_quote,
         };
-        (provider, calls, limit_calls)
+        (provider, calls, limit_calls, limit_gtc_calls, cancel_calls)
     }
 
     #[tokio::test]
     async fn rejects_non_positive_quantity() {
-        let (provider, calls, _limit_calls) = provider(false);
+        let (provider, calls, _limit_calls, _gtc_calls, _cancel_calls) = provider(false);
         let err = provider
             .place_market_order(request(OrderAmount::Base(Decimal::ZERO), false))
             .await
@@ -210,7 +287,7 @@ mod tests {
 
     #[tokio::test]
     async fn dry_run_short_circuits_before_raw_call() {
-        let (provider, calls, _limit_calls) = provider(false);
+        let (provider, calls, _limit_calls, _gtc_calls, _cancel_calls) = provider(false);
         let result = provider
             .place_market_order(request(OrderAmount::Base(Decimal::new(1, 2)), true)) // 0.01
             .await
@@ -221,7 +298,7 @@ mod tests {
 
     #[tokio::test]
     async fn valid_request_calls_place_market_order_raw_once() {
-        let (provider, calls, _limit_calls) = provider(false);
+        let (provider, calls, _limit_calls, _gtc_calls, _cancel_calls) = provider(false);
         let result = provider
             .place_market_order(request(OrderAmount::Base(Decimal::new(1, 2)), false)) // 0.01
             .await
@@ -232,7 +309,7 @@ mod tests {
 
     #[tokio::test]
     async fn quote_order_rejects_non_positive_amount() {
-        let (provider, calls, _limit_calls) = provider(true);
+        let (provider, calls, _limit_calls, _gtc_calls, _cancel_calls) = provider(true);
         let err = provider
             .place_market_order(request(OrderAmount::Quote(Decimal::ZERO), false))
             .await
@@ -243,7 +320,7 @@ mod tests {
 
     #[tokio::test]
     async fn quote_order_dry_run_short_circuits_before_raw_call() {
-        let (provider, calls, _limit_calls) = provider(true);
+        let (provider, calls, _limit_calls, _gtc_calls, _cancel_calls) = provider(true);
         let result = provider
             .place_market_order(request(OrderAmount::Quote(Decimal::new(100, 0)), true))
             .await
@@ -254,7 +331,7 @@ mod tests {
 
     #[tokio::test]
     async fn quote_order_unsupported_venue_errors() {
-        let (provider, calls, _limit_calls) = provider(false);
+        let (provider, calls, _limit_calls, _gtc_calls, _cancel_calls) = provider(false);
         let err = provider
             .place_market_order(request(OrderAmount::Quote(Decimal::new(100, 0)), false))
             .await
@@ -265,7 +342,7 @@ mod tests {
 
     #[tokio::test]
     async fn quote_order_valid_request_calls_raw_once() {
-        let (provider, calls, _limit_calls) = provider(true);
+        let (provider, calls, _limit_calls, _gtc_calls, _cancel_calls) = provider(true);
         let result = provider
             .place_market_order(request(OrderAmount::Quote(Decimal::new(100, 0)), false))
             .await
@@ -277,7 +354,7 @@ mod tests {
 
     #[tokio::test]
     async fn limit_ioc_rejects_non_positive_quantity() {
-        let (provider, _calls, limit_calls) = provider(false);
+        let (provider, _calls, limit_calls, _gtc_calls, _cancel_calls) = provider(false);
         let err = provider
             .place_limit_ioc_order(limit_request(Decimal::ZERO, Decimal::new(100, 0), false))
             .await
@@ -288,7 +365,7 @@ mod tests {
 
     #[tokio::test]
     async fn limit_ioc_rejects_non_positive_price() {
-        let (provider, _calls, limit_calls) = provider(false);
+        let (provider, _calls, limit_calls, _gtc_calls, _cancel_calls) = provider(false);
         let err = provider
             .place_limit_ioc_order(limit_request(Decimal::new(1, 2), Decimal::ZERO, false)) // 0.01
             .await
@@ -299,7 +376,7 @@ mod tests {
 
     #[tokio::test]
     async fn limit_ioc_dry_run_short_circuits_before_raw_call() {
-        let (provider, _calls, limit_calls) = provider(false);
+        let (provider, _calls, limit_calls, _gtc_calls, _cancel_calls) = provider(false);
         let result = provider
             .place_limit_ioc_order(limit_request(Decimal::new(1, 2), Decimal::new(100, 0), true)) // 0.01
             .await
@@ -310,12 +387,84 @@ mod tests {
 
     #[tokio::test]
     async fn limit_ioc_valid_request_calls_raw_once() {
-        let (provider, _calls, limit_calls) = provider(false);
+        let (provider, _calls, limit_calls, _gtc_calls, _cancel_calls) = provider(false);
         let result = provider
             .place_limit_ioc_order(limit_request(Decimal::new(1, 2), Decimal::new(100, 0), false)) // 0.01
             .await
             .unwrap();
         assert_eq!(result.order_id, "real-limit-BTC/USDT");
         assert_eq!(limit_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn limit_gtc_rejects_non_positive_quantity() {
+        let (provider, _calls, _limit_calls, gtc_calls, _cancel_calls) = provider(false);
+        let err = provider
+            .place_limit_order(limit_gtc_request(Decimal::ZERO, Decimal::new(100, 0), false))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("must be positive"));
+        assert_eq!(gtc_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn limit_gtc_rejects_non_positive_price() {
+        let (provider, _calls, _limit_calls, gtc_calls, _cancel_calls) = provider(false);
+        let err = provider
+            .place_limit_order(limit_gtc_request(Decimal::new(1, 2), Decimal::ZERO, false)) // 0.01
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("must be positive"));
+        assert_eq!(gtc_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn limit_gtc_dry_run_short_circuits_before_raw_call() {
+        let (provider, _calls, _limit_calls, gtc_calls, _cancel_calls) = provider(false);
+        let result = provider
+            .place_limit_order(limit_gtc_request(Decimal::new(1, 2), Decimal::new(100, 0), true)) // 0.01
+            .await
+            .unwrap();
+        assert_eq!(result.order_id, "dry-run");
+        assert_eq!(gtc_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn limit_gtc_valid_request_calls_raw_once() {
+        let (provider, _calls, _limit_calls, gtc_calls, _cancel_calls) = provider(false);
+        let result = provider
+            .place_limit_order(limit_gtc_request(Decimal::new(1, 2), Decimal::new(100, 0), false)) // 0.01
+            .await
+            .unwrap();
+        assert_eq!(result.order_id, "real-limit-gtc-BTC/USDT");
+        assert_eq!(gtc_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn cancel_order_default_impl_errors_for_unsupported_venue() {
+        struct NoCancelProvider;
+        #[async_trait]
+        impl OrderProvider for NoCancelProvider {
+            fn venue(&self) -> Venue {
+                Venue::new("no-cancel")
+            }
+
+            async fn place_market_order_raw(&self, _req: &MarketOrderRequest) -> anyhow::Result<OrderResult> {
+                unimplemented!()
+            }
+        }
+
+        let err = NoCancelProvider
+            .cancel_order(&Symbol::new("BTC", "USDT"), "123")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("cancel_order not supported"));
+    }
+
+    #[tokio::test]
+    async fn cancel_order_calls_provider_once() {
+        let (provider, _calls, _limit_calls, _gtc_calls, cancel_calls) = provider(false);
+        provider.cancel_order(&Symbol::new("BTC", "USDT"), "123").await.unwrap();
+        assert_eq!(cancel_calls.load(Ordering::SeqCst), 1);
     }
 }

@@ -63,6 +63,25 @@ pub struct LimitIocOrderRequest {
     pub dry_run: bool,
 }
 
+/// 普通限价单 (GTC, Good-Til-Cancelled) 请求：以指定价格挂单，一直有效直到
+/// 成交或被撤销。字段和 `LimitIocOrderRequest` 完全一致，但故意保持独立类型
+/// (不复用/改名 `LimitIocOrderRequest`)——沿用 `MarketOrderRequest`/
+/// `LimitIocOrderRequest` 各自独立成型的既有惯例，避免为了共享字段牵动 IOC
+/// 那边已有测试覆盖的类型和调用点。
+#[derive(Debug, Clone, PartialEq)]
+pub struct LimitOrderRequest {
+    pub symbol: Symbol,
+    pub side: OrderSide,
+    /// 语义同 `LimitIocOrderRequest::quantity`。
+    pub quantity: Decimal,
+    /// 语义同 `LimitIocOrderRequest::price`。
+    pub price: Decimal,
+    /// 语义同 `MarketOrderRequest::client_order_id`。
+    pub client_order_id: Option<String>,
+    /// 语义同 `MarketOrderRequest::dry_run`。
+    pub dry_run: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OrderStatus {
     New,
@@ -73,7 +92,14 @@ pub enum OrderStatus {
     /// 划转单：到账事件已通过余额变动确认
     DepositConfirmed,
     Rejected,
+    /// 未完全成交就终结、非用户撤单：目前只用于限价 IOC 单未成交部分被
+    /// 交易所自动撤销。是否走这个分支还是 `Cancelled` 由
+    /// `OrderManager::handle_exchange_update` 依据原始 `OrderKind` 判定，
+    /// 见该函数注释。
     Expired,
+    /// 用户主动撤单（或交易所因故强制撤销一笔非 IOC 单）后的终态，
+    /// 与 `Expired`（IOC 自动失效）语义上刻意区分开。
+    Cancelled,
 }
 
 #[derive(Debug, Clone, PartialEq)]

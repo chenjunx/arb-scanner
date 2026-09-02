@@ -24,6 +24,16 @@ pub trait OrderStore: Send + Sync {
     fn get(&self, order_id: &OrderId) -> Option<Order>;
     fn upsert(&self, order: Order);
     fn update(&self, order_id: &OrderId, f: Box<dyn FnOnce(&mut Order) -> bool + Send + '_>) -> OrderUpdateOutcome;
+
+    /// 按 `client_order_id` 查找订单。用于撤单请求（策略只知道自己生成的
+    /// `client_order_id`，需要反查出 venue/symbol/exchange_order_id）。
+    /// 默认实现基于 `all()` 线性查找，`InMemoryOrderStore`/`RedisOrderStore`
+    /// 都不需要单独实现或加索引。
+    fn find_by_client_order_id(&self, client_order_id: &str) -> Option<Order> {
+        self.all()
+            .into_iter()
+            .find(|order| order.request.client_order_id() == Some(client_order_id))
+    }
 }
 
 /// 纯内存实现，重启即丢。

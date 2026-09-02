@@ -30,6 +30,8 @@ impl std::fmt::Display for OrderId {
 pub enum OrderKind {
     Market,
     LimitIoc { price: Decimal },
+    /// GTC (Good-Til-Cancelled) 限价单，需要主动撤单才会终止。
+    Limit { price: Decimal },
 }
 
 impl Default for OrderKind {
@@ -79,6 +81,19 @@ pub struct TransferRequest {
     pub group_id: Option<String>,
     pub metadata: Option<String>,
     pub order_id: Option<OrderId>,
+}
+
+/// 策略主动撤单请求。撤单是针对一个已存在订单的动作，语义上和"分配一个新
+/// OrderId 提交订单"不同，因此不并入 `AnyOrderRequest`，走独立的
+/// `Topic::order_cancel()` 通道。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CancelRequest {
+    #[serde(default)]
+    pub strategy_id: String,
+    pub venue: Venue,
+    pub client_order_id: String,
+    pub group_id: Option<String>,
+    pub metadata: Option<String>,
 }
 
 /// 统一的订单提交类型，走同一条总线管道。
@@ -230,6 +245,15 @@ pub enum OrderEvent {
         asset: String,
         actual_delta: Decimal,
     },
+    /// GTC 限价单被撤销（用户主动撤单或交易所强制撤单），区别于 IOC 单未
+    /// 完全成交时的 `Filled`/自动失效（那种情况不发这个事件，见 OrderKind
+    /// 判定逻辑：manager.rs 的 handle_exchange_update）。
+    Cancelled {
+        order_id: OrderId,
+        client_order_id: Option<String>,
+        filled_qty: Decimal,
+        avg_price: Decimal,
+    },
 }
 
 impl OrderEvent {
@@ -242,7 +266,8 @@ impl OrderEvent {
             | Self::PartiallyFilled { order_id, .. }
             | Self::Filled { order_id, .. }
             | Self::Transferred { order_id, .. }
-            | Self::TransferConfirmed { order_id, .. } => order_id,
+            | Self::TransferConfirmed { order_id, .. }
+            | Self::Cancelled { order_id, .. } => order_id,
         }
     }
 
@@ -255,7 +280,8 @@ impl OrderEvent {
             | Self::PartiallyFilled { client_order_id, .. }
             | Self::Filled { client_order_id, .. }
             | Self::Transferred { client_order_id, .. }
-            | Self::TransferConfirmed { client_order_id, .. } => client_order_id.as_deref(),
+            | Self::TransferConfirmed { client_order_id, .. }
+            | Self::Cancelled { client_order_id, .. } => client_order_id.as_deref(),
         }
     }
 }

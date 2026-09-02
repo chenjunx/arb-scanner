@@ -3,7 +3,7 @@
 # 当前 binance/kraken 两个 venue 均接入真实行情(bookTicker / ticker WebSocket)。
 # 如需临时用随机游走假行情跑通链路,把某个 venue 的 source 改回 "mock" 即可。
 
-min_profit_bps = "5"    # 低于该收益(基点)的机会不会被报告
+min_profit_bps = "10"   # 低于该收益(基点)的机会不会被报告；cross_exchange 现在挂单/撤单也用这同一个阈值
 tick_interval_ms = 500  # mock 数据源的行情推送间隔
 
 # 出网代理不在这里配置,而是读环境变量 ARB_SCANNER_PROXY(格式 "host:port",
@@ -20,6 +20,7 @@ fee_discount = "0.75"     # monitor 子命令按 taker 费率打 7.5 折(如 BNB
 [[venues]]
 name = "kraken"
 taker_fee_bps = "16"    # 0.16%
+maker_fee_bps = "16"    # TODO: 按 Kraken 账户实际 maker 费率档位核实后修改，这里先占位等于 taker
 source = "kraken_spot"  # 接 Kraken 现货真实行情(ticker WebSocket v2)
 
 # symbols 用于:

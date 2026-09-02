@@ -33,13 +33,14 @@ impl ReportSection for OrderSection {
 
         let count = |status: OrderStatus| orders.iter().filter(|o| o.status == status).count();
         let summary = format!(
-            "共 {} 笔订单: New={} PartiallyFilled={} Filled={} Rejected={} Expired={}",
+            "共 {} 笔订单: New={} PartiallyFilled={} Filled={} Rejected={} Expired={} Cancelled={}",
             orders.len(),
             count(OrderStatus::New),
             count(OrderStatus::PartiallyFilled),
             count(OrderStatus::Filled),
             count(OrderStatus::Rejected),
             count(OrderStatus::Expired),
+            count(OrderStatus::Cancelled),
         );
 
         let mut open_orders: Vec<_> = orders

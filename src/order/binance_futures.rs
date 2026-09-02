@@ -22,7 +22,7 @@ use crate::order_manager::OrderManager;
 use crate::types::{Symbol, Venue};
 
 use super::OrderProvider;
-use super::types::{LimitIocOrderRequest, MarketOrderRequest, OrderAmount, OrderResult, OrderSide, OrderStatus};
+use super::types::{LimitIocOrderRequest, LimitOrderRequest, MarketOrderRequest, OrderAmount, OrderResult, OrderSide, OrderStatus};
 
 const MAINNET_HOST: &str = "https://fapi.binance.com";
 const TESTNET_HOST: &str = "https://testnet.binancefuture.com";
@@ -174,6 +174,40 @@ impl OrderProvider for BinanceFuturesOrderProvider {
         }
         let text = self.signed_request(reqwest::Method::POST, "/fapi/v1/order", params).await?;
         parse_order_response(&text)
+    }
+
+    async fn place_limit_order_raw(&self, req: &LimitOrderRequest) -> anyhow::Result<OrderResult> {
+        let mut params = vec![
+            ("symbol".to_string(), binance_symbol(&req.symbol)),
+            ("side".to_string(), map_side(req.side).to_string()),
+            ("type".to_string(), "LIMIT".to_string()),
+            ("timeInForce".to_string(), "GTC".to_string()),
+            ("quantity".to_string(), req.quantity.to_string()),
+            ("price".to_string(), req.price.to_string()),
+            // 默认 LIMIT 单只同步返回 ACK(无成交信息)，和市价单一样必须显式
+            // 要求 RESULT 才能在下单响应里同步拿到 avgPrice/executedQty。
+            ("newOrderRespType".to_string(), "RESULT".to_string()),
+        ];
+        if let Some(client_order_id) = &req.client_order_id {
+            params.push(("newClientOrderId".to_string(), client_order_id.clone()));
+        }
+        let text = self.signed_request(reqwest::Method::POST, "/fapi/v1/order", params).await?;
+        parse_order_response(&text)
+    }
+
+    /// `DELETE /fapi/v1/order` 按 orderId 撤销，响应体解析方式和现货一致：
+    /// 先按 `ErrorResponse` 尝试解析，能解析出来就是撤单失败，否则视为撤单
+    /// 指令被接受，真正的终态仍然只信任 User Data Stream 推送。
+    async fn cancel_order(&self, symbol: &Symbol, exchange_order_id: &str) -> anyhow::Result<()> {
+        let params = vec![
+            ("symbol".to_string(), binance_symbol(symbol)),
+            ("orderId".to_string(), exchange_order_id.to_string()),
+        ];
+        let text = self.signed_request(reqwest::Method::DELETE, "/fapi/v1/order", params).await?;
+        if let Ok(err) = serde_json::from_str::<ErrorResponse>(&text) {
+            anyhow::bail!("binance futures error {}: {}", err.code, err.msg);
+        }
+        Ok(())
     }
 
     /// `GET /fapi/v1/order` 按 orderId 查询，响应字段(orderId/status/

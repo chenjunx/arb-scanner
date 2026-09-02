@@ -23,7 +23,7 @@ use crate::order_manager::stream::{ExchangeOrderUpdate, OrderStreamSource};
 use crate::types::{Symbol, Venue};
 
 use super::OrderProvider;
-use super::types::{LimitIocOrderRequest, MarketOrderRequest, OrderAmount, OrderResult, OrderSide, OrderStatus};
+use super::types::{LimitIocOrderRequest, LimitOrderRequest, MarketOrderRequest, OrderAmount, OrderResult, OrderSide, OrderStatus};
 
 const HOST: &str = "https://api.kraken.com";
 /// `pub(crate)`：`accounting::kraken::KrakenBalanceStream` 复用同一个私有 WS 端点。
@@ -117,6 +117,25 @@ impl OrderProvider for KrakenOrderProvider {
         );
         let result = self.ws.add_order(params).await?;
         Ok(order_result_from_ws(result))
+    }
+
+    async fn place_limit_order_raw(&self, req: &LimitOrderRequest) -> anyhow::Result<OrderResult> {
+        let params = build_limit_add_order_params(
+            &Self::kraken_pair(&req.symbol),
+            req.side,
+            req.quantity,
+            req.price,
+            req.client_order_id.as_deref(),
+        );
+        let result = self.ws.add_order(params).await?;
+        Ok(order_result_from_ws(result))
+    }
+
+    /// 撤单走同一条已鉴权的共享 WS 连接的 `cancel_order` 方法，见
+    /// `KrakenPrivateWs::cancel_order`。`symbol` 参数用不到(Kraken `cancel_order`
+    /// 只需要 order_id)，但保留和 `OrderProvider::cancel_order` 签名一致。
+    async fn cancel_order(&self, _symbol: &Symbol, exchange_order_id: &str) -> anyhow::Result<()> {
+        self.ws.cancel_order(exchange_order_id).await
     }
 
     /// `GET /0/public/Ticker?pair={ASSET}USD`(查 USD 不是 USDT：Kraken 山寨币
@@ -302,6 +321,28 @@ fn build_limit_ioc_add_order_params(
     params
 }
 
+/// 组装 WS v2 `add_order` 普通限价单(GTC)参数，同样不含 `token`。GTC 是
+/// Kraken `add_order` 的默认行为，不用像 IOC 那样显式传 `time_in_force`。
+fn build_limit_add_order_params(
+    pair: &str,
+    side: OrderSide,
+    quantity: Decimal,
+    price: Decimal,
+    client_order_id: Option<&str>,
+) -> serde_json::Value {
+    let mut params = serde_json::json!({
+        "order_type": "limit",
+        "side": map_side(side),
+        "order_qty": decimal_to_json_number(quantity),
+        "limit_price": decimal_to_json_number(price),
+        "symbol": pair,
+    });
+    if let Some(client_order_id) = client_order_id {
+        params["cl_ord_id"] = serde_json::Value::String(client_order_id.to_string());
+    }
+    params
+}
+
 #[derive(Debug)]
 pub struct AddOrderWsResult {
     pub(crate) order_id: String,
@@ -340,6 +381,43 @@ fn parse_add_order_ws_response(text: &str) -> Option<(u64, anyhow::Result<AddOrd
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct CancelOrderWsResponse {
+    #[serde(default)]
+    req_id: Option<u64>,
+    #[serde(default)]
+    success: bool,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+/// 解析一条 `cancel_order` 响应消息，结构和 `add_order` 响应高度相似(同样带
+/// `req_id`/`success`/`error`)，但 `cancel_order` 的调用方只关心撤单指令是否
+/// 被接受，不需要 `result` 里的 order_id，因此不复用 `AddOrderWsResponse`。
+fn parse_cancel_order_ws_response(text: &str) -> Option<(u64, anyhow::Result<()>)> {
+    let resp: CancelOrderWsResponse = serde_json::from_str(text).ok()?;
+    let req_id = resp.req_id?;
+    if resp.success {
+        Some((req_id, Ok(())))
+    } else {
+        let err = resp.error.unwrap_or_else(|| "unknown kraken cancel_order error".to_string());
+        Some((req_id, Err(anyhow::anyhow!("kraken cancel_order error: {err}"))))
+    }
+}
+
+/// 只探测 `method` 字段，用于在读循环里区分同样带 `req_id` 的 `add_order`
+/// 响应和 `cancel_order` 响应——二者 JSON 形状高度相似(`result` 都只有一个
+/// `order_id`)，光靠字段能不能解析出来没法可靠区分，必须先看 `method`。
+#[derive(Debug, Deserialize)]
+struct WsMethodEnvelope {
+    #[serde(default)]
+    method: Option<String>,
+}
+
+fn parse_ws_method(text: &str) -> Option<String> {
+    serde_json::from_str::<WsMethodEnvelope>(text).ok()?.method
+}
+
 /// 下单与 `executions` 推送共用的私有 WS 长连接。连接建立后立刻订阅
 /// `executions` channel，让 token 在整个会话期间保活（Kraken 规则：token
 /// 有 15 分钟有效期，但只要有活跃的 private subscription 就不会过期）。
@@ -355,6 +433,10 @@ pub struct KrakenPrivateWs {
     next_req_id: AtomicU64,
     active: Arc<Mutex<Option<ActiveConnection>>>,
     pending: Arc<DashMap<u64, oneshot::Sender<anyhow::Result<AddOrderWsResult>>>>,
+    /// `cancel_order` 的响应路由表，和 `pending` 分开是因为响应结果类型不同
+    /// (`()` vs `AddOrderWsResult`)，二者用同一个 `next_req_id` 计数器分配
+    /// req_id，因此不会冲突。
+    pending_cancel: Arc<DashMap<u64, oneshot::Sender<anyhow::Result<()>>>>,
     /// spawn() 设置，连接建立后 execution 推送发往此处；未设置时静默丢弃。
     execution_tx: Arc<Mutex<Option<mpsc::UnboundedSender<Vec<ExchangeOrderUpdate>>>>>,
     /// 后台任务在首次建连时发 `true`，断线时发 `false`。
@@ -371,6 +453,7 @@ impl KrakenPrivateWs {
         let http = build_http_client(proxy)?;
         let active = Arc::new(Mutex::new(None));
         let pending = Arc::new(DashMap::new());
+        let pending_cancel = Arc::new(DashMap::new());
         let execution_tx = Arc::new(Mutex::new(None));
         let (connected_tx, connected_rx) = watch::channel(false);
         tokio::spawn(run_kraken_shared_ws(
@@ -381,10 +464,11 @@ impl KrakenPrivateWs {
             proxy.map(str::to_string),
             active.clone(),
             pending.clone(),
+            pending_cancel.clone(),
             execution_tx.clone(),
             connected_tx,
         ));
-        Ok(Self { venue, next_req_id: AtomicU64::new(1), active, pending, execution_tx, connected: connected_rx })
+        Ok(Self { venue, next_req_id: AtomicU64::new(1), active, pending, pending_cancel, execution_tx, connected: connected_rx })
     }
 
     /// 提交一次下单请求并等待响应。未连接或发送失败都快速返回错误，不排队。
@@ -413,6 +497,38 @@ impl KrakenPrivateWs {
             Err(_) => anyhow::bail!("kraken order ws for venue={} response channel closed", self.venue),
         }
     }
+
+    /// 提交一次撤单请求并等待响应，复用同一条已鉴权的共享 WS 连接，和
+    /// `add_order` 走同一个 `next_req_id` 计数器，响应路由到独立的
+    /// `pending_cancel`。未连接或发送失败都快速返回错误，不排队。
+    pub async fn cancel_order(&self, exchange_order_id: &str) -> anyhow::Result<()> {
+        let (sender, token) = {
+            let guard = self.active.lock().unwrap();
+            let conn = guard
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("kraken order ws for venue={} not connected", self.venue))?;
+            (conn.sender.clone(), conn.token.clone())
+        };
+
+        let req_id = self.next_req_id.fetch_add(1, Ordering::SeqCst);
+        let (tx, rx) = oneshot::channel();
+        self.pending_cancel.insert(req_id, tx);
+
+        let request = serde_json::json!({
+            "method": "cancel_order",
+            "params": {"order_id": [exchange_order_id], "token": token},
+            "req_id": req_id,
+        });
+        if sender.send(Message::Text(request.to_string())).is_err() {
+            self.pending_cancel.remove(&req_id);
+            anyhow::bail!("kraken order ws for venue={} connection just closed", self.venue);
+        }
+
+        match rx.await {
+            Ok(result) => result,
+            Err(_) => anyhow::bail!("kraken order ws for venue={} response channel closed", self.venue),
+        }
+    }
 }
 
 /// 后台连接循环：连接建立后订阅 `executions`，同时处理 `add_order` 的发送和
@@ -426,6 +542,7 @@ async fn run_kraken_shared_ws(
     proxy: Option<String>,
     active: Arc<Mutex<Option<ActiveConnection>>>,
     pending: Arc<DashMap<u64, oneshot::Sender<anyhow::Result<AddOrderWsResult>>>>,
+    pending_cancel: Arc<DashMap<u64, oneshot::Sender<anyhow::Result<()>>>>,
     execution_tx: Arc<Mutex<Option<mpsc::UnboundedSender<Vec<ExchangeOrderUpdate>>>>>,
     connected_tx: watch::Sender<bool>,
 ) {
@@ -523,6 +640,18 @@ async fn run_kraken_shared_ws(
                     };
                     let Message::Text(text) = msg else { continue };
 
+                    // cancel_order 和 add_order 的响应 JSON 形状高度相似(都带
+                    // req_id/success/error，result 都只有一个 order_id)，必须先
+                    // 看 method 字段区分，才能路由到正确的 pending map。
+                    if parse_ws_method(&text).as_deref() == Some("cancel_order") {
+                        if let Some((req_id, result)) = parse_cancel_order_ws_response(&text) {
+                            if let Some((_, tx)) = pending_cancel.remove(&req_id) {
+                                let _ = tx.send(result);
+                            }
+                        }
+                        continue;
+                    }
+
                     // add_order 响应带 req_id；executions 推送带 channel 字段
                     if let Some((req_id, result)) = parse_add_order_ws_response(&text) {
                         let is_session_err = result.as_ref()
@@ -553,6 +682,12 @@ async fn run_kraken_shared_ws(
         let stale_req_ids: Vec<u64> = pending.iter().map(|entry| *entry.key()).collect();
         for req_id in stale_req_ids {
             if let Some((_, tx)) = pending.remove(&req_id) {
+                let _ = tx.send(Err(anyhow::anyhow!("kraken shared ws for venue={venue} disconnected, reconnecting")));
+            }
+        }
+        let stale_cancel_req_ids: Vec<u64> = pending_cancel.iter().map(|entry| *entry.key()).collect();
+        for req_id in stale_cancel_req_ids {
+            if let Some((_, tx)) = pending_cancel.remove(&req_id) {
                 let _ = tx.send(Err(anyhow::anyhow!("kraken shared ws for venue={venue} disconnected, reconnecting")));
             }
         }
@@ -842,6 +977,56 @@ mod tests {
         assert_eq!(params["limit_price"], 30000.0);
         assert_eq!(params["time_in_force"], "ioc");
         assert!(params.get("cl_ord_id").is_none());
+    }
+
+    #[test]
+    fn builds_limit_add_order_params_without_tif_defaults_to_gtc() {
+        let params = build_limit_add_order_params(
+            "BTC/USD",
+            OrderSide::Buy,
+            "0.2".parse().unwrap(),
+            "30000".parse().unwrap(),
+            Some("cid-gtc"),
+        );
+        assert_eq!(params["order_type"], "limit");
+        assert_eq!(params["side"], "buy");
+        assert!(params["order_qty"].is_number(), "order_qty must be a JSON number, got {:?}", params["order_qty"]);
+        assert_eq!(params["order_qty"], 0.2);
+        assert!(params["limit_price"].is_number(), "limit_price must be a JSON number, got {:?}", params["limit_price"]);
+        assert_eq!(params["limit_price"], 30000.0);
+        assert_eq!(params["cl_ord_id"], "cid-gtc");
+        // GTC 是 Kraken add_order 的默认行为，不显式传 time_in_force
+        assert!(params.get("time_in_force").is_none());
+    }
+
+    #[test]
+    fn parses_successful_cancel_order_ws_response() {
+        let text = r#"{"method":"cancel_order","req_id":9,"success":true,"result":{"order_id":"OQCLML-BW3P3-BUCMWZ"}}"#;
+        let (req_id, result) = parse_cancel_order_ws_response(text).expect("should parse");
+        assert_eq!(req_id, 9);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn parses_failed_cancel_order_ws_response() {
+        let text = r#"{"method":"cancel_order","req_id":10,"success":false,"error":"Unknown order"}"#;
+        let (req_id, result) = parse_cancel_order_ws_response(text).expect("should parse");
+        assert_eq!(req_id, 10);
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("Unknown order"));
+    }
+
+    #[test]
+    fn parse_ws_method_distinguishes_add_order_from_cancel_order() {
+        assert_eq!(
+            parse_ws_method(r#"{"method":"add_order","req_id":1,"success":true}"#).as_deref(),
+            Some("add_order")
+        );
+        assert_eq!(
+            parse_ws_method(r#"{"method":"cancel_order","req_id":1,"success":true}"#).as_deref(),
+            Some("cancel_order")
+        );
+        assert!(parse_ws_method(r#"{"channel":"executions"}"#).is_none());
     }
 
     #[test]
