@@ -25,7 +25,7 @@ pub struct VenueConfig {
     #[serde(default)]
     pub taker_fee_bps: Decimal,
     /// 行情数据源实现: "mock"(默认,随机游走假行情) | "binance_spot"(币安现货真实行情)
-    /// | "kraken_spot"(Kraken 现货真实行情)。
+    /// | "kraken_spot"(Kraken 现货真实行情) | "coinex_spot"(CoinEx 现货真实行情)。
     #[serde(default = "default_source")]
     pub source: String,
     /// 仅当 source = "binance_spot" 时生效,是否连接币安测试网。

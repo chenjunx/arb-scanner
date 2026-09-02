@@ -23,6 +23,7 @@ use arb_scanner::market_data::MarketDataSource;
 use arb_scanner::market_data::binance::BinanceSpotSource;
 use arb_scanner::market_data::binance_futures::BinanceFuturesSource;
 use arb_scanner::market_data::cache::MarketDataCache;
+use arb_scanner::market_data::coinex::CoinexSpotSource;
 use arb_scanner::market_data::kraken::KrakenSpotSource;
 use arb_scanner::market_data::link_health::LinkHealthMonitor;
 use arb_scanner::market_data::mock::{MockSource, MockSymbolConfig};
@@ -151,6 +152,10 @@ async fn main() -> anyhow::Result<()> {
             "kraken_spot" => {
                 info!("starting kraken spot market data source for venue={venue}");
                 Box::new(KrakenSpotSource::new(venue.clone(), symbols.clone(), proxy.clone()))
+            }
+            "coinex_spot" => {
+                info!("starting coinex spot market data source for venue={venue}");
+                Box::new(CoinexSpotSource::new(venue.clone(), symbols.clone(), proxy.clone()))
             }
             _ => {
                 info!("starting mock market data source for venue={venue}");
