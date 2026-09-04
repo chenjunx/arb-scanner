@@ -1,4 +1,5 @@
 pub mod binance;
+pub mod coinex;
 pub mod kraken;
 pub mod transfer;
 pub mod transfer_monitor;

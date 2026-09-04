@@ -16,6 +16,7 @@ use arb_scanner::engine::ArbitrageEngine;
 use arb_scanner::exchange_info::ExchangeInfoProvider;
 use arb_scanner::exchange_info::PrecisionCache;
 use arb_scanner::exchange_info::binance::BinanceExchangeInfoProvider;
+use arb_scanner::exchange_info::coinex::CoinexExchangeInfoProvider;
 use arb_scanner::exchange_info::kraken::KrakenExchangeInfoProvider;
 use arb_scanner::exchange_info::types::{PrecisionKind, TradingFee};
 use arb_scanner::logging;
@@ -60,6 +61,7 @@ use arb_scanner::topic::{Topic, TopicBus};
 use arb_scanner::types::{Quote, Symbol, Venue};
 use arb_scanner::wallet::WalletProvider;
 use arb_scanner::wallet::binance::BinanceWalletProvider;
+use arb_scanner::wallet::coinex::CoinexWalletProvider;
 use arb_scanner::wallet::kraken::KrakenWalletProvider;
 use arb_scanner::wallet::transfer::{TransferHalfParams, TransferParams, transfer_asset, transfer_half_to_kraken};
 use arb_scanner::wallet::transfer_monitor::TransferMonitor;
@@ -1548,12 +1550,14 @@ async fn run_close_command(args: &[String]) -> anyhow::Result<()> {
 }
 
 /// 把 `--secondary <name>` 映射到对应的 `ExchangeInfoProvider`，供 `scan`/
-/// `monitor` 子命令选择"副交易所"。目前只有 Kraken 有完整实现——接入新交易所
-/// 只需要在这里和 [`build_secondary_wallet_provider`] 加一个分支。
+/// `monitor` 子命令选择"副交易所"。Kraken 有完整实现（含下单）；CoinEx 目前
+/// 只按 `scan` 需要的接口实现（无下单支持）——接入新交易所只需要在这里和
+/// [`build_secondary_wallet_provider`] 加一个分支。
 fn build_secondary_exchange_info(name: &str, proxy: Option<&str>) -> anyhow::Result<Box<dyn ExchangeInfoProvider>> {
     match name {
         "kraken" => Ok(Box::new(KrakenExchangeInfoProvider::from_env(Venue::new(name), proxy)?)),
-        other => anyhow::bail!("unknown --secondary venue '{other}', only 'kraken' is currently supported"),
+        "coinex" => Ok(Box::new(CoinexExchangeInfoProvider::from_env(Venue::new(name), proxy)?)),
+        other => anyhow::bail!("unknown --secondary venue '{other}', only 'kraken'/'coinex' are currently supported"),
     }
 }
 
@@ -1562,7 +1566,8 @@ fn build_secondary_exchange_info(name: &str, proxy: Option<&str>) -> anyhow::Res
 fn build_secondary_wallet_provider(name: &str, proxy: Option<&str>) -> anyhow::Result<Box<dyn WalletProvider>> {
     match name {
         "kraken" => Ok(Box::new(KrakenWalletProvider::from_env(Venue::new(name), proxy)?)),
-        other => anyhow::bail!("unknown --secondary venue '{other}', only 'kraken' is currently supported"),
+        "coinex" => Ok(Box::new(CoinexWalletProvider::from_env(Venue::new(name), proxy)?)),
+        other => anyhow::bail!("unknown --secondary venue '{other}', only 'kraken'/'coinex' are currently supported"),
     }
 }
 

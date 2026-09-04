@@ -1,5 +1,6 @@
 pub mod binance;
 pub mod cache;
+pub mod coinex;
 pub mod gate;
 pub mod kraken;
 pub mod types;
