@@ -18,13 +18,15 @@ fn hex_encode(bytes: &[u8]) -> String {
 }
 
 /// Nonkyc 原生链后缀(资产 `ticker` 里 "-" 之后的部分,如 `USDT-BEP20` 里的
-/// `"BEP20"`) -> 标准链名(与币安 `network` 代码对齐,详见
-/// [`super::types::ChainInfo::network`])的精确映射表。目前是空的:虽然
-/// `-BEP20`/`-ERC20`/`-TRC20` 这些后缀看着眼熟,但对应到币安自己的 `network`
-/// 代码字符串没有用真实币安账户核对过,写错一个就可能把资金转去错误的网络——
-/// 和 `wallet::coinex::COINEX_CHAIN_TO_STANDARD` 同样的规则,没有真实响应核对
-/// 过的条目不能凭猜测入表。不在表里的后缀原样透传(转大写)。
-const NONKYC_CHAIN_TO_STANDARD: &[(&str, &str)] = &[];
+/// `"BEP20"`;或独立 ticker 本身,如 Solana 原生代币 `"JTO"`) -> 标准链名
+/// (与币安 `network` 代码对齐,详见 [`super::types::ChainInfo::network`])的
+/// 精确映射表。不在表里的后缀原样透传(转大写)。
+const NONKYC_CHAIN_TO_STANDARD: &[(&str, &str)] = &[
+    ("BEP20", "BSC"),
+    ("ERC20", "ETH"),
+    ("JTO",   "SOL"),
+    ("TRUMP", "SOL"),
+];
 
 /// `entry_ticker` 是某个 network 条目自己的 ticker(如 `"USDT-BEP20"`,或者
 /// 父资产条目本身不带后缀的 `"USDT"`);`parent_ticker` 是资产本身的 ticker,
@@ -308,8 +310,11 @@ mod tests {
 
     #[test]
     fn chain_to_standard_strips_parent_prefix_and_uppercases() {
-        assert_eq!(chain_to_standard("USDT-BEP20", "USDT"), "BEP20");
+        assert_eq!(chain_to_standard("USDT-BEP20", "USDT"), "BSC");
         assert_eq!(chain_to_standard("USDT", "USDT"), "USDT");
+        assert_eq!(chain_to_standard("USDT-ERC20", "USDT"), "ETH");
+        assert_eq!(chain_to_standard("JTO", "JTO"), "SOL");
+        assert_eq!(chain_to_standard("TRUMP", "TRUMP"), "SOL");
     }
 
     fn asset(id: &str, ticker: &str, child_of: Option<&str>, deposit: bool, withdraw: bool, fee: &str, min: &str, confirms: u32) -> AssetEntry {
@@ -343,7 +348,7 @@ mod tests {
         assert_eq!(parent.withdraw_min, Decimal::ZERO);
 
         let bep20 = info.networks.iter().find(|n| n.name == "USDT-BEP20").expect("bep20 network present");
-        assert_eq!(bep20.network, "BEP20");
+        assert_eq!(bep20.network, "BSC");
         assert!(bep20.withdraw_enabled);
         assert_eq!(bep20.withdraw_min, "1".parse().unwrap());
         assert_eq!(bep20.min_confirm, 15);
