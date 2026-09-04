@@ -17,17 +17,19 @@ use crate::types::{Quote, Symbol, Venue};
 
 use super::{FeeSchedule, Opportunity, OpportunityKind, Strategy};
 
-/// 跨交易所下单执行所需的全部依赖打包。`kraken_venue`/`binance_venue` 是
-/// `on_quote` 里用来匹配价差机会的行情 venue 名；`kraken_trade_venue`/
+/// 跨交易所下单执行所需的全部依赖打包。`secondary_venue`/`binance_venue` 是
+/// `on_quote` 里用来匹配价差机会的行情 venue 名；`secondary_trade_venue`/
 /// `binance_trade_venue` 是实际下单用的 venue 名——两者通常相同，但
 /// `run_monitor_command` 里 Kraken 的行情 venue 是 "kraken"、交易 venue 是
-/// "kraken_spot"，这里显式区分以便将来复用。
+/// "kraken_spot"，这里显式区分以便将来复用。`secondary_*` 是"副交易所"这个
+/// 角色的通用命名——目前唯一的实现是 Kraken(GTC 挂单)，以后接入其他交易所
+/// 只需要在调用方换一套 provider，不需要改这里的字段。
 pub struct CrossExecutionConfig {
-    pub kraken_venue: Venue,
-    pub kraken_trade_venue: Venue,
+    pub secondary_venue: Venue,
+    pub secondary_trade_venue: Venue,
     pub binance_venue: Venue,
     pub binance_trade_venue: Venue,
-    pub kraken_precision: Arc<PrecisionCache>,
+    pub secondary_precision: Arc<PrecisionCache>,
     pub binance_precision: Arc<PrecisionCache>,
     pub order_manager: Arc<OrderManager>,
     /// 启动时预算好的每个 symbol 的下单量：两边交易所最小下单量里较大的那个。
@@ -46,28 +48,28 @@ pub struct CrossExchangeStrategy {
     latest: Mutex<HashMap<Symbol, HashMap<Venue, Quote>>>,
     bus: Arc<TopicBus>,
     execution: Option<Arc<CrossExecutionConfig>>,
-    /// 已挂出、还在等终态的 kraken GTC 挂单：key 是 client_order_id。
+    /// 已挂出、还在等终态的副交易所 GTC 挂单：key 是 client_order_id。
     /// `on_order_event` 收到订单事件后按 order_id 反查出 client_order_id，
-    /// 在这张表里找到对应条目才说明这是我们自己在等的 kraken 挂单
+    /// 在这张表里找到对应条目才说明这是我们自己在等的 副交易所挂单
     /// （而不是币安对冲单自己的事件），随后取出成交量去下对冲单。
-    /// 同一时刻每个 symbol 最多一条记录——`submit_kraken_maker_order` 下单前
-    /// 会扫描这张表，同一 symbol 已有在途挂单时跳过；`evaluate_kraken_resting_order`
+    /// 同一时刻每个 symbol 最多一条记录——`submit_secondary_maker_order` 下单前
+    /// 会扫描这张表，同一 symbol 已有在途挂单时跳过；`evaluate_secondary_resting_order`
     /// 靠这张表判断该 symbol 当前是"无挂单"/"挂单仍然有效"/"挂单需要撤销"。
-    pending_kraken_orders: Arc<Mutex<HashMap<String, PendingKrakenLeg>>>,
+    pending_secondary_orders: Arc<Mutex<HashMap<String, PendingSecondaryLeg>>>,
     /// 已发出、还在等成交结果的 binance 对冲单：key 是 client_order_id。
-    /// 与 `pending_kraken_orders` 同一套模式——`on_order_event` 按
+    /// 与 `pending_secondary_orders` 同一套模式——`on_order_event` 按
     /// client_order_id 对表，找到即说明这是我们自己在等的对冲单终态，
     /// 不需要再像旧版那样临时订阅事件流等一笔。
     pending_binance_orders: Arc<Mutex<HashMap<String, PendingBinanceLeg>>>,
 }
 
-/// `pending_kraken_orders` 表里的一条登记：足够 `on_order_event` 拿去下对冲单
-/// （symbol 决定精度/下单量四舍五入，kraken_side 翻转后就是对冲单方向）。
-/// `price` 是精度取整后实际挂到交易所的价格，供 `evaluate_kraken_resting_order`
+/// `pending_secondary_orders` 表里的一条登记：足够 `on_order_event` 拿去下对冲单
+/// （symbol 决定精度/下单量四舍五入，secondary_side 翻转后就是对冲单方向）。
+/// `price` 是精度取整后实际挂到交易所的价格，供 `evaluate_secondary_resting_order`
 /// 判断"是否还在最优盘口"。
-struct PendingKrakenLeg {
+struct PendingSecondaryLeg {
     symbol: Symbol,
-    kraken_side: OrderSide,
+    secondary_side: OrderSide,
     price: Decimal,
     /// 已经对这笔单发出过撤单请求、正在等待终态(Cancelled/Filled)确认。
     /// 用于防止同一笔单被重复撤单——撤单不经过 `RiskService` 限流，没有这个
@@ -76,12 +78,12 @@ struct PendingKrakenLeg {
 }
 
 /// `pending_binance_orders` 表里的一条登记：`on_order_event` 收到币安对冲单
-/// 终态后，靠这些信息记日志（kraken 侧的 order_id/成交量是为了让失衡告警能
-/// 定位到具体是哪一笔 kraken 探路单）。
+/// 终态后，靠这些信息记日志（副交易所侧的 order_id/成交量是为了让失衡告警能
+/// 定位到具体是哪一笔 副交易所探路单）。
 struct PendingBinanceLeg {
     symbol: Symbol,
-    kraken_order_id: OrderId,
-    kraken_filled_qty: Decimal,
+    secondary_order_id: OrderId,
+    secondary_filled_qty: Decimal,
 }
 
 impl CrossExchangeStrategy {
@@ -100,7 +102,7 @@ impl CrossExchangeStrategy {
             latest: Mutex::new(HashMap::new()),
             bus,
             execution: None,
-            pending_kraken_orders: Arc::new(Mutex::new(HashMap::new())),
+            pending_secondary_orders: Arc::new(Mutex::new(HashMap::new())),
             pending_binance_orders: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -230,14 +232,14 @@ impl Strategy for CrossExchangeStrategy {
             }
         }
 
-        // Kraken 挂单判断需要 kraken/binance 两个 venue 各自最新的 quote，
-        // 克隆出来后再释放 `latest` 的锁——`evaluate_kraken_resting_order`
-        // 内部还要拿 `pending_kraken_orders` 的锁、可能调用
+        // 副交易所挂单判断需要 secondary/binance 两个 venue 各自最新的 quote，
+        // 克隆出来后再释放 `latest` 的锁——`evaluate_secondary_resting_order`
+        // 内部还要拿 `pending_secondary_orders` 的锁、可能调用
         // `submit_limit_order`/`cancel_order`，不能嵌套持有 `latest` 的锁。
         let execution_quotes = self.execution.as_ref().and_then(|execution| {
-            let kraken_quote = symbol_quotes.get(&execution.kraken_venue).copied()?;
+            let secondary_quote = symbol_quotes.get(&execution.secondary_venue).copied()?;
             let binance_quote = symbol_quotes.get(&execution.binance_venue).copied()?;
-            Some((kraken_quote, binance_quote))
+            Some((secondary_quote, binance_quote))
         });
         drop(latest);
 
@@ -245,15 +247,15 @@ impl Strategy for CrossExchangeStrategy {
             log_opportunity(opportunity);
         }
 
-        if let (Some(execution), Some((kraken_quote, binance_quote))) = (&self.execution, execution_quotes) {
-            self.evaluate_kraken_resting_order(execution, symbol, kraken_quote, binance_quote);
+        if let (Some(execution), Some((secondary_quote, binance_quote))) = (&self.execution, execution_quotes) {
+            self.evaluate_secondary_resting_order(execution, symbol, secondary_quote, binance_quote);
         }
     }
 
-    /// 订单事件回调：kraken 挂单、binance 对冲单都靠这里驱动，两张登记表
-    /// （`pending_kraken_orders`/`pending_binance_orders`）按 client_order_id
+    /// 订单事件回调：副交易所挂单、binance 对冲单都靠这里驱动，两张登记表
+    /// （`pending_secondary_orders`/`pending_binance_orders`）按 client_order_id
     /// 互斥，不属于自己的事件直接忽略。`PartiallyFilled` 不在终态集合里——
-    /// kraken 挂单部分成交后仍然挂在盘口上，不能当终态处理（会漏掉后续继续
+    /// 副交易所挂单部分成交后仍然挂在盘口上，不能当终态处理（会漏掉后续继续
     /// 成交的部分）；binance 对冲单是市价单，`PartiallyFilled` 同样只是过程态。
     fn on_order_event(&self, event: &OrderEvent) {
         let Some(execution) = self.execution.clone() else { return };
@@ -267,8 +269,8 @@ impl Strategy for CrossExchangeStrategy {
 
         let Some(client_order_id) = event.client_order_id() else { return };
 
-        if self.pending_kraken_orders.lock().unwrap().contains_key(client_order_id) {
-            self.handle_kraken_leg_event(&execution, client_order_id, event);
+        if self.pending_secondary_orders.lock().unwrap().contains_key(client_order_id) {
+            self.handle_secondary_leg_event(&execution, client_order_id, event);
             return;
         }
 
@@ -279,36 +281,36 @@ impl Strategy for CrossExchangeStrategy {
 }
 
 impl CrossExchangeStrategy {
-    /// 每次收到新报价后，重新评估 kraken/binance 这一对 quote 是否应该
+    /// 每次收到新报价后，重新评估 secondary/binance 这一对 quote 是否应该
     /// 挂单/撤单/维持现状。撤单条件用 OR：不再是最优盘口、或扣费后价差不再
     /// 满足 `min_profit_bps`，任一满足就撤单（比 AND 更保守，换来更高的
     /// 撤单频率）。
-    fn evaluate_kraken_resting_order(&self, execution: &Arc<CrossExecutionConfig>, symbol: &Symbol, kraken_quote: Quote, binance_quote: Quote) {
-        if !self.health.is_healthy(&execution.kraken_venue) || !self.health.is_healthy(&execution.binance_venue) {
+    fn evaluate_secondary_resting_order(&self, execution: &Arc<CrossExecutionConfig>, symbol: &Symbol, secondary_quote: Quote, binance_quote: Quote) {
+        if !self.health.is_healthy(&execution.secondary_venue) || !self.health.is_healthy(&execution.binance_venue) {
             return;
         }
 
-        let kraken_fee = self.fee_for(&execution.kraken_venue);
+        let secondary_fee = self.fee_for(&execution.secondary_venue);
         let binance_fee = self.fee_for(&execution.binance_venue);
 
-        // kraken 挂在买一吃 binance 卖出对冲、kraken 挂在卖一吃 binance 买入
+        // 副交易所挂在买一吃 binance 卖出对冲、副交易所挂在卖一吃 binance 买入
         // 对冲，两个方向分别算一次挂单侧收益；正常行情下至多一个方向达标。
-        let buy_kraken_bps = compute_profit_bps(kraken_quote.ask, kraken_fee.maker_buy_multiplier(), binance_quote.bid, binance_fee.sell_multiplier());
-        let sell_kraken_bps = compute_profit_bps(binance_quote.ask, binance_fee.buy_multiplier(), kraken_quote.bid, kraken_fee.maker_sell_multiplier());
+        let buy_secondary_bps = compute_profit_bps(secondary_quote.ask, secondary_fee.maker_buy_multiplier(), binance_quote.bid, binance_fee.sell_multiplier());
+        let sell_secondary_bps = compute_profit_bps(binance_quote.ask, binance_fee.buy_multiplier(), secondary_quote.bid, secondary_fee.maker_sell_multiplier());
 
-        let raw_target = match buy_kraken_bps {
-            Some(bps) if bps >= self.min_profit_bps => Some((OrderSide::Buy, kraken_quote.ask)),
-            _ => match sell_kraken_bps {
-                Some(bps) if bps >= self.min_profit_bps => Some((OrderSide::Sell, kraken_quote.bid)),
+        let raw_target = match buy_secondary_bps {
+            Some(bps) if bps >= self.min_profit_bps => Some((OrderSide::Buy, secondary_quote.ask)),
+            _ => match sell_secondary_bps {
+                Some(bps) if bps >= self.min_profit_bps => Some((OrderSide::Sell, secondary_quote.bid)),
                 _ => None,
             },
         };
 
         let target = match raw_target {
-            Some((side, ref_price)) => match execution.kraken_precision.round_price(symbol, ref_price) {
+            Some((side, ref_price)) => match execution.secondary_precision.round_price(symbol, ref_price) {
                 Ok(price) => Some((side, price)),
                 Err(err) => {
-                    error!("cross_exchange: failed to round kraken resting price for symbol={symbol}: {err:#}");
+                    error!("cross_exchange: failed to round secondary resting price for symbol={symbol}: {err:#}");
                     None
                 }
             },
@@ -316,59 +318,59 @@ impl CrossExchangeStrategy {
         };
 
         let existing = {
-            let pending = self.pending_kraken_orders.lock().unwrap();
+            let pending = self.pending_secondary_orders.lock().unwrap();
             pending
                 .iter()
                 .find(|(_, leg)| &leg.symbol == symbol)
-                .map(|(id, leg)| (id.clone(), leg.kraken_side, leg.price, leg.cancel_requested))
+                .map(|(id, leg)| (id.clone(), leg.secondary_side, leg.price, leg.cancel_requested))
         };
 
         match existing {
             None => {
                 if let Some((side, price)) = target {
-                    self.submit_kraken_maker_order(execution, symbol.clone(), side, price);
+                    self.submit_secondary_maker_order(execution, symbol.clone(), side, price);
                 }
             }
             Some((client_order_id, existing_side, existing_price, cancel_requested)) => {
                 if cancel_requested || target == Some((existing_side, existing_price)) {
                     return;
                 }
-                if let Some(leg) = self.pending_kraken_orders.lock().unwrap().get_mut(&client_order_id) {
+                if let Some(leg) = self.pending_secondary_orders.lock().unwrap().get_mut(&client_order_id) {
                     leg.cancel_requested = true;
                 }
                 info!(
-                    "cross_exchange: kraken resting order client_order_id={client_order_id} symbol={symbol} side={existing_side:?} price={existing_price} \
+                    "cross_exchange: secondary resting order client_order_id={client_order_id} symbol={symbol} side={existing_side:?} price={existing_price} \
                      no longer at best price or profit below threshold, cancelling"
                 );
-                self.cancel_order(execution.kraken_trade_venue.clone(), client_order_id, None, None);
+                self.cancel_order(execution.secondary_trade_venue.clone(), client_order_id, None, None);
             }
         }
     }
 
-    /// kraken 挂单命中终态后的处理。`RejectedByExchange` 分支是核心正确性
+    /// 副交易所挂单命中终态后的处理。`RejectedByExchange` 分支是核心正确性
     /// 设计：该事件同时可能是"下单被拒"或"撤单尝试失败(订单可能仍存活)"，
     /// 必须查 `order_manager.get_order` 的权威状态才能确认——只有订单当前
     /// 状态真的是终态时才移除记录/对冲，否则保留记录、重置 `cancel_requested`
     /// 允许下次 `on_quote` 重试撤单，避免后续真正的 Filled/Cancelled 事件到达
     /// 时表里已经找不到记录，漏掉对冲、造成孤儿仓位。
-    fn handle_kraken_leg_event(&self, execution: &Arc<CrossExecutionConfig>, client_order_id: &str, event: &OrderEvent) {
+    fn handle_secondary_leg_event(&self, execution: &Arc<CrossExecutionConfig>, client_order_id: &str, event: &OrderEvent) {
         let order_id = event.order_id();
 
         match event {
             OrderEvent::Filled { filled_qty, avg_price, .. } | OrderEvent::Cancelled { filled_qty, avg_price, .. } => {
-                if let Some(leg) = self.pending_kraken_orders.lock().unwrap().remove(client_order_id) {
-                    self.settle_kraken_leg(execution, leg, order_id.clone(), *filled_qty, *avg_price);
+                if let Some(leg) = self.pending_secondary_orders.lock().unwrap().remove(client_order_id) {
+                    self.settle_secondary_leg(execution, leg, order_id.clone(), *filled_qty, *avg_price);
                 }
             }
             OrderEvent::RejectedByRisk { reason, .. } => {
-                if let Some(leg) = self.pending_kraken_orders.lock().unwrap().remove(client_order_id) {
-                    warn!("cross_exchange: kraken resting order_id={order_id} symbol={} rejected by risk: {reason}", leg.symbol);
+                if let Some(leg) = self.pending_secondary_orders.lock().unwrap().remove(client_order_id) {
+                    warn!("cross_exchange: secondary resting order_id={order_id} symbol={} rejected by risk: {reason}", leg.symbol);
                 }
             }
             OrderEvent::RejectedByExchange { reason, .. } => {
                 let Some(order) = execution.order_manager.get_order(order_id) else {
-                    warn!("cross_exchange: kraken order_id={order_id} not found in order manager after rejected_by_exchange (reason={reason}), dropping tracking");
-                    self.pending_kraken_orders.lock().unwrap().remove(client_order_id);
+                    warn!("cross_exchange: secondary order_id={order_id} not found in order manager after rejected_by_exchange (reason={reason}), dropping tracking");
+                    self.pending_secondary_orders.lock().unwrap().remove(client_order_id);
                     return;
                 };
 
@@ -378,15 +380,15 @@ impl CrossExchangeStrategy {
                 );
 
                 if is_terminal {
-                    if let Some(leg) = self.pending_kraken_orders.lock().unwrap().remove(client_order_id) {
-                        self.settle_kraken_leg(execution, leg, order_id.clone(), order.filled_qty, order.avg_price.unwrap_or(Decimal::ZERO));
+                    if let Some(leg) = self.pending_secondary_orders.lock().unwrap().remove(client_order_id) {
+                        self.settle_secondary_leg(execution, leg, order_id.clone(), order.filled_qty, order.avg_price.unwrap_or(Decimal::ZERO));
                     }
                 } else {
-                    if let Some(leg) = self.pending_kraken_orders.lock().unwrap().get_mut(client_order_id) {
+                    if let Some(leg) = self.pending_secondary_orders.lock().unwrap().get_mut(client_order_id) {
                         leg.cancel_requested = false;
                     }
                     error!(
-                        "cross_exchange: kraken order_id={order_id} cancel attempt rejected by exchange (reason={reason}) but order status is still \
+                        "cross_exchange: secondary order_id={order_id} cancel attempt rejected by exchange (reason={reason}) but order status is still \
                          {:?}, keeping tracking and will retry cancel on next quote",
                         order.status
                     );
@@ -396,24 +398,24 @@ impl CrossExchangeStrategy {
         }
     }
 
-    /// `handle_kraken_leg_event` 确认拿到权威终态后的收尾：成交量够了就同步
+    /// `handle_secondary_leg_event` 确认拿到权威终态后的收尾：成交量够了就同步
     /// 下 binance 对冲单，否则记日志说明机会消失、无需对冲。
-    fn settle_kraken_leg(&self, execution: &Arc<CrossExecutionConfig>, leg: PendingKrakenLeg, order_id: OrderId, filled_qty: Decimal, avg_price: Decimal) {
+    fn settle_secondary_leg(&self, execution: &Arc<CrossExecutionConfig>, leg: PendingSecondaryLeg, order_id: OrderId, filled_qty: Decimal, avg_price: Decimal) {
         if filled_qty <= Decimal::ZERO {
-            info!("cross_exchange: kraken resting order_id={order_id} symbol={} filled_qty=0, opportunity vanished, skip hedge", leg.symbol);
+            info!("cross_exchange: secondary resting order_id={order_id} symbol={} filled_qty=0, opportunity vanished, skip hedge", leg.symbol);
             return;
         }
 
         info!(
-            "cross_exchange: kraken resting order_id={order_id} symbol={} filled_qty={filled_qty} avg_price={avg_price}, hedging on binance",
+            "cross_exchange: secondary resting order_id={order_id} symbol={} filled_qty={filled_qty} avg_price={avg_price}, hedging on binance",
             leg.symbol
         );
 
-        self.submit_binance_hedge(execution, leg.symbol, leg.kraken_side, order_id, filled_qty);
+        self.submit_binance_hedge(execution, leg.symbol, leg.secondary_side, order_id, filled_qty);
     }
 
     /// binance 对冲单命中终态后的处理：只负责记日志——同一 symbol 同一时刻
-    /// 最多一笔在途 kraken 挂单（见 `pending_kraken_orders` 上的注释），
+    /// 最多一笔在途 副交易所挂单（见 `pending_secondary_orders` 上的注释），
     /// binance 对冲单的并发量上限交给 `RiskService` 的
     /// `max_position`/`max_orders_per_window` 兜底。
     fn handle_binance_leg_event(&self, leg: PendingBinanceLeg, event: &OrderEvent) {
@@ -427,63 +429,63 @@ impl CrossExchangeStrategy {
             }
             OrderEvent::Cancelled { filled_qty, avg_price, .. } => {
                 error!(
-                    "cross_exchange: kraken order_id={} filled_qty={} but binance hedge order_id={hedge_order_id} was cancelled (filled_qty={filled_qty} avg_price={avg_price}), \
+                    "cross_exchange: secondary order_id={} filled_qty={} but binance hedge order_id={hedge_order_id} was cancelled (filled_qty={filled_qty} avg_price={avg_price}), \
                      position may be imbalanced and needs manual check",
-                    leg.kraken_order_id, leg.kraken_filled_qty
+                    leg.secondary_order_id, leg.secondary_filled_qty
                 );
             }
             OrderEvent::RejectedByRisk { reason, .. } => {
                 error!(
-                    "cross_exchange: kraken order_id={} filled_qty={} but binance hedge order_id={hedge_order_id} rejected by risk: {reason}, \
+                    "cross_exchange: secondary order_id={} filled_qty={} but binance hedge order_id={hedge_order_id} rejected by risk: {reason}, \
                      position is now imbalanced and needs manual check",
-                    leg.kraken_order_id, leg.kraken_filled_qty
+                    leg.secondary_order_id, leg.secondary_filled_qty
                 );
             }
             OrderEvent::RejectedByExchange { reason, .. } => {
                 error!(
-                    "cross_exchange: kraken order_id={} filled_qty={} but binance hedge order_id={hedge_order_id} rejected by exchange: {reason}, \
+                    "cross_exchange: secondary order_id={} filled_qty={} but binance hedge order_id={hedge_order_id} rejected by exchange: {reason}, \
                      position is now imbalanced and needs manual check",
-                    leg.kraken_order_id, leg.kraken_filled_qty
+                    leg.secondary_order_id, leg.secondary_filled_qty
                 );
             }
             _ => unreachable!("on_order_event only forwards Filled/Cancelled/RejectedByRisk/RejectedByExchange here"),
         }
     }
 
-    /// 挂 kraken GTC 限价单：检查同 symbol 是否已有在途挂单、登记进
-    /// `pending_kraken_orders`、发布下单请求，全程同步操作，不需要
-    /// `.await`，所以不用 spawn task。`price` 由调用方（`evaluate_kraken_resting_order`
+    /// 挂副交易所 GTC 限价单：检查同 symbol 是否已有在途挂单、登记进
+    /// `pending_secondary_orders`、发布下单请求，全程同步操作，不需要
+    /// `.await`，所以不用 spawn task。`price` 由调用方（`evaluate_secondary_resting_order`
     /// 或测试）传入，已经过精度取整。
-    fn submit_kraken_maker_order(&self, execution: &Arc<CrossExecutionConfig>, symbol: Symbol, kraken_side: OrderSide, price: Decimal) {
+    fn submit_secondary_maker_order(&self, execution: &Arc<CrossExecutionConfig>, symbol: Symbol, secondary_side: OrderSide, price: Decimal) {
         let Some(&qty) = execution.order_qty_by_symbol.get(&symbol) else {
             warn!("cross_exchange: no preloaded order qty for symbol={symbol}, skip");
             return;
         };
 
-        let mut pending = self.pending_kraken_orders.lock().unwrap();
+        let mut pending = self.pending_secondary_orders.lock().unwrap();
         let already_in_flight = pending.values().any(|leg| leg.symbol == symbol);
         if already_in_flight {
-            info!("cross_exchange: kraken resting order symbol={symbol} already has an in-flight order, skip");
+            info!("cross_exchange: secondary resting order symbol={symbol} already has an in-flight order, skip");
             return;
         }
 
-        let client_order_id = generate_client_order_id("kraken");
+        let client_order_id = generate_client_order_id("secondary");
         pending.insert(
             client_order_id.clone(),
-            PendingKrakenLeg {
+            PendingSecondaryLeg {
                 symbol: symbol.clone(),
-                kraken_side,
+                secondary_side,
                 price,
                 cancel_requested: false,
             },
         );
         drop(pending);
 
-        self.submit_limit_order(execution.kraken_trade_venue.clone(), symbol, kraken_side, qty, price, Some(client_order_id), None, None);
+        self.submit_limit_order(execution.secondary_trade_venue.clone(), symbol, secondary_side, qty, price, Some(client_order_id), None, None);
     }
 
-    /// kraken 挂单成交后的对冲：在 Binance Spot 下市价单对冲。跟
-    /// `submit_kraken_maker_order` 是同一套模式——算精度取整量、登记进
+    /// 副交易所挂单成交后的对冲：在 Binance Spot 下市价单对冲。跟
+    /// `submit_secondary_maker_order` 是同一套模式——算精度取整量、登记进
     /// `pending_binance_orders`、发布下单请求，全程同步不需要 `.await`，
     /// 不用 spawn task。任何一步失败只记日志、不重试/不回滚——与
     /// `manual.rs` 现有的失败处理哲学一致，失衡了需要人工介入。
@@ -491,22 +493,22 @@ impl CrossExchangeStrategy {
         &self,
         execution: &Arc<CrossExecutionConfig>,
         symbol: Symbol,
-        kraken_side: OrderSide,
-        kraken_order_id: OrderId,
-        kraken_filled_qty: Decimal,
+        secondary_side: OrderSide,
+        secondary_order_id: OrderId,
+        secondary_filled_qty: Decimal,
     ) {
-        let hedge_qty = match execution.binance_precision.round_qty(&symbol, PrecisionKind::Market, kraken_filled_qty) {
+        let hedge_qty = match execution.binance_precision.round_qty(&symbol, PrecisionKind::Market, secondary_filled_qty) {
             Ok(q) => q,
             Err(err) => {
                 error!(
-                    "cross_exchange: kraken order_id={kraken_order_id} filled_qty={kraken_filled_qty} for symbol={symbol} cannot be rounded to a valid binance market qty ({err:#}), \
+                    "cross_exchange: secondary order_id={secondary_order_id} filled_qty={secondary_filled_qty} for symbol={symbol} cannot be rounded to a valid binance market qty ({err:#}), \
                      position is now imbalanced and needs manual hedge"
                 );
                 return;
             }
         };
 
-        let hedge_side = match kraken_side {
+        let hedge_side = match secondary_side {
             OrderSide::Buy => OrderSide::Sell,
             OrderSide::Sell => OrderSide::Buy,
         };
@@ -516,8 +518,8 @@ impl CrossExchangeStrategy {
             hedge_client_order_id.clone(),
             PendingBinanceLeg {
                 symbol: symbol.clone(),
-                kraken_order_id,
-                kraken_filled_qty,
+                secondary_order_id,
+                secondary_filled_qty,
             },
         );
 
@@ -533,13 +535,14 @@ impl CrossExchangeStrategy {
     }
 }
 
-/// kraken 的 `cl_ord_id` 只接受 32 位 UUID 或 ≤18 个 ASCII 字符的自由文本，
-/// 超出格式会被直接拒单（`EGeneral:Invalid arguments:cl_ord_id`）——之前带
-/// `{strategy_name}-{leg}-` 前缀的版本超长，所以这里舍弃可读前缀，只留 leg
-/// 标记 + 十六进制时间戳 + 随机数，保证两条腿在各自 pending 期内不重复即可。
+/// 副交易所（目前是 Kraken）的 `cl_ord_id` 只接受 32 位 UUID 或 ≤18 个 ASCII
+/// 字符的自由文本，超出格式会被直接拒单（`EGeneral:Invalid arguments:cl_ord_id`）
+/// ——之前带 `{strategy_name}-{leg}-` 前缀的版本超长，所以这里舍弃可读前缀，
+/// 只留 leg 标记 + 十六进制时间戳 + 随机数，保证两条腿在各自 pending 期内
+/// 不重复即可。
 fn generate_client_order_id(leg: &str) -> String {
     let leg_tag = match leg {
-        "kraken" => "k",
+        "secondary" => "s",
         "binance" => "b",
         other => other,
     };
@@ -813,7 +816,7 @@ mod tests {
     }
 
     /// 轮询直到某个条件满足——用于等待 `OrderEvent` 经由 bus 异步派发到
-    /// `on_order_event` 之后，策略内部状态（如 `pending_kraken_orders`）发生
+    /// `on_order_event` 之后，策略内部状态（如 `pending_secondary_orders`）发生
     /// 预期的变化。
     async fn poll_until(mut cond: impl FnMut() -> bool, what: &str) {
         for _ in 0..500 {
@@ -827,7 +830,7 @@ mod tests {
 
     /// 轮询直到 order_manager 里出现 client_order_id 带指定前缀的订单——
     /// try_execute 内部随机生成 client_order_id，测试没法提前知道完整值，
-    /// 只知道 "xk"/"xb"（kraken/binance 两条腿）前缀。
+    /// 只知道 "xs"/"xb"（secondary/binance 两条腿）前缀。
     async fn poll_order_by_prefix(order_manager: &OrderManager, prefix: &str) -> Order {
         for _ in 0..500 {
             if let Some(order) = order_manager
@@ -871,7 +874,7 @@ mod tests {
     /// 构造带 `execution` 的 `CrossExchangeStrategy`，并 spawn 一个模拟
     /// `ArbitrageEngine` 的常驻任务：订阅该策略名下的 `OrderEvent`，收到就转发
     /// 给 `on_order_event`——和生产环境里 `engine.rs::ArbitrageEngine::run`
-    /// 实际做的事一样。测试驱动 kraken/binance 成交靠已有的
+    /// 实际做的事一样。测试驱动 secondary/binance 成交靠已有的
     /// `poll_order_by_prefix` + `push_exchange_update`，它们本身带轮询重试，
     /// 天然兼容 on_order_event 是异步派发这件事,不需要额外 sleep。
     fn build_strategy(env: &TestEnv, symbol: &Symbol, execution: Arc<CrossExecutionConfig>) -> Arc<CrossExchangeStrategy> {
@@ -900,16 +903,16 @@ mod tests {
     fn test_execution_config(
         env: &TestEnv,
         symbol: &Symbol,
-        kraken_venue: Venue,
+        secondary_venue: Venue,
         binance_venue: Venue,
         qty: Decimal,
     ) -> Arc<CrossExecutionConfig> {
         Arc::new(CrossExecutionConfig {
-            kraken_venue: kraken_venue.clone(),
-            kraken_trade_venue: kraken_venue,
+            secondary_venue: secondary_venue.clone(),
+            secondary_trade_venue: secondary_venue,
             binance_venue: binance_venue.clone(),
             binance_trade_venue: binance_venue,
-            kraken_precision: Arc::new(precision_cache(symbol, "0.001", "0.001", "0.01")),
+            secondary_precision: Arc::new(precision_cache(symbol, "0.001", "0.001", "0.01")),
             binance_precision: Arc::new(precision_cache(symbol, "0.001", "0.001", "0.01")),
             order_manager: env.order_manager.clone(),
             order_qty_by_symbol: HashMap::from([(symbol.clone(), qty)]),
@@ -919,175 +922,175 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn kraken_gtc_full_fill_triggers_binance_hedge() {
+    async fn secondary_gtc_full_fill_triggers_binance_hedge() {
         let symbol = btc_usdt();
-        let kraken_venue = Venue::new("kraken_spot");
+        let secondary_venue = Venue::new("secondary_spot");
         let binance_venue = Venue::new("binance_spot");
 
-        let (kraken_provider, kraken_handles) = fake_provider(kraken_venue.clone());
+        let (secondary_provider, secondary_handles) = fake_provider(secondary_venue.clone());
         let (binance_provider, binance_handles) = fake_provider(binance_venue.clone());
 
-        let env = setup_env(vec![kraken_provider, binance_provider], symbol.clone()).await;
+        let env = setup_env(vec![secondary_provider, binance_provider], symbol.clone()).await;
         let qty = Decimal::ONE;
-        let execution = test_execution_config(&env, &symbol, kraken_venue.clone(), binance_venue.clone(), qty);
+        let execution = test_execution_config(&env, &symbol, secondary_venue.clone(), binance_venue.clone(), qty);
         let strategy = build_strategy(&env, &symbol, execution.clone());
 
         let order_manager = env.order_manager.clone();
         let driver = tokio::spawn(async move {
-            let kraken_order = poll_order_by_prefix(&order_manager, "xk").await;
-            push_exchange_update(&order_manager, &kraken_venue, &kraken_order, OrderStatus::Filled, qty, Decimal::from(100)).await;
+            let secondary_order = poll_order_by_prefix(&order_manager, "xs").await;
+            push_exchange_update(&order_manager, &secondary_venue, &secondary_order, OrderStatus::Filled, qty, Decimal::from(100)).await;
 
             let binance_order = poll_order_by_prefix(&order_manager, "xb").await;
             push_exchange_update(&order_manager, &binance_venue, &binance_order, OrderStatus::Filled, qty, Decimal::from(100)).await;
         });
 
-        strategy.submit_kraken_maker_order(&execution, symbol, OrderSide::Buy, Decimal::from(100));
+        strategy.submit_secondary_maker_order(&execution, symbol, OrderSide::Buy, Decimal::from(100));
         driver.await.unwrap();
 
-        assert_eq!(kraken_handles.limit_calls.lock().unwrap().len(), 1);
+        assert_eq!(secondary_handles.limit_calls.lock().unwrap().len(), 1);
         let hedge_calls = binance_handles.market_calls.lock().unwrap();
-        assert_eq!(hedge_calls.len(), 1, "kraken 完全成交后应该触发一次 binance 对冲");
-        assert_eq!(hedge_calls[0], (OrderSide::Sell, qty), "kraken 买入后应该在 binance 卖出对冲，数量按实际成交量");
+        assert_eq!(hedge_calls.len(), 1, "副交易所完全成交后应该触发一次 binance 对冲");
+        assert_eq!(hedge_calls[0], (OrderSide::Sell, qty), "副交易所买入后应该在 binance 卖出对冲，数量按实际成交量");
     }
 
     #[tokio::test]
-    async fn kraken_gtc_cancelled_zero_fill_skips_hedge() {
+    async fn secondary_gtc_cancelled_zero_fill_skips_hedge() {
         let symbol = btc_usdt();
-        let kraken_venue = Venue::new("kraken_spot");
+        let secondary_venue = Venue::new("secondary_spot");
         let binance_venue = Venue::new("binance_spot");
 
-        let (kraken_provider, kraken_handles) = fake_provider(kraken_venue.clone());
+        let (secondary_provider, secondary_handles) = fake_provider(secondary_venue.clone());
         let (binance_provider, binance_handles) = fake_provider(binance_venue.clone());
 
-        let env = setup_env(vec![kraken_provider, binance_provider], symbol.clone()).await;
+        let env = setup_env(vec![secondary_provider, binance_provider], symbol.clone()).await;
         let qty = Decimal::ONE;
-        let execution = test_execution_config(&env, &symbol, kraken_venue.clone(), binance_venue, qty);
+        let execution = test_execution_config(&env, &symbol, secondary_venue.clone(), binance_venue, qty);
         let strategy = build_strategy(&env, &symbol, execution.clone());
 
         let order_manager = env.order_manager.clone();
         let driver = tokio::spawn(async move {
-            let kraken_order = poll_order_by_prefix(&order_manager, "xk").await;
+            let secondary_order = poll_order_by_prefix(&order_manager, "xs").await;
             // 挂单还没成交就被撤销：机会消失，撤单确认后 filled_qty=0。
-            push_exchange_update(&order_manager, &kraken_venue, &kraken_order, OrderStatus::Cancelled, Decimal::ZERO, Decimal::ZERO).await;
+            push_exchange_update(&order_manager, &secondary_venue, &secondary_order, OrderStatus::Cancelled, Decimal::ZERO, Decimal::ZERO).await;
         });
 
-        strategy.submit_kraken_maker_order(&execution, symbol, OrderSide::Buy, Decimal::from(100));
+        strategy.submit_secondary_maker_order(&execution, symbol, OrderSide::Buy, Decimal::from(100));
         driver.await.unwrap();
 
-        assert_eq!(kraken_handles.limit_calls.lock().unwrap().len(), 1);
+        assert_eq!(secondary_handles.limit_calls.lock().unwrap().len(), 1);
         assert!(binance_handles.market_calls.lock().unwrap().is_empty(), "撤单时 0 成交不应该下对冲单");
     }
 
     #[tokio::test]
-    async fn kraken_gtc_cancelled_partial_fill_hedges_actual_filled_qty() {
+    async fn secondary_gtc_cancelled_partial_fill_hedges_actual_filled_qty() {
         let symbol = btc_usdt();
-        let kraken_venue = Venue::new("kraken_spot");
+        let secondary_venue = Venue::new("secondary_spot");
         let binance_venue = Venue::new("binance_spot");
 
-        let (kraken_provider, kraken_handles) = fake_provider(kraken_venue.clone());
+        let (secondary_provider, secondary_handles) = fake_provider(secondary_venue.clone());
         let (binance_provider, binance_handles) = fake_provider(binance_venue.clone());
 
-        let env = setup_env(vec![kraken_provider, binance_provider], symbol.clone()).await;
+        let env = setup_env(vec![secondary_provider, binance_provider], symbol.clone()).await;
         let qty = Decimal::ONE;
-        let execution = test_execution_config(&env, &symbol, kraken_venue.clone(), binance_venue.clone(), qty);
+        let execution = test_execution_config(&env, &symbol, secondary_venue.clone(), binance_venue.clone(), qty);
         let strategy = build_strategy(&env, &symbol, execution.clone());
 
         let partial_fill = Decimal::new(6, 1); // 0.6
 
         let order_manager = env.order_manager.clone();
         let driver = tokio::spawn(async move {
-            let kraken_order = poll_order_by_prefix(&order_manager, "xk").await;
+            let secondary_order = poll_order_by_prefix(&order_manager, "xs").await;
             // 部分成交后撤单：Cancelled 事件自带准确的累计成交量。
-            push_exchange_update(&order_manager, &kraken_venue, &kraken_order, OrderStatus::Cancelled, partial_fill, Decimal::from(100)).await;
+            push_exchange_update(&order_manager, &secondary_venue, &secondary_order, OrderStatus::Cancelled, partial_fill, Decimal::from(100)).await;
 
             let binance_order = poll_order_by_prefix(&order_manager, "xb").await;
             push_exchange_update(&order_manager, &binance_venue, &binance_order, OrderStatus::Filled, partial_fill, Decimal::from(100)).await;
         });
 
-        strategy.submit_kraken_maker_order(&execution, symbol, OrderSide::Sell, Decimal::from(100));
+        strategy.submit_secondary_maker_order(&execution, symbol, OrderSide::Sell, Decimal::from(100));
         driver.await.unwrap();
 
-        assert_eq!(kraken_handles.limit_calls.lock().unwrap().len(), 1);
+        assert_eq!(secondary_handles.limit_calls.lock().unwrap().len(), 1);
         let hedge_calls = binance_handles.market_calls.lock().unwrap();
         assert_eq!(hedge_calls.len(), 1, "部分成交后撤单也应该按实际成交量触发一次对冲");
-        assert_eq!(hedge_calls[0], (OrderSide::Buy, partial_fill), "kraken 卖出部分成交后应该在 binance 买入对冲，数量是实际成交的 0.6 而不是下单量 1");
+        assert_eq!(hedge_calls[0], (OrderSide::Buy, partial_fill), "副交易所卖出部分成交后应该在 binance 买入对冲，数量是实际成交的 0.6 而不是下单量 1");
     }
 
     #[tokio::test]
-    async fn kraken_gtc_partially_filled_event_is_not_terminal_then_later_fill_hedges_full_qty() {
+    async fn secondary_gtc_partially_filled_event_is_not_terminal_then_later_fill_hedges_full_qty() {
         let symbol = btc_usdt();
-        let kraken_venue = Venue::new("kraken_spot");
+        let secondary_venue = Venue::new("secondary_spot");
         let binance_venue = Venue::new("binance_spot");
 
-        let (kraken_provider, kraken_handles) = fake_provider(kraken_venue.clone());
+        let (secondary_provider, secondary_handles) = fake_provider(secondary_venue.clone());
         let (binance_provider, binance_handles) = fake_provider(binance_venue.clone());
 
-        let env = setup_env(vec![kraken_provider, binance_provider], symbol.clone()).await;
+        let env = setup_env(vec![secondary_provider, binance_provider], symbol.clone()).await;
         let qty = Decimal::ONE;
-        let execution = test_execution_config(&env, &symbol, kraken_venue.clone(), binance_venue.clone(), qty);
+        let execution = test_execution_config(&env, &symbol, secondary_venue.clone(), binance_venue.clone(), qty);
         let strategy = build_strategy(&env, &symbol, execution.clone());
 
-        strategy.submit_kraken_maker_order(&execution, symbol.clone(), OrderSide::Buy, Decimal::from(100));
-        let kraken_order = poll_order_by_prefix(&env.order_manager, "xk").await;
-        let client_order_id = kraken_order.request.client_order_id().unwrap().to_string();
+        strategy.submit_secondary_maker_order(&execution, symbol.clone(), OrderSide::Buy, Decimal::from(100));
+        let secondary_order = poll_order_by_prefix(&env.order_manager, "xs").await;
+        let client_order_id = secondary_order.request.client_order_id().unwrap().to_string();
 
         let partial_fill = Decimal::new(4, 1); // 0.4
-        push_exchange_update(&env.order_manager, &kraken_venue, &kraken_order, OrderStatus::PartiallyFilled, partial_fill, Decimal::from(100)).await;
+        push_exchange_update(&env.order_manager, &secondary_venue, &secondary_order, OrderStatus::PartiallyFilled, partial_fill, Decimal::from(100)).await;
 
         // 给 PartiallyFilled 事件的异步派发留出时间落地，确认它没有被当成
         // 终态处理——挂单记录还在、没有提前触发对冲。
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(binance_handles.market_calls.lock().unwrap().is_empty(), "PartiallyFilled 不应该触发对冲");
         assert!(
-            strategy.pending_kraken_orders.lock().unwrap().contains_key(&client_order_id),
+            strategy.pending_secondary_orders.lock().unwrap().contains_key(&client_order_id),
             "PartiallyFilled 不应该把挂单记录从跟踪表里移除"
         );
 
         let order_manager = env.order_manager.clone();
         let driver = tokio::spawn(async move {
-            push_exchange_update(&order_manager, &kraken_venue, &kraken_order, OrderStatus::Filled, qty, Decimal::from(100)).await;
+            push_exchange_update(&order_manager, &secondary_venue, &secondary_order, OrderStatus::Filled, qty, Decimal::from(100)).await;
 
             let binance_order = poll_order_by_prefix(&order_manager, "xb").await;
             push_exchange_update(&order_manager, &binance_venue, &binance_order, OrderStatus::Filled, qty, Decimal::from(100)).await;
         });
         driver.await.unwrap();
 
-        assert_eq!(kraken_handles.limit_calls.lock().unwrap().len(), 1);
+        assert_eq!(secondary_handles.limit_calls.lock().unwrap().len(), 1);
         let hedge_calls = binance_handles.market_calls.lock().unwrap();
         assert_eq!(hedge_calls.len(), 1, "最终 Filled 到达后应该按累计成交量触发一次对冲");
-        assert_eq!(hedge_calls[0], (OrderSide::Sell, qty), "kraken 买入后应该在 binance 卖出对冲，数量是累计成交量而不是中途的部分成交量");
+        assert_eq!(hedge_calls[0], (OrderSide::Sell, qty), "副交易所买入后应该在 binance 卖出对冲，数量是累计成交量而不是中途的部分成交量");
     }
 
     #[tokio::test]
-    async fn kraken_gtc_rejected_by_exchange_cancel_attempt_retried_when_order_still_alive() {
+    async fn secondary_gtc_rejected_by_exchange_cancel_attempt_retried_when_order_still_alive() {
         let symbol = btc_usdt();
-        let kraken_venue = Venue::new("kraken_spot");
+        let secondary_venue = Venue::new("secondary_spot");
         let binance_venue = Venue::new("binance_spot");
 
-        let (kraken_provider, kraken_handles) = fake_provider(kraken_venue.clone());
+        let (secondary_provider, secondary_handles) = fake_provider(secondary_venue.clone());
         let (binance_provider, binance_handles) = fake_provider(binance_venue.clone());
 
-        let env = setup_env(vec![kraken_provider, binance_provider], symbol.clone()).await;
+        let env = setup_env(vec![secondary_provider, binance_provider], symbol.clone()).await;
         let qty = Decimal::ONE;
-        let execution = test_execution_config(&env, &symbol, kraken_venue.clone(), binance_venue.clone(), qty);
+        let execution = test_execution_config(&env, &symbol, secondary_venue.clone(), binance_venue.clone(), qty);
         let strategy = build_strategy(&env, &symbol, execution.clone());
 
-        strategy.submit_kraken_maker_order(&execution, symbol.clone(), OrderSide::Buy, Decimal::from(100));
-        let kraken_order = poll_order_by_prefix(&env.order_manager, "xk").await;
-        let client_order_id = kraken_order.request.client_order_id().unwrap().to_string();
-        poll_until_exchange_order_id(&env.order_manager, &kraken_order.order_id).await;
+        strategy.submit_secondary_maker_order(&execution, symbol.clone(), OrderSide::Buy, Decimal::from(100));
+        let secondary_order = poll_order_by_prefix(&env.order_manager, "xs").await;
+        let client_order_id = secondary_order.request.client_order_id().unwrap().to_string();
+        poll_until_exchange_order_id(&env.order_manager, &secondary_order.order_id).await;
 
-        // 模拟 `evaluate_kraken_resting_order` 已经判定需要撤单、标记了
+        // 模拟 `evaluate_secondary_resting_order` 已经判定需要撤单、标记了
         // cancel_requested=true，接下来撤单请求本身失败(交易所报错)，但订单
         // 在交易所侧其实还活着(status 仍是 New，没有任何 WS 终态推送)。
-        strategy.pending_kraken_orders.lock().unwrap().get_mut(&client_order_id).unwrap().cancel_requested = true;
-        kraken_handles.cancel_should_fail.store(true, Ordering::SeqCst);
-        strategy.cancel_order(execution.kraken_trade_venue.clone(), client_order_id.clone(), None, None);
+        strategy.pending_secondary_orders.lock().unwrap().get_mut(&client_order_id).unwrap().cancel_requested = true;
+        secondary_handles.cancel_should_fail.store(true, Ordering::SeqCst);
+        strategy.cancel_order(execution.secondary_trade_venue.clone(), client_order_id.clone(), None, None);
 
         poll_until(
             || {
                 strategy
-                    .pending_kraken_orders
+                    .pending_secondary_orders
                     .lock()
                     .unwrap()
                     .get(&client_order_id)
@@ -1098,16 +1101,16 @@ mod tests {
         )
         .await;
         assert!(
-            strategy.pending_kraken_orders.lock().unwrap().contains_key(&client_order_id),
+            strategy.pending_secondary_orders.lock().unwrap().contains_key(&client_order_id),
             "撤单尝试失败但订单还活着时不应该把记录从跟踪表里移除"
         );
 
         // 证明重置后确实能重试并最终正确对冲：撤单不再失败，driver 推送真正
         // 的 Filled 终态。
-        kraken_handles.cancel_should_fail.store(false, Ordering::SeqCst);
+        secondary_handles.cancel_should_fail.store(false, Ordering::SeqCst);
         let order_manager = env.order_manager.clone();
         let driver = tokio::spawn(async move {
-            push_exchange_update(&order_manager, &kraken_venue, &kraken_order, OrderStatus::Filled, qty, Decimal::from(100)).await;
+            push_exchange_update(&order_manager, &secondary_venue, &secondary_order, OrderStatus::Filled, qty, Decimal::from(100)).await;
 
             let binance_order = poll_order_by_prefix(&order_manager, "xb").await;
             push_exchange_update(&order_manager, &binance_venue, &binance_order, OrderStatus::Filled, qty, Decimal::from(100)).await;
@@ -1117,21 +1120,21 @@ mod tests {
         let hedge_calls = binance_handles.market_calls.lock().unwrap();
         assert_eq!(hedge_calls.len(), 1, "撤单失败重试后，最终的真实成交仍然应该正确触发对冲");
         assert_eq!(hedge_calls[0], (OrderSide::Sell, qty));
-        assert_eq!(kraken_handles.cancel_calls.lock().unwrap().len(), 1);
+        assert_eq!(secondary_handles.cancel_calls.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]
-    async fn kraken_gtc_rejected_by_exchange_but_order_already_terminal_settles_using_authoritative_status() {
+    async fn secondary_gtc_rejected_by_exchange_but_order_already_terminal_settles_using_authoritative_status() {
         let symbol = btc_usdt();
-        let kraken_venue = Venue::new("kraken_spot");
+        let secondary_venue = Venue::new("secondary_spot");
         let binance_venue = Venue::new("binance_spot");
 
-        let (kraken_provider, kraken_handles) = fake_provider(kraken_venue.clone());
+        let (secondary_provider, secondary_handles) = fake_provider(secondary_venue.clone());
         let (binance_provider, binance_handles) = fake_provider(binance_venue.clone());
 
-        let env = setup_env(vec![kraken_provider, binance_provider], symbol.clone()).await;
+        let env = setup_env(vec![secondary_provider, binance_provider], symbol.clone()).await;
         let qty = Decimal::ONE;
-        let execution = test_execution_config(&env, &symbol, kraken_venue.clone(), binance_venue.clone(), qty);
+        let execution = test_execution_config(&env, &symbol, secondary_venue.clone(), binance_venue.clone(), qty);
         // 这个用例需要精确控制 `on_order_event` 的调用时机，构造一个"撤单失败
         // 的 RejectedByExchange 比真正的终态事件先被处理"的乱序场景，所以不用
         // `build_strategy`（它会自动把 bus 上的 OrderEvent 转发给
@@ -1147,18 +1150,18 @@ mod tests {
             .with_execution(execution.clone()),
         );
 
-        strategy.submit_kraken_maker_order(&execution, symbol.clone(), OrderSide::Buy, Decimal::from(100));
-        let kraken_order = poll_order_by_prefix(&env.order_manager, "xk").await;
-        let client_order_id = kraken_order.request.client_order_id().unwrap().to_string();
+        strategy.submit_secondary_maker_order(&execution, symbol.clone(), OrderSide::Buy, Decimal::from(100));
+        let secondary_order = poll_order_by_prefix(&env.order_manager, "xs").await;
+        let client_order_id = secondary_order.request.client_order_id().unwrap().to_string();
 
         // 订单在 order_manager 里已经真正到达终态 Filled（模拟 WS 推送先落地；
         // 这里没有 dispatcher 订阅 bus，所以 handle_exchange_update 内部发布的
         // 真实 Filled 事件不会被自动转发，不会干扰下面手动构造的乱序场景）。
-        push_exchange_update(&env.order_manager, &kraken_venue, &kraken_order, OrderStatus::Filled, qty, Decimal::from(100)).await;
+        push_exchange_update(&env.order_manager, &secondary_venue, &secondary_order, OrderStatus::Filled, qty, Decimal::from(100)).await;
 
         // 模拟撤单请求的响应比 WS 推送更晚才回来、但先被派发到策略。
         let rejected = OrderEvent::RejectedByExchange {
-            order_id: kraken_order.order_id.clone(),
+            order_id: secondary_order.order_id.clone(),
             client_order_id: Some(client_order_id.clone()),
             reason: "cancel_order exchange error: too late, already filled".to_string(),
         };
@@ -1173,28 +1176,28 @@ mod tests {
         )
         .await;
 
-        assert_eq!(kraken_handles.limit_calls.lock().unwrap().len(), 1);
+        assert_eq!(secondary_handles.limit_calls.lock().unwrap().len(), 1);
         let hedge_calls = binance_handles.market_calls.lock().unwrap();
         assert_eq!(hedge_calls.len(), 1, "RejectedByExchange 到达时若订单其实已经是真正终态 Filled，应该按权威状态对冲");
         assert_eq!(hedge_calls[0], (OrderSide::Sell, qty));
         assert!(
-            !strategy.pending_kraken_orders.lock().unwrap().contains_key(&client_order_id),
+            !strategy.pending_secondary_orders.lock().unwrap().contains_key(&client_order_id),
             "确认真实终态后应该移除跟踪记录"
         );
     }
 
     #[tokio::test]
-    async fn submit_kraken_maker_order_skips_duplicate_in_flight_order_for_same_symbol() {
+    async fn submit_secondary_maker_order_skips_duplicate_in_flight_order_for_same_symbol() {
         let symbol = btc_usdt();
-        let kraken_venue = Venue::new("kraken_spot");
+        let secondary_venue = Venue::new("secondary_spot");
         let binance_venue = Venue::new("binance_spot");
 
-        let (kraken_provider, kraken_handles) = fake_provider(kraken_venue.clone());
+        let (secondary_provider, secondary_handles) = fake_provider(secondary_venue.clone());
         let (binance_provider, _binance_handles) = fake_provider(binance_venue.clone());
 
-        let env = setup_env(vec![kraken_provider, binance_provider], symbol.clone()).await;
+        let env = setup_env(vec![secondary_provider, binance_provider], symbol.clone()).await;
         let qty = Decimal::ONE;
-        let execution = test_execution_config(&env, &symbol, kraken_venue.clone(), binance_venue, qty);
+        let execution = test_execution_config(&env, &symbol, secondary_venue.clone(), binance_venue, qty);
         let strategy = build_strategy(&env, &symbol, execution.clone());
 
         // 第一笔挂单发出后还没拿到终态（不驱动任何 fill/cancel 事件），此时同
@@ -1202,21 +1205,21 @@ mod tests {
         // 请求。这是这次改动里最关键的行为变化：旧版按 symbol+side+price 去重
         // （允许同 symbol 不同价位并发探路单），新版按 symbol 去重，因为同一
         // 时刻每个 symbol 只应该有一笔挂单在途（cancel-and-replace 语义）。
-        strategy.submit_kraken_maker_order(&execution, symbol.clone(), OrderSide::Buy, Decimal::from(100));
-        poll_order_by_prefix(&env.order_manager, "xk").await;
+        strategy.submit_secondary_maker_order(&execution, symbol.clone(), OrderSide::Buy, Decimal::from(100));
+        poll_order_by_prefix(&env.order_manager, "xs").await;
 
-        strategy.submit_kraken_maker_order(&execution, symbol.clone(), OrderSide::Buy, Decimal::from(101));
+        strategy.submit_secondary_maker_order(&execution, symbol.clone(), OrderSide::Buy, Decimal::from(101));
         // 给第二次调用（如果它错误地真的下单了）留出时间落地。
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         assert_eq!(
-            kraken_handles.limit_calls.lock().unwrap().len(),
+            secondary_handles.limit_calls.lock().unwrap().len(),
             1,
             "同一 symbol 已有在途挂单时不应该被重复下单，即使价格不同"
         );
     }
 
-    /// 记录"价格决策"（`submit_kraken_maker_order` 被调用，等价于 `on_quote`
+    /// 记录"价格决策"（`submit_secondary_maker_order` 被调用，等价于 `on_quote`
     /// 判定出套利机会那一刻）到 `OrderProvider::place_limit_order_raw` 被调用
     /// （生产环境里这一步就是真实 HTTP 请求发出前）之间的纯内部调度耗时：
     /// bus.publish -> RiskService -> bus.publish -> ExecutionService -> adapter.submit。
@@ -1239,7 +1242,7 @@ mod tests {
                 self.venue.clone()
             }
             async fn place_market_order_raw(&self, _req: &MarketOrderRequest) -> anyhow::Result<OrderResult> {
-                unreachable!("benchmark only drives the kraken leg")
+                unreachable!("benchmark only drives the secondary leg")
             }
             async fn place_limit_order_raw(&self, req: &LimitOrderRequest) -> anyhow::Result<OrderResult> {
                 let _ = self.tx.send(Instant::now());
@@ -1255,16 +1258,16 @@ mod tests {
         }
 
         let symbol = btc_usdt();
-        let kraken_venue = Venue::new("kraken_spot");
+        let secondary_venue = Venue::new("secondary_spot");
         let binance_venue = Venue::new("binance_spot");
 
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let kraken_provider: Arc<dyn OrderProvider> = Arc::new(TimestampingProvider { venue: kraken_venue.clone(), tx });
+        let secondary_provider: Arc<dyn OrderProvider> = Arc::new(TimestampingProvider { venue: secondary_venue.clone(), tx });
         let (binance_provider, _binance_handles) = fake_provider(binance_venue.clone());
 
-        let env = setup_env(vec![kraken_provider, binance_provider], symbol.clone()).await;
+        let env = setup_env(vec![secondary_provider, binance_provider], symbol.clone()).await;
         let qty = Decimal::ONE;
-        let execution = test_execution_config(&env, &symbol, kraken_venue, binance_venue, qty);
+        let execution = test_execution_config(&env, &symbol, secondary_venue, binance_venue, qty);
         let strategy = build_strategy(&env, &symbol, execution.clone());
 
         // `setup_env` 固定给每个 (venue, symbol) 配 `max_orders_per_window: 100`
@@ -1274,14 +1277,14 @@ mod tests {
         let mut samples = Vec::with_capacity(ITERATIONS);
         for i in 0..ITERATIONS {
             // 新设计按 symbol 去重（同一时刻每个 symbol 只应该有一笔挂单在
-            // 途），这个基准只跑 `submit_kraken_maker_order`、从不驱动任何
-            // 成交/撤单事件，挂单永远不会从 `pending_kraken_orders` 里自然
+            // 途），这个基准只跑 `submit_secondary_maker_order`、从不驱动任何
+            // 成交/撤单事件，挂单永远不会从 `pending_secondary_orders` 里自然
             // 移除，所以每次迭代手动清空一下，模拟"上一笔已经终结"，让每次
             // 调用都能真正走到 provider。
-            strategy.pending_kraken_orders.lock().unwrap().clear();
+            strategy.pending_secondary_orders.lock().unwrap().clear();
             let price = Decimal::from(100) + Decimal::new(i as i64, 2);
             let start = Instant::now();
-            strategy.submit_kraken_maker_order(&execution, symbol.clone(), OrderSide::Buy, price);
+            strategy.submit_secondary_maker_order(&execution, symbol.clone(), OrderSide::Buy, price);
             let received_at = tokio::time::timeout(Duration::from_secs(2), rx.recv())
                 .await
                 .expect("provider was not called within timeout")

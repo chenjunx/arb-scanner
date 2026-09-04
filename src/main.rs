@@ -467,11 +467,11 @@ async fn build_cross_execution_config(
     .context("failed to build cross_exchange_execution OrderManager pipeline")?;
 
     Ok(CrossExecutionConfig {
-        kraken_venue: kraken_venue.clone(),
-        kraken_trade_venue: kraken_venue,
+        secondary_venue: kraken_venue.clone(),
+        secondary_trade_venue: kraken_venue,
         binance_venue: binance_venue.clone(),
         binance_trade_venue: binance_venue,
-        kraken_precision,
+        secondary_precision: kraken_precision,
         binance_precision,
         order_manager: pipeline.order_manager,
         order_qty_by_symbol,
@@ -1547,12 +1547,54 @@ async fn run_close_command(args: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `scan` 子命令：只读地找出币安和 Kraken"有交集"的币种——币安有 USDT 本位永续
-/// 合约、Kraken 有 USDT 现货、且两边钱包信息里至少共享一条可转账的标准链，打印
-/// 每个币种的基本信息，作为后续 `open`/`rotate` 操作前的选币依据。不接入 engine
-/// 主循环，也不读取 `config.toml`。
+/// 把 `--secondary <name>` 映射到对应的 `ExchangeInfoProvider`，供 `scan`/
+/// `monitor` 子命令选择"副交易所"。目前只有 Kraken 有完整实现——接入新交易所
+/// 只需要在这里和 [`build_secondary_wallet_provider`] 加一个分支。
+fn build_secondary_exchange_info(name: &str, proxy: Option<&str>) -> anyhow::Result<Box<dyn ExchangeInfoProvider>> {
+    match name {
+        "kraken" => Ok(Box::new(KrakenExchangeInfoProvider::from_env(Venue::new(name), proxy)?)),
+        other => anyhow::bail!("unknown --secondary venue '{other}', only 'kraken' is currently supported"),
+    }
+}
+
+/// 和 [`build_secondary_exchange_info`] 按同样的名字映射构造对应的
+/// `WalletProvider`，供 `scan::find_overlap` 查询副交易所的钱包链信息。
+fn build_secondary_wallet_provider(name: &str, proxy: Option<&str>) -> anyhow::Result<Box<dyn WalletProvider>> {
+    match name {
+        "kraken" => Ok(Box::new(KrakenWalletProvider::from_env(Venue::new(name), proxy)?)),
+        other => anyhow::bail!("unknown --secondary venue '{other}', only 'kraken' is currently supported"),
+    }
+}
+
+/// 和上面两个函数按同样的名字映射构造 `monitor` 子命令用的行情源和心跳探针
+/// symbol——探针 symbol 是副交易所的原生报价资产（Kraken 报价用 BTC/USD），
+/// 用来判断该行情链路是否健康，见 `LinkHealthMonitor`。
+fn build_secondary_market_data_source(
+    name: &str,
+    venue: Venue,
+    symbols: Vec<Symbol>,
+    proxy: Option<String>,
+) -> anyhow::Result<Box<dyn MarketDataSource>> {
+    match name {
+        "kraken" => Ok(Box::new(KrakenSpotSource::new(venue, symbols, proxy))),
+        other => anyhow::bail!("unknown --secondary venue '{other}', only 'kraken' is currently supported"),
+    }
+}
+
+fn secondary_probe_symbol(name: &str) -> Symbol {
+    match name {
+        "kraken" => Symbol::new("BTC", "USD"),
+        _ => Symbol::new("BTC", "USDT"),
+    }
+}
+
+/// `scan` 子命令：只读地找出币安和副交易所"有交集"的币种——币安有 USDT 本位
+/// 永续合约、副交易所有 USDT 现货、且两边钱包信息里至少共享一条可转账的标准
+/// 链，打印每个币种的基本信息，作为后续 `open`/`rotate` 操作前的选币依据。
+/// 不接入 engine 主循环，也不读取 `config.toml`。
 async fn run_scan_command(args: &[String]) -> anyhow::Result<()> {
     let mut testnet = false;
+    let mut secondary = "kraken".to_string();
 
     let mut i = 0;
     while i < args.len() {
@@ -1561,26 +1603,37 @@ async fn run_scan_command(args: &[String]) -> anyhow::Result<()> {
                 testnet = true;
                 i += 1;
             }
+            "--secondary" => {
+                secondary = args.get(i + 1).context("--secondary requires a value")?.clone();
+                i += 2;
+            }
             other => anyhow::bail!("unknown argument '{other}' for 'scan' subcommand"),
         }
     }
 
     let proxy = net::proxy_from_env();
     let binance_info = BinanceExchangeInfoProvider::from_env(Venue::new("binance"), testnet, proxy.as_deref())?;
-    let kraken_info = KrakenExchangeInfoProvider::from_env(Venue::new("kraken"), proxy.as_deref())?;
+    let secondary_info = build_secondary_exchange_info(&secondary, proxy.as_deref())?;
     let binance_wallet = BinanceWalletProvider::from_env(Venue::new("binance"), testnet, proxy.as_deref())?;
-    let kraken_wallet = KrakenWalletProvider::from_env(Venue::new("kraken"), proxy.as_deref())?;
+    let secondary_wallet = build_secondary_wallet_provider(&secondary, proxy.as_deref())?;
 
     let blacklist = ScanConfig::load_blacklist("config.toml");
     info!(
-        "scan: looking for symbols overlapping between binance (usdt perpetual) and kraken (usdt spot) testnet={testnet} blacklist={blacklist:?}"
+        "scan: looking for symbols overlapping between binance (usdt perpetual) and {secondary} (usdt spot) testnet={testnet} blacklist={blacklist:?}"
     );
 
-    let result = scan::find_overlap(&binance_info, &kraken_info, &binance_wallet, &kraken_wallet, &blacklist).await?;
+    let result = scan::find_overlap(
+        &binance_info,
+        secondary_info.as_ref(),
+        &binance_wallet,
+        secondary_wallet.as_ref(),
+        &blacklist,
+    )
+    .await?;
     info!(
-        "scan: binance_spot_symbols={} kraken_spot_symbols={} overlapping_symbols={} skipped={} blacklisted={}",
+        "scan: binance_spot_symbols={} {secondary}_spot_symbols={} overlapping_symbols={} skipped={} blacklisted={}",
         result.binance_spot_symbols.len(),
-        result.kraken_spot_symbols.len(),
+        result.secondary_spot_symbols.len(),
         result.overlaps.len(),
         result.skipped.len(),
         result.blacklisted.len()
@@ -1589,8 +1642,8 @@ async fn run_scan_command(args: &[String]) -> anyhow::Result<()> {
     println!("== Binance USDT Spot Symbols With Perp Hedge ({}) ==", result.binance_spot_symbols.len());
     println!("{}", scan::format_symbol_list(&result.binance_spot_symbols));
     println!();
-    println!("== Kraken USDT Spot Symbols ({}) ==", result.kraken_spot_symbols.len());
-    println!("{}", scan::format_symbol_list(&result.kraken_spot_symbols));
+    println!("== {} USDT Spot Symbols ({}) ==", secondary.to_uppercase(), result.secondary_spot_symbols.len());
+    println!("{}", scan::format_symbol_list(&result.secondary_spot_symbols));
     println!();
     println!("== Overlapping Symbols ({}) ==", result.overlaps.len());
     println!("{}", scan::format_overlap_table(&result.overlaps));
@@ -1604,15 +1657,15 @@ async fn run_scan_command(args: &[String]) -> anyhow::Result<()> {
 }
 
 /// `spot_trading_fee` 查询并发上限，避免对候选币逐个查询手续费时触发限流，
-/// 和 `scan/mod.rs` 里 `KRAKEN_WALLET_CONCURRENCY` 同样的考虑。
+/// 和 `scan/mod.rs` 里 `SECONDARY_WALLET_CONCURRENCY` 同样的考虑。
 const FEE_QUERY_CONCURRENCY: usize = 4;
 
-/// `monitor` 子命令：复用 `scan::find_overlap` 筛出的币安/Kraken 交集币种，接入现成的
+/// `monitor` 子命令：复用 `scan::find_overlap` 筛出的币安/副交易所交集币种，接入现成的
 /// 行情源 + `CrossExchangeStrategy` 管线，持续监控两边现货价差。每个币的
 /// 手续费用 [`ExchangeInfoProvider::spot_trading_fee`] 查询两边真实账户 taker 费率(而
 /// 不是固定值)，币安这边再乘上 `config.toml` `[[venues]]` 里币安条目的 `fee_discount`
 /// 折扣(如 BNB 抵扣手续费，默认 1 不打折，见 [`VenueConfig::load_fee_discount`])，
-/// Kraken 不打折。扣费后价差只要 >= `--min-profit-bps`(默认 0，即扣费后为正)就打印。
+/// 副交易所不打折。扣费后价差只要 >= `--min-profit-bps`(默认 0，即扣费后为正)就打印。
 /// 参与比较的两侧报价里只要有一个距今超过 `--max-quote-age-ms`(默认 5000ms)，就跳过
 /// 这次比较——防止某一侧 WS 断线/卡住后，一直拿旧报价和另一侧的新报价比出虚假价差。
 ///
@@ -1629,6 +1682,7 @@ const FEE_QUERY_CONCURRENCY: usize = 4;
 /// 一致)，不想连 Redis 就加 `--no-portfolio` 退回纯价差扫描。
 async fn run_monitor_command(args: &[String]) -> anyhow::Result<()> {
     let mut testnet = false;
+    let mut secondary = "kraken".to_string();
     let mut min_profit_bps = Decimal::ZERO;
     let mut link_health_window_ms: u64 = 5000;
     let mut no_portfolio = false;
@@ -1642,6 +1696,10 @@ async fn run_monitor_command(args: &[String]) -> anyhow::Result<()> {
             "--testnet" => {
                 testnet = true;
                 i += 1;
+            }
+            "--secondary" => {
+                secondary = args.get(i + 1).context("--secondary requires a value")?.clone();
+                i += 2;
             }
             "--min-profit-bps" => {
                 let v = args.get(i + 1).context("--min-profit-bps requires a value")?;
@@ -1683,17 +1741,23 @@ async fn run_monitor_command(args: &[String]) -> anyhow::Result<()> {
 
     let proxy = net::proxy_from_env();
     let binance_info = BinanceExchangeInfoProvider::from_env(Venue::new("binance"), testnet, proxy.as_deref())?;
-    let kraken_info = KrakenExchangeInfoProvider::from_env(Venue::new("kraken"), proxy.as_deref())?;
+    let secondary_info = build_secondary_exchange_info(&secondary, proxy.as_deref())?;
     let binance_wallet = BinanceWalletProvider::from_env(Venue::new("binance"), testnet, proxy.as_deref())?;
-    let kraken_wallet = KrakenWalletProvider::from_env(Venue::new("kraken"), proxy.as_deref())?;
+    let secondary_wallet = build_secondary_wallet_provider(&secondary, proxy.as_deref())?;
 
     let blacklist = ScanConfig::load_blacklist("config.toml");
     let binance_fee_discount = VenueConfig::load_fee_discount("config.toml", "binance");
     info!(
-        "monitor: looking for symbols overlapping between binance (usdt perpetual) and kraken (usdt spot) testnet={testnet} blacklist={blacklist:?} binance_fee_discount={binance_fee_discount}"
+        "monitor: looking for symbols overlapping between binance (usdt perpetual) and {secondary} (usdt spot) testnet={testnet} blacklist={blacklist:?} binance_fee_discount={binance_fee_discount}"
     );
-    let scan_result =
-        scan::find_overlap(&binance_info, &kraken_info, &binance_wallet, &kraken_wallet, &blacklist).await?;
+    let scan_result = scan::find_overlap(
+        &binance_info,
+        secondary_info.as_ref(),
+        &binance_wallet,
+        secondary_wallet.as_ref(),
+        &blacklist,
+    )
+    .await?;
     info!(
         "monitor: blacklisted={} ({})",
         scan_result.blacklisted.len(),
@@ -1706,14 +1770,14 @@ async fn run_monitor_command(args: &[String]) -> anyhow::Result<()> {
 
     info!("monitor: querying real taker fees for {} candidate symbols", scan_result.overlaps.len());
     let binance_info_ref = &binance_info;
-    let kraken_info_ref = &kraken_info;
+    let secondary_info_ref = secondary_info.as_ref();
     let fee_results: Vec<(String, Symbol, anyhow::Result<(TradingFee, TradingFee)>)> =
         stream::iter(scan_result.overlaps)
             .map(|overlap| async move {
                 let binance_symbol = Symbol::new(overlap.coin.clone(), "USDT");
                 let result = tokio::try_join!(
                     binance_info_ref.spot_trading_fee(&binance_symbol),
-                    kraken_info_ref.spot_trading_fee(&overlap.kraken_spot_symbol)
+                    secondary_info_ref.spot_trading_fee(&overlap.secondary_spot_symbol)
                 );
                 (overlap.coin, binance_symbol, result)
             })
@@ -1727,15 +1791,15 @@ async fn run_monitor_command(args: &[String]) -> anyhow::Result<()> {
     let mut skipped = Vec::new();
     for (coin, symbol, result) in fee_results {
         match result {
-            Ok((binance_fee, kraken_fee)) => {
+            Ok((binance_fee, secondary_fee)) => {
                 let binance_effective_bps = binance_fee.taker_bps * binance_fee_discount;
                 let fees: HashMap<Venue, FeeSchedule> = HashMap::from([
                     (Venue::new("binance_spot"), FeeSchedule::new(binance_effective_bps)),
-                    (Venue::new("kraken"), FeeSchedule::new(kraken_fee.taker_bps)),
+                    (Venue::new(secondary.as_str()), FeeSchedule::new(secondary_fee.taker_bps)),
                 ]);
                 monitored_summary.push(format!(
-                    "{coin:<10}  binance_taker_bps={} x{binance_fee_discount}={binance_effective_bps}  kraken_taker_bps={}",
-                    binance_fee.taker_bps, kraken_fee.taker_bps
+                    "{coin:<10}  binance_taker_bps={} x{binance_fee_discount}={binance_effective_bps}  {secondary}_taker_bps={}",
+                    binance_fee.taker_bps, secondary_fee.taker_bps
                 ));
                 symbols.push(symbol.clone());
                 coin_fees.push((coin, symbol, fees));
@@ -1770,14 +1834,16 @@ async fn run_monitor_command(args: &[String]) -> anyhow::Result<()> {
 
     // 每条参与价差计算的 venue 链路额外订阅一个心跳探针交易对：只要在
     // link_health_window_ms 内持续收到它的报价推送，就认为该链路健康。见
-    // `LinkHealthMonitor`。探针币种按 venue 分别指定——kraken 用 BTC/USD
-    // (kraken 的原生报价币种)，binance 沿用 BTC/USDT。
+    // `LinkHealthMonitor`。探针币种按 venue 分别指定——副交易所目前只有
+    // Kraken，用它的原生报价币种 BTC/USD，binance 沿用 BTC/USDT。
     let binance_venue = Venue::new("binance_spot");
-    let kraken_venue = Venue::new("kraken");
+    let secondary_venue = Venue::new(secondary.as_str());
     let binance_probe = Symbol::new("BTC", "USDT");
-    let kraken_probe = Symbol::new("BTC", "USD");
-    let probe_symbols =
-        HashMap::from([(binance_venue.clone(), binance_probe.clone()), (kraken_venue.clone(), kraken_probe.clone())]);
+    let secondary_probe = secondary_probe_symbol(&secondary);
+    let probe_symbols = HashMap::from([
+        (binance_venue.clone(), binance_probe.clone()),
+        (secondary_venue.clone(), secondary_probe.clone()),
+    ]);
     let link_health = Arc::new(LinkHealthMonitor::new(probe_symbols, link_health_window_ms));
     let mut source_handles = Vec::new();
     source_handles.push(link_health.clone().spawn(bus.clone()));
@@ -1818,9 +1884,9 @@ async fn run_monitor_command(args: &[String]) -> anyhow::Result<()> {
         proxy.clone(),
     ));
     source_handles.push(binance_source.spawn(bus.clone()));
-    let kraken_source: Box<dyn MarketDataSource> =
-        Box::new(KrakenSpotSource::new(kraken_venue, with_probe(&kraken_probe), proxy.clone()));
-    source_handles.push(kraken_source.spawn(bus.clone()));
+    let secondary_source =
+        build_secondary_market_data_source(&secondary, secondary_venue, with_probe(&secondary_probe), proxy.clone())?;
+    source_handles.push(secondary_source.spawn(bus.clone()));
 
     if !no_portfolio {
         let redis_url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379/".to_string());
@@ -1828,10 +1894,10 @@ async fn run_monitor_command(args: &[String]) -> anyhow::Result<()> {
 
         let futures_venue = Venue::new("binance_futures");
 
-        // 独立的行情缓存：订阅三条腿(现货/期货/kraken)的最新价格，喂给
+        // 独立的行情缓存：订阅三条腿(现货/期货/副交易所)的最新价格，喂给
         // `PortfolioManager::quote_cache` 做 mark-to-market 估值，
         // 参见 `MarketDataCache` 文档。
-        let quote_topics: Vec<Topic> = [Venue::new("binance_spot"), Venue::new("kraken"), futures_venue.clone()]
+        let quote_topics: Vec<Topic> = [Venue::new("binance_spot"), Venue::new(secondary.as_str()), futures_venue.clone()]
             .into_iter()
             .flat_map(|venue| symbols.iter().map(move |symbol| Topic::quote(venue.clone(), symbol.clone())))
             .collect();

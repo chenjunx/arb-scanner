@@ -9,12 +9,11 @@ use crate::exchange_info::types::SpotPerpPair;
 use crate::types::Symbol;
 use crate::wallet::WalletProvider;
 use crate::wallet::binance::BinanceWalletProvider;
-use crate::wallet::kraken::KrakenWalletProvider;
 use crate::wallet::types::AssetInfo;
 
 /// 一个通过粗筛的候选币种：币安有 USDT 现货+永续(用
 /// [`BinanceExchangeInfoProvider::spot_perpetual_pairs`] 配好对，已经处理了
-/// "1000PEPE" 这类合约乘数前缀)、Kraken 有 USDT 现货，且是同一个币种。是否
+/// "1000PEPE" 这类合约乘数前缀)、副交易所有 USDT 现货，且是同一个币种。是否
 /// 真的"有交集"还要看 [`common_chains`]。
 #[derive(Debug, Clone, PartialEq)]
 struct Candidate {
@@ -22,7 +21,7 @@ struct Candidate {
     coin: String,
     /// 币安永续 symbol，用来对冲(如 "1000PEPE/USDT")。
     binance_symbol: Symbol,
-    kraken_symbol: Symbol,
+    secondary_symbol: Symbol,
 }
 
 /// 两个交易所都能交易、且共享至少一条可转账链的币种基本信息。
@@ -30,7 +29,7 @@ struct Candidate {
 pub struct SymbolOverlap {
     pub coin: String,
     pub binance_perp_symbol: Symbol,
-    pub kraken_spot_symbol: Symbol,
+    pub secondary_spot_symbol: Symbol,
     /// 两边钱包信息里都支持的标准链名，已排序。
     pub common_chains: Vec<String>,
 }
@@ -45,14 +44,14 @@ pub struct SkippedCandidate {
 }
 
 /// `find_overlap` 的完整结果：除了最终的交集表，也带上两边各自的完整币种列表
-/// (`scan` 打印时要展示"币安都有哪些能用永续对冲的现货币"/"Kraken 都有哪些
+/// (`scan` 打印时要展示"币安都有哪些能用永续对冲的现货币"/"副交易所都有哪些
 /// USDT 现货"，避免调用方为了拿这两份列表再多发一次网络请求)。
 pub struct ScanResult {
     /// 币安 USDT 现货里，同一币种在币安还有 USDT 永续合约(可以用来对冲)的那些
     /// symbol——实际开仓买的是现货，永续只是用来对冲，所以这里展示的是现货
     /// symbol 而不是永续 symbol。来自 [`BinanceExchangeInfoProvider::spot_perpetual_pairs`]。
     pub binance_spot_symbols: Vec<Symbol>,
-    pub kraken_spot_symbols: Vec<Symbol>,
+    pub secondary_spot_symbols: Vec<Symbol>,
     pub overlaps: Vec<SymbolOverlap>,
     /// 两边都有挂牌、但在求交集过程中被跳过的候选币种(钱包信息查询失败/两边
     /// 都没有共同链等)，附带原因，按币名排序。
@@ -74,38 +73,38 @@ fn partition_blacklisted(candidates: Vec<Candidate>, blacklist: &[String]) -> (V
     (kept, blacklisted)
 }
 
-/// 从币安现货/永续配对列表和 Kraken USDT 现货列表算出候选币种。用币安现货
-/// base 去匹配 Kraken(而不是永续 base)，因为像 "1000PEPE" 这样带合约乘数
-/// 前缀的永续 symbol 在 Kraken 上不存在对应 base，`spot_perpetual_pairs` 已经
-/// 把它还原成真实币种 "PEPE"。Kraken 一侧的命名已经在
-/// `exchange_info::kraken::usdt_spot_symbols` 里翻译过标准(币安)命名，这里
+/// 从币安现货/永续配对列表和副交易所 USDT 现货列表算出候选币种。用币安现货
+/// base 去匹配副交易所(而不是永续 base)，因为像 "1000PEPE" 这样带合约乘数
+/// 前缀的永续 symbol 在副交易所上不存在对应 base，`spot_perpetual_pairs` 已经
+/// 把它还原成真实币种 "PEPE"。副交易所一侧的命名已经在各自的
+/// `exchange_info::*::usdt_spot_symbols` 实现里翻译过标准(币安)命名，这里
 /// 只需要大小写不敏感的精确匹配。
-fn build_candidates(binance_pairs: &[SpotPerpPair], kraken_spot: &[Symbol]) -> Vec<Candidate> {
-    let kraken_by_coin: HashMap<String, &Symbol> =
-        kraken_spot.iter().map(|s| (s.base.to_ascii_uppercase(), s)).collect();
+fn build_candidates(binance_pairs: &[SpotPerpPair], secondary_spot: &[Symbol]) -> Vec<Candidate> {
+    let secondary_by_coin: HashMap<String, &Symbol> =
+        secondary_spot.iter().map(|s| (s.base.to_ascii_uppercase(), s)).collect();
 
     binance_pairs
         .iter()
         .filter_map(|pair| {
             let coin = pair.spot_symbol.base.to_ascii_uppercase();
-            let kraken_symbol = kraken_by_coin.get(&coin)?;
+            let secondary_symbol = secondary_by_coin.get(&coin)?;
             Some(Candidate {
                 coin,
                 binance_symbol: pair.perp_symbol.clone(),
-                kraken_symbol: (*kraken_symbol).clone(),
+                secondary_symbol: (*secondary_symbol).clone(),
             })
         })
         .collect()
 }
 
 /// 求两份钱包资产信息里标准链名(`ChainInfo::network`)的交集，已排序。
-fn common_chains(binance: &AssetInfo, kraken: &AssetInfo) -> Vec<String> {
+fn common_chains(binance: &AssetInfo, secondary: &AssetInfo) -> Vec<String> {
     let binance_networks: HashSet<String> = binance
         .networks
         .iter()
         .map(|n| n.network.to_ascii_uppercase())
         .collect();
-    let mut chains: Vec<String> = kraken
+    let mut chains: Vec<String> = secondary
         .networks
         .iter()
         .map(|n| n.network.to_ascii_uppercase())
@@ -117,36 +116,36 @@ fn common_chains(binance: &AssetInfo, kraken: &AssetInfo) -> Vec<String> {
     chains
 }
 
-/// Kraken 私有钱包接口(`DepositMethods`)的并发上限，避免对候选币逐个查询时
-/// 触发 Kraken 的限流。
-const KRAKEN_WALLET_CONCURRENCY: usize = 4;
+/// 副交易所私有钱包接口的并发上限，避免对候选币逐个查询时触发对方的限流。
+const SECONDARY_WALLET_CONCURRENCY: usize = 4;
 
-/// 算出 Binance / Kraken 有交集的币种：币安有 USDT 永续合约、Kraken 有 USDT 现货、
-/// 且两边钱包信息里至少共享一条标准链(可转账)。交集结果按币名排序。
+/// 算出 Binance / 副交易所有交集的币种：币安有 USDT 永续合约、副交易所有 USDT
+/// 现货、且两边钱包信息里至少共享一条标准链(可转账)。交集结果按币名排序。
 pub async fn find_overlap(
     binance_info: &BinanceExchangeInfoProvider,
-    kraken_info: &dyn ExchangeInfoProvider,
+    secondary_info: &dyn ExchangeInfoProvider,
     binance_wallet: &BinanceWalletProvider,
-    kraken_wallet: &KrakenWalletProvider,
+    secondary_wallet: &dyn WalletProvider,
     blacklist: &[String],
 ) -> anyhow::Result<ScanResult> {
-    let (binance_pairs, kraken_spot) =
-        tokio::try_join!(binance_info.spot_perpetual_pairs(), kraken_info.usdt_spot_symbols())?;
+    let (binance_pairs, secondary_spot) =
+        tokio::try_join!(binance_info.spot_perpetual_pairs(), secondary_info.usdt_spot_symbols())?;
     let mut binance_hedgeable_spot: Vec<Symbol> = binance_pairs.iter().map(|p| p.spot_symbol.clone()).collect();
     binance_hedgeable_spot.sort_by(|a, b| a.to_string().cmp(&b.to_string()));
 
-    let (candidates, blacklisted) = partition_blacklisted(build_candidates(&binance_pairs, &kraken_spot), blacklist);
+    let (candidates, blacklisted) =
+        partition_blacklisted(build_candidates(&binance_pairs, &secondary_spot), blacklist);
     log::info!(
-        "scan: binance_spot_perp_pairs={} kraken_spot_symbols={} candidates={} blacklisted={}",
+        "scan: binance_spot_perp_pairs={} secondary_spot_symbols={} candidates={} blacklisted={}",
         binance_pairs.len(),
-        kraken_spot.len(),
+        secondary_spot.len(),
         candidates.len(),
         blacklisted.len()
     );
     if candidates.is_empty() {
         return Ok(ScanResult {
             binance_spot_symbols: binance_hedgeable_spot,
-            kraken_spot_symbols: kraken_spot,
+            secondary_spot_symbols: secondary_spot,
             overlaps: Vec::new(),
             skipped: Vec::new(),
             blacklisted,
@@ -160,44 +159,44 @@ pub async fn find_overlap(
         .map(|a| (a.asset.to_ascii_uppercase(), a))
         .collect();
 
-    let kraken_results: Vec<(Candidate, anyhow::Result<AssetInfo>)> = stream::iter(candidates)
+    let secondary_results: Vec<(Candidate, anyhow::Result<AssetInfo>)> = stream::iter(candidates)
         .map(|candidate| async move {
-            let result = kraken_wallet.asset_info(&candidate.kraken_symbol.base).await;
+            let result = secondary_wallet.asset_info(&candidate.secondary_symbol.base).await;
             (candidate, result)
         })
-        .buffer_unordered(KRAKEN_WALLET_CONCURRENCY)
+        .buffer_unordered(SECONDARY_WALLET_CONCURRENCY)
         .collect()
         .await;
 
     let mut overlaps = Vec::new();
     let mut skipped = Vec::new();
-    for (candidate, kraken_asset) in kraken_results {
+    for (candidate, secondary_asset) in secondary_results {
         let Some(binance_asset) = binance_assets.get(&candidate.coin) else {
             let reason = "not found in binance wallet asset list".to_string();
             log::warn!("scan: {} {reason}, skipping", candidate.coin);
             skipped.push(SkippedCandidate { coin: candidate.coin, reason });
             continue;
         };
-        let kraken_asset = match kraken_asset {
+        let secondary_asset = match secondary_asset {
             Ok(info) => info,
             Err(err) => {
-                let reason = format!("failed to fetch kraken wallet asset info: {err:#}");
+                let reason = format!("failed to fetch secondary wallet asset info: {err:#}");
                 log::warn!("scan: {} {reason}", candidate.coin);
                 skipped.push(SkippedCandidate { coin: candidate.coin, reason });
                 continue;
             }
         };
 
-        let chains = common_chains(binance_asset, &kraken_asset);
+        let chains = common_chains(binance_asset, &secondary_asset);
         if chains.is_empty() {
             let binance_chains: Vec<String> =
                 binance_asset.networks.iter().map(|n| n.network.to_ascii_uppercase()).collect();
-            let kraken_chains: Vec<String> =
-                kraken_asset.networks.iter().map(|n| n.network.to_ascii_uppercase()).collect();
+            let secondary_chains: Vec<String> =
+                secondary_asset.networks.iter().map(|n| n.network.to_ascii_uppercase()).collect();
             let reason = format!(
-                "no common chain, binance=[{}] kraken=[{}]",
+                "no common chain, binance=[{}] secondary=[{}]",
                 binance_chains.join(","),
-                kraken_chains.join(",")
+                secondary_chains.join(",")
             );
             log::warn!("scan: {} {reason}", candidate.coin);
             skipped.push(SkippedCandidate { coin: candidate.coin, reason });
@@ -206,7 +205,7 @@ pub async fn find_overlap(
         overlaps.push(SymbolOverlap {
             coin: candidate.coin,
             binance_perp_symbol: candidate.binance_symbol,
-            kraken_spot_symbol: candidate.kraken_symbol,
+            secondary_spot_symbol: candidate.secondary_symbol,
             common_chains: chains,
         });
     }
@@ -215,14 +214,14 @@ pub async fn find_overlap(
     skipped.sort_by(|a, b| a.coin.cmp(&b.coin));
     Ok(ScanResult {
         binance_spot_symbols: binance_hedgeable_spot,
-        kraken_spot_symbols: kraken_spot,
+        secondary_spot_symbols: secondary_spot,
         overlaps,
         skipped,
         blacklisted,
     })
 }
 
-/// 把一组 symbol 排版成多列、左对齐的清单，供 `scan` 打印币安/Kraken 各自的
+/// 把一组 symbol 排版成多列、左对齐的清单，供 `scan` 打印币安/副交易所各自的
 /// 完整币种列表。按 symbol 的展示字符串排序，固定每行 `COLUMNS` 列。
 pub fn format_symbol_list(symbols: &[Symbol]) -> String {
     const COLUMNS: usize = 6;
@@ -258,25 +257,25 @@ pub fn format_overlap_table(rows: &[SymbolOverlap]) -> String {
         .max()
         .unwrap_or(12)
         .max(12);
-    let kraken_width = rows
+    let secondary_width = rows
         .iter()
-        .map(|r| r.kraken_spot_symbol.to_string().len())
+        .map(|r| r.secondary_spot_symbol.to_string().len())
         .max()
         .unwrap_or(11)
         .max(11);
 
     let header = format!(
-        "{:<coin_width$}  {:<binance_width$}  {:<kraken_width$}  COMMON_CHAINS",
-        "COIN", "BINANCE_PERP", "KRAKEN_SPOT"
+        "{:<coin_width$}  {:<binance_width$}  {:<secondary_width$}  COMMON_CHAINS",
+        "COIN", "BINANCE_PERP", "SECONDARY_SPOT"
     );
     let separator = "-".repeat(header.len());
     let mut out = format!("{header}\n{separator}\n");
     for row in rows {
         out.push_str(&format!(
-            "{:<coin_width$}  {:<binance_width$}  {:<kraken_width$}  {}\n",
+            "{:<coin_width$}  {:<binance_width$}  {:<secondary_width$}  {}\n",
             row.coin,
             row.binance_perp_symbol.to_string(),
-            row.kraken_spot_symbol.to_string(),
+            row.secondary_spot_symbol.to_string(),
             row.common_chains.join(",")
         ));
     }
@@ -322,11 +321,11 @@ mod tests {
     #[test]
     fn build_candidates_matches_case_insensitively() {
         let binance_pairs = vec![pair("BTC", "BTC"), pair("ETH", "ETH")];
-        let kraken_spot = vec![Symbol::new("btc", "USDT")];
-        let candidates = build_candidates(&binance_pairs, &kraken_spot);
+        let secondary_spot = vec![Symbol::new("btc", "USDT")];
+        let candidates = build_candidates(&binance_pairs, &secondary_spot);
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].coin, "BTC");
-        assert_eq!(candidates[0].kraken_symbol, Symbol::new("btc", "USDT"));
+        assert_eq!(candidates[0].secondary_symbol, Symbol::new("btc", "USDT"));
     }
 
     #[test]
@@ -336,8 +335,8 @@ mod tests {
             perp_symbol: Symbol::new("1000PEPE", "USDT"),
             contract_multiplier: 1000,
         }];
-        let kraken_spot = vec![Symbol::new("PEPE", "USDT")];
-        let candidates = build_candidates(&binance_pairs, &kraken_spot);
+        let secondary_spot = vec![Symbol::new("PEPE", "USDT")];
+        let candidates = build_candidates(&binance_pairs, &secondary_spot);
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].coin, "PEPE");
         assert_eq!(candidates[0].binance_symbol, Symbol::new("1000PEPE", "USDT"));
@@ -346,15 +345,15 @@ mod tests {
     #[test]
     fn build_candidates_excludes_symbols_missing_on_either_side() {
         let binance_pairs = vec![pair("SOL", "SOL")];
-        let kraken_spot = vec![Symbol::new("ADA", "USDT")];
-        assert!(build_candidates(&binance_pairs, &kraken_spot).is_empty());
+        let secondary_spot = vec![Symbol::new("ADA", "USDT")];
+        assert!(build_candidates(&binance_pairs, &secondary_spot).is_empty());
     }
 
     fn candidate(coin: &str) -> Candidate {
         Candidate {
             coin: coin.to_string(),
             binance_symbol: Symbol::new(coin, "USDT"),
-            kraken_symbol: Symbol::new(coin, "USDT"),
+            secondary_symbol: Symbol::new(coin, "USDT"),
         }
     }
 
@@ -395,11 +394,11 @@ mod tests {
             asset: "BTC".to_string(),
             networks: vec![chain("BTC"), chain("BSC")],
         };
-        let kraken = AssetInfo {
+        let secondary = AssetInfo {
             asset: "XBT".to_string(),
             networks: vec![chain("BSC"), chain("BTC"), chain("ETH")],
         };
-        assert_eq!(common_chains(&binance, &kraken), vec!["BSC".to_string(), "BTC".to_string()]);
+        assert_eq!(common_chains(&binance, &secondary), vec!["BSC".to_string(), "BTC".to_string()]);
     }
 
     #[test]
@@ -408,11 +407,11 @@ mod tests {
             asset: "FOO".to_string(),
             networks: vec![chain("ETH")],
         };
-        let kraken = AssetInfo {
+        let secondary = AssetInfo {
             asset: "FOO".to_string(),
             networks: vec![chain("SOL")],
         };
-        assert!(common_chains(&binance, &kraken).is_empty());
+        assert!(common_chains(&binance, &secondary).is_empty());
     }
 
     #[test]
@@ -448,7 +447,7 @@ mod tests {
     fn format_skipped_list_includes_coin_and_reason() {
         let skipped = vec![SkippedCandidate {
             coin: "ETH".to_string(),
-            reason: "no common chain, binance=[ETH] kraken=[]".to_string(),
+            reason: "no common chain, binance=[ETH] secondary=[]".to_string(),
         }];
         let list = format_skipped_list(&skipped);
         assert!(list.contains("ETH"));
@@ -460,7 +459,7 @@ mod tests {
         let rows = vec![SymbolOverlap {
             coin: "BTC".to_string(),
             binance_perp_symbol: Symbol::new("BTC", "USDT"),
-            kraken_spot_symbol: Symbol::new("BTC", "USDT"),
+            secondary_spot_symbol: Symbol::new("BTC", "USDT"),
             common_chains: vec!["BSC".to_string(), "BTC".to_string()],
         }];
         let table = format_overlap_table(&rows);
