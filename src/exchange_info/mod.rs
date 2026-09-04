@@ -3,6 +3,7 @@ pub mod cache;
 pub mod coinex;
 pub mod gate;
 pub mod kraken;
+pub mod nonkyc;
 pub mod types;
 
 use async_trait::async_trait;

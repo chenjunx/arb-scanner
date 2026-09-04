@@ -17,6 +17,7 @@ use arb_scanner::exchange_info::ExchangeInfoProvider;
 use arb_scanner::exchange_info::PrecisionCache;
 use arb_scanner::exchange_info::binance::BinanceExchangeInfoProvider;
 use arb_scanner::exchange_info::coinex::CoinexExchangeInfoProvider;
+use arb_scanner::exchange_info::nonkyc::NonkycExchangeInfoProvider;
 use arb_scanner::exchange_info::kraken::KrakenExchangeInfoProvider;
 use arb_scanner::exchange_info::types::{PrecisionKind, TradingFee};
 use arb_scanner::logging;
@@ -62,6 +63,7 @@ use arb_scanner::types::{Quote, Symbol, Venue};
 use arb_scanner::wallet::WalletProvider;
 use arb_scanner::wallet::binance::BinanceWalletProvider;
 use arb_scanner::wallet::coinex::CoinexWalletProvider;
+use arb_scanner::wallet::nonkyc::NonkycWalletProvider;
 use arb_scanner::wallet::kraken::KrakenWalletProvider;
 use arb_scanner::wallet::transfer::{TransferHalfParams, TransferParams, transfer_asset, transfer_half_to_kraken};
 use arb_scanner::wallet::transfer_monitor::TransferMonitor;
@@ -1557,7 +1559,8 @@ fn build_secondary_exchange_info(name: &str, proxy: Option<&str>) -> anyhow::Res
     match name {
         "kraken" => Ok(Box::new(KrakenExchangeInfoProvider::from_env(Venue::new(name), proxy)?)),
         "coinex" => Ok(Box::new(CoinexExchangeInfoProvider::from_env(Venue::new(name), proxy)?)),
-        other => anyhow::bail!("unknown --secondary venue '{other}', only 'kraken'/'coinex' are currently supported"),
+        "nonkyc" => Ok(Box::new(NonkycExchangeInfoProvider::from_env(Venue::new(name), proxy)?)),
+        other => anyhow::bail!("unknown --secondary venue '{other}', only 'kraken'/'coinex'/'nonkyc' are currently supported"),
     }
 }
 
@@ -1567,7 +1570,8 @@ fn build_secondary_wallet_provider(name: &str, proxy: Option<&str>) -> anyhow::R
     match name {
         "kraken" => Ok(Box::new(KrakenWalletProvider::from_env(Venue::new(name), proxy)?)),
         "coinex" => Ok(Box::new(CoinexWalletProvider::from_env(Venue::new(name), proxy)?)),
-        other => anyhow::bail!("unknown --secondary venue '{other}', only 'kraken'/'coinex' are currently supported"),
+        "nonkyc" => Ok(Box::new(NonkycWalletProvider::from_env(Venue::new(name), proxy)?)),
+        other => anyhow::bail!("unknown --secondary venue '{other}', only 'kraken'/'coinex'/'nonkyc' are currently supported"),
     }
 }
 

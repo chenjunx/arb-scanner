@@ -1,6 +1,7 @@
 pub mod binance;
 pub mod coinex;
 pub mod kraken;
+pub mod nonkyc;
 pub mod transfer;
 pub mod transfer_monitor;
 pub mod types;
