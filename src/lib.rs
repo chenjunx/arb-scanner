@@ -1,4 +1,5 @@
 pub mod accounting;
+pub mod cli;
 pub mod config;
 pub mod engine;
 pub mod exchange_info;
