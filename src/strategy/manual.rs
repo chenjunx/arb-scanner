@@ -45,10 +45,6 @@ impl Strategy for ManualStrategy {
         "manual"
     }
 
-    fn subscriptions(&self) -> Vec<Topic> {
-        Vec::new()
-    }
-
     fn on_quote(&self, _topic: &Topic, _quote: &Quote) {}
 
     fn bus(&self) -> &Arc<TopicBus> {

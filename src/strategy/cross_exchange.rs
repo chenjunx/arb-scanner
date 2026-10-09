@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use async_trait::async_trait;
 use log::{error, info, warn};
 use rust_decimal::Decimal;
 
@@ -15,7 +16,7 @@ use crate::order_manager::types::{OrderEvent, OrderId};
 use crate::topic::{Topic, TopicBus};
 use crate::types::{Quote, Symbol, Venue};
 
-use super::{FeeSchedule, Opportunity, OpportunityKind, Strategy};
+use super::{FeeSchedule, Opportunity, OpportunityKind, Strategy, StrategySubscriber};
 
 /// 跨交易所下单执行所需的全部依赖打包。`secondary_venue`/`binance_venue` 是
 /// `on_quote` 里用来匹配价差机会的行情 venue 名；`secondary_trade_venue`/
@@ -115,7 +116,7 @@ impl CrossExchangeStrategy {
         self
     }
 
-    /// `subscriptions()` 就是从 `fees` 派生出来的，所以这里查不到只可能是调用方
+    /// `init` 订阅的行情就是从 `fees` 派生出来的，所以这里查不到只可能是调用方
     /// 传入的行情不是自己订阅范围内的——修 bug 而不是兜底掩盖它。
     fn fee_for(&self, venue: &Venue) -> FeeSchedule {
         self.fees
@@ -158,20 +159,19 @@ fn log_opportunity(opportunity: &Opportunity) {
     );
 }
 
+#[async_trait]
 impl Strategy for CrossExchangeStrategy {
     fn name(&self) -> &str {
         "cross_exchange"
     }
 
-    fn subscriptions(&self) -> Vec<Topic> {
-        self.fees
-            .keys()
-            .flat_map(|venue| {
-                self.symbols
-                    .iter()
-                    .map(move |symbol| Topic::quote(venue.clone(), symbol.clone()))
-            })
-            .collect()
+    async fn init(&self, subscriber: &mut StrategySubscriber) -> anyhow::Result<()> {
+        subscriber.subscribe_quotes(self.fees.keys().flat_map(|venue| {
+            self.symbols
+                .iter()
+                .map(move |symbol| Topic::quote(venue.clone(), symbol.clone()))
+        }));
+        Ok(())
     }
 
     fn bus(&self) -> &Arc<TopicBus> {
@@ -578,20 +578,22 @@ mod tests {
         venues.iter().map(|v| ((*v).clone(), FeeSchedule::new(0))).collect()
     }
 
-    #[test]
-    fn subscriptions_only_cover_configured_venues_and_symbols() {
+    #[tokio::test]
+    async fn init_subscribes_only_configured_venues_and_symbols() {
         let watched = Symbol::new("BTC", "USDT");
         let venue_a = Venue::new("a");
+        let bus = Arc::new(TopicBus::new());
         let strategy = CrossExchangeStrategy::new(
             vec![watched.clone()],
             fees_for(&[&venue_a]),
             Decimal::ZERO,
             Arc::new(LinkHealthMonitor::always_healthy()),
-            Arc::new(TopicBus::new()),
+            bus.clone(),
         );
 
-        let subs = strategy.subscriptions();
-        assert_eq!(subs, vec![Topic::quote(venue_a, watched)]);
+        let mut subscriber = StrategySubscriber::new(bus);
+        strategy.init(&mut subscriber).await.expect("init should succeed");
+        assert_eq!(subscriber.topics(), &[Topic::quote(venue_a, watched)]);
     }
 
     #[test]

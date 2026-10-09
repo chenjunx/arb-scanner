@@ -46,6 +46,11 @@ impl PrecisionCache {
         Ok(self.qty_precision(symbol, kind)?.min_qty)
     }
 
+    /// 查询该 symbol、该下单方式的下单量步进。
+    pub fn qty_step(&self, symbol: &Symbol, kind: PrecisionKind) -> anyhow::Result<Decimal> {
+        Ok(self.qty_precision(symbol, kind)?.qty_step)
+    }
+
     /// 把下单数量向下抹到该 symbol、该下单方式合法的步进，并校验不低于
     /// min_qty(否则报错，调用方不需要自己再判断一次)。
     pub fn round_qty(&self, symbol: &Symbol, kind: PrecisionKind, qty: Decimal) -> anyhow::Result<Decimal> {

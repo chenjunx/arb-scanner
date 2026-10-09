@@ -300,7 +300,7 @@ pub async fn run(args: MonitorArgs) -> anyhow::Result<()> {
     }
 
     info!("monitor: engine starting");
-    engine.run(bus).await;
+    engine.run(bus).await?;
 
     for handle in source_handles {
         let _ = handle.await;

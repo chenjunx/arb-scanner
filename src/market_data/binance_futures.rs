@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
+use async_trait::async_trait;
 use futures_util::StreamExt;
 use log::{debug, warn};
 use rust_decimal::Decimal;
@@ -15,12 +16,14 @@ use crate::net::connect_tcp;
 use crate::topic::{Topic, TopicBus};
 use crate::types::{Quote, Symbol, Venue};
 
-use super::{MarketDataSource, now_ms};
+use super::{Kline, KlineProvider, MarketDataSource, closed_hourly_klines, now_ms};
 
 const MAINNET_WS_HOST: &str = "fstream.binance.com";
 const MAINNET_WS_PORT: u16 = 443;
 const TESTNET_WS_HOST: &str = "stream.binancefuture.com";
 const TESTNET_WS_PORT: u16 = 443;
+const MAINNET_REST_HOST: &str = "https://fapi.binance.com";
+const TESTNET_REST_HOST: &str = "https://testnet.binancefuture.com";
 const MIN_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 
@@ -182,6 +185,103 @@ fn parse_book_ticker(text: &str, symbol_map: &HashMap<String, Symbol>) -> Option
     ))
 }
 
+/// 币安 U 本位永续的公开 K 线 / 24h 行情 REST 客户端，不需要签名。
+pub struct BinanceFuturesKlineClient {
+    venue: Venue,
+    host: &'static str,
+    http: reqwest::Client,
+}
+
+impl BinanceFuturesKlineClient {
+    pub fn new(venue: Venue, testnet: bool, proxy: Option<&str>) -> anyhow::Result<Self> {
+        let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(10));
+        if let Some(proxy) = proxy {
+            builder = builder.proxy(reqwest::Proxy::all(format!("http://{proxy}")).context("invalid proxy address")?);
+        }
+        let http = builder.build().context("failed to build binance futures http client")?;
+        let host = if testnet { TESTNET_REST_HOST } else { MAINNET_REST_HOST };
+        Ok(Self { venue, host, http })
+    }
+
+    async fn public_get(&self, path: &str, query: &[(&str, String)]) -> anyhow::Result<String> {
+        crate::ratelimit::throttle(self.host).await;
+        let resp = self
+            .http
+            .get(format!("{}{path}", self.host))
+            .query(query)
+            .send()
+            .await
+            .with_context(|| format!("binance futures request {path} failed"))?;
+        resp.text().await.context("failed to read binance futures response body")
+    }
+}
+
+#[async_trait]
+impl KlineProvider for BinanceFuturesKlineClient {
+    fn venue(&self) -> Venue {
+        self.venue.clone()
+    }
+
+    /// `GET /fapi/v1/klines` 按开盘时间升序返回，最后一根是当前未收盘的小时，
+    /// 所以多要 1 根再剔除。
+    async fn hourly_klines(&self, symbol: &Symbol, limit: usize) -> anyhow::Result<Vec<Kline>> {
+        let query = [
+            ("symbol", BinanceFuturesSource::binance_symbol(symbol)),
+            ("interval", "1h".to_string()),
+            ("limit", (limit + 1).min(1500).to_string()),
+        ];
+        let text = self.public_get("/fapi/v1/klines", &query).await?;
+        Ok(closed_hourly_klines(parse_klines(&text)?, now_ms(), limit))
+    }
+
+    async fn quote_volume_24h(&self, symbol: &Symbol) -> anyhow::Result<Decimal> {
+        let query = [("symbol", BinanceFuturesSource::binance_symbol(symbol))];
+        let text = self.public_get("/fapi/v1/ticker/24hr", &query).await?;
+        parse_quote_volume(&text)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct RestErrorResponse {
+    code: i64,
+    msg: String,
+}
+
+/// 每根 K 线是数组 `[openTimeMs, "open", "high", "low", "close", "volume", closeTimeMs, ...]`。
+fn parse_klines(text: &str) -> anyhow::Result<Vec<Kline>> {
+    if let Ok(err) = serde_json::from_str::<RestErrorResponse>(text) {
+        anyhow::bail!("binance futures error {}: {}", err.code, err.msg);
+    }
+    let rows: Vec<Vec<serde_json::Value>> =
+        serde_json::from_str(text).with_context(|| format!("failed to parse binance futures klines, raw body: {text}"))?;
+    rows.into_iter()
+        .map(|row| {
+            let open_time_ms = row.first().and_then(|v| v.as_u64()).context("kline missing open time")?;
+            let close = row
+                .get(4)
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.parse::<Decimal>().ok())
+                .context("kline missing close price")?;
+            Ok(Kline { open_time_ms, close })
+        })
+        .collect()
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Ticker24h {
+    quote_volume: Decimal,
+}
+
+fn parse_quote_volume(text: &str) -> anyhow::Result<Decimal> {
+    if let Ok(err) = serde_json::from_str::<RestErrorResponse>(text) {
+        anyhow::bail!("binance futures error {}: {}", err.code, err.msg);
+    }
+    let ticker: Ticker24h =
+        serde_json::from_str(text).with_context(|| format!("failed to parse binance futures 24hr ticker, raw body: {text}"))?;
+    Ok(ticker.quote_volume)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -254,6 +354,30 @@ mod tests {
             source.stream_url(),
             "wss://fstream.binance.com:443/stream?streams=btcusdt@bookTicker/ethbtc@bookTicker"
         );
+    }
+
+    #[test]
+    fn parses_klines_open_time_and_close() {
+        let text = r#"[
+            [1791435600000,"0.004000","0.004100","0.003900","0.004036","123",1791439199999,"0.5",10,"60","0.2","0"],
+            [1791439200000,"0.004036","0.004100","0.003900","0.004050","123",1791442799999,"0.5",10,"60","0.2","0"]
+        ]"#;
+        let klines = parse_klines(text).expect("should parse");
+        assert_eq!(klines.len(), 2);
+        assert_eq!(klines[0], Kline { open_time_ms: 1791435600000, close: "0.004036".parse().unwrap() });
+        assert_eq!(klines[1].open_time_ms, 1791439200000);
+    }
+
+    #[test]
+    fn parse_klines_surfaces_error_response() {
+        let err = parse_klines(r#"{"code":-1121,"msg":"Invalid symbol."}"#).unwrap_err();
+        assert!(err.to_string().contains("Invalid symbol."));
+    }
+
+    #[test]
+    fn parses_24hr_quote_volume() {
+        let text = r#"{"symbol":"1000PEPEUSDT","volume":"1","quoteVolume":"176638409.33"}"#;
+        assert_eq!(parse_quote_volume(text).unwrap(), "176638409.33".parse::<Decimal>().unwrap());
     }
 
     #[test]

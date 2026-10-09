@@ -1,9 +1,13 @@
 pub mod cross_exchange;
+pub mod cross_funding;
 pub mod manual;
 pub mod triangular;
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
+use async_trait::async_trait;
+use futures_util::stream::select_all;
 use rust_decimal::Decimal;
 
 use crate::market_data::now_ms;
@@ -11,7 +15,7 @@ use crate::order::types::{OrderAmount, OrderSide};
 use crate::order_manager::types::{
     AnyOrderRequest, CancelRequest, OrderEvent, OrderKind, OrderRequest, TransferRequest,
 };
-use crate::topic::{Topic, TopicBus};
+use crate::topic::{BoxTopicStream, Topic, TopicBus};
 use crate::types::{Quote, Symbol, Venue};
 
 /// 某个 venue 的手续费配置，用于在计算套利收益时扣除成本。`maker_bps` 默认
@@ -80,14 +84,69 @@ pub struct Opportunity {
     pub ts_ms: u64,
 }
 
-/// 套利策略扩展点：每个策略声明自己关心的 topic 集合（`subscriptions`），
-/// `ArbitrageEngine` 为每个策略订阅对应的行情流，收到行情后调用 `on_quote` 回调。
+/// [`Strategy::init`] 里订阅行情用的句柄。每次 `subscribe_quote` 立即向
+/// `TopicBus` 订阅(之后发布的行情都会缓存下来，不会丢)，`init` 结束后由
+/// `ArbitrageEngine` 把全部订阅合并成一条流，驱动 `on_quote`。同一 topic 重复
+/// 订阅会被忽略，避免重复消费。
+pub struct StrategySubscriber {
+    bus: Arc<TopicBus>,
+    topics: Vec<Topic>,
+    seen: HashSet<Topic>,
+    quotes: Vec<BoxTopicStream<Quote>>,
+}
+
+impl StrategySubscriber {
+    pub fn new(bus: Arc<TopicBus>) -> Self {
+        Self { bus, topics: Vec::new(), seen: HashSet::new(), quotes: Vec::new() }
+    }
+
+    pub fn subscribe_quote(&mut self, topic: Topic) {
+        if !self.seen.insert(topic.clone()) {
+            return;
+        }
+        self.quotes.push(self.bus.subscribe(topic.clone()));
+        self.topics.push(topic);
+    }
+
+    pub fn subscribe_quotes(&mut self, topics: impl IntoIterator<Item = Topic>) {
+        for topic in topics {
+            self.subscribe_quote(topic);
+        }
+    }
+
+    /// 已订阅的行情 topic，按订阅顺序排列。
+    pub fn topics(&self) -> &[Topic] {
+        &self.topics
+    }
+
+    /// 合并成一条行情流。一个都没订阅时是 `select_all([])`，立即结束。
+    pub fn into_quote_stream(self) -> BoxTopicStream<Quote> {
+        Box::pin(select_all(self.quotes))
+    }
+}
+
+/// 套利策略扩展点：策略在 `init` 里通过 [`StrategySubscriber`] 订阅自己关心的
+/// 行情，`ArbitrageEngine` 驱动这些行情流，收到行情后调用 `on_quote` 回调。
 /// 策略维护内部状态（用内部可变性如 `Mutex`/`DashMap`），发现机会时直接打日志。
+#[async_trait]
 pub trait Strategy: Send + Sync {
     fn name(&self) -> &str;
 
-    /// 声明这个策略关心哪些 topic；`ArbitrageEngine` 用它向 `TopicBus` 订阅。
-    fn subscriptions(&self) -> Vec<Topic>;
+    /// 启动初始化：`ArbitrageEngine::run` 在进入事件循环之前调用一次。策略在这里
+    /// 通过 `subscriber` 订阅行情，并加载启动时需要的状态（拉取资金费率、恢复
+    /// 未完结订单、预热缓存等）。`Topic::order_event(self.name())` 由引擎在调用
+    /// `init` 之前自动订阅，策略不用自己订阅。
+    ///
+    /// 订阅是即时生效的，`init` 期间到达的订单事件/已订阅的行情会在事件循环开始
+    /// 后依次送到 `on_order_event`/`on_quote`，不会丢；但 `init` 耗时过长时行情
+    /// 可能因 broadcast 缓冲写满而被跳过(`Lagged`)，所以耗时操作尽量放在订阅之前。
+    ///
+    /// 返回 `Err` 时整个引擎不启动（`run` 直接返回该错误），避免带着半初始化的
+    /// 状态上线交易。默认什么都不订阅、什么都不做。
+    async fn init(&self, subscriber: &mut StrategySubscriber) -> anyhow::Result<()> {
+        let _ = subscriber;
+        Ok(())
+    }
 
     /// 行情回调：收到订阅的 topic 行情时被调用。策略内部维护状态，发现机会时打日志。
     fn on_quote(&self, topic: &Topic, quote: &Quote);

@@ -7,8 +7,8 @@ use serde::de::DeserializeOwned;
 use crate::market_data::now_ms;
 use crate::types::{Symbol, Venue};
 
-use super::ExchangeInfoProvider;
-use super::types::{MarketPrecision, QtyPrecision, TradingFee};
+use super::types::{FundingRateRecord, MarketPrecision, PredictedFundingRate, QtyPrecision, TradingFee};
+use super::{ExchangeInfoProvider, FundingRateProvider};
 
 const HOST: &str = "https://api.coinex.com";
 const API_PREFIX: &str = "/v2";
@@ -22,6 +22,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 /// 接入成现货副交易所，不为它另外接入合约端点——`perpetual_trading_fee`
 /// 直接报错、`usdt_perpetual_symbols`/`perpetual_market_precisions` 返回空
 /// Vec，和 `exchange_info::gate` 对没有接入合约场景的既有约定一致，不是 bug。
+/// 资金费率是公开数据，不依赖合约下单接入，照常实现 [`FundingRateProvider`]。
 pub struct CoinexExchangeInfoProvider {
     venue: Venue,
     access_id: String,
@@ -124,6 +125,74 @@ impl ExchangeInfoProvider for CoinexExchangeInfoProvider {
 
     async fn perpetual_market_precisions(&self) -> anyhow::Result<Vec<MarketPrecision>> {
         Ok(Vec::new())
+    }
+}
+
+/// `/futures/funding-rate-history` 每页条数。实测传 1000 也能返回，但文档没写
+/// 上限，取保守值 100 按页翻。
+const FUNDING_HISTORY_PAGE_LIMIT: usize = 100;
+/// 翻页保护：100 条/页 × 200 页，8h 周期约覆盖 18 年，正常区间不会触发。
+const FUNDING_HISTORY_MAX_PAGES: u32 = 200;
+const MS_PER_HOUR: u64 = 3_600_000;
+
+#[async_trait]
+impl FundingRateProvider for CoinexExchangeInfoProvider {
+    fn venue(&self) -> Venue {
+        self.venue.clone()
+    }
+
+    /// `/futures/funding-rate-history` 按时间倒序、按 `page` 翻页(`pagination.has_next`)，
+    /// 取 `actual_funding_rate`(实际结算值，`theoretical_funding_rate` 是封顶前的理论值)。
+    async fn funding_rate_history(
+        &self,
+        symbol: &Symbol,
+        start_time_ms: u64,
+        end_time_ms: Option<u64>,
+    ) -> anyhow::Result<Vec<FundingRateRecord>> {
+        let mut records = Vec::new();
+        for page in 1..=FUNDING_HISTORY_MAX_PAGES {
+            let mut query = vec![
+                ("market".to_string(), Self::coinex_market(symbol)),
+                ("start_time".to_string(), start_time_ms.to_string()),
+                ("page".to_string(), page.to_string()),
+                ("limit".to_string(), FUNDING_HISTORY_PAGE_LIMIT.to_string()),
+            ];
+            if let Some(end) = end_time_ms {
+                query.push(("end_time".to_string(), end.to_string()));
+            }
+            let text = self.public_request("/futures/funding-rate-history", &query).await?;
+            let (page_records, has_next) = parse_funding_rate_history(&text, symbol)?;
+            let page_empty = page_records.is_empty();
+            records.extend(page_records);
+            if !has_next || page_empty {
+                break;
+            }
+        }
+        records.sort_by_key(|r| r.funding_time_ms);
+        records.dedup_by_key(|r| r.funding_time_ms);
+        Ok(records)
+    }
+
+    /// 不传时间区间时第一页就是最近 `limit` 条(倒序)。
+    async fn recent_funding_rates(&self, symbol: &Symbol, limit: usize) -> anyhow::Result<Vec<FundingRateRecord>> {
+        let query = vec![
+            ("market".to_string(), Self::coinex_market(symbol)),
+            ("page".to_string(), "1".to_string()),
+            ("limit".to_string(), limit.clamp(1, FUNDING_HISTORY_PAGE_LIMIT).to_string()),
+        ];
+        let text = self.public_request("/futures/funding-rate-history", &query).await?;
+        let (mut records, _) = parse_funding_rate_history(&text, symbol)?;
+        records.sort_by_key(|r| r.funding_time_ms);
+        Ok(records)
+    }
+
+    /// `/futures/funding-rate` 不传 market 返回全部合约。注意 CoinEx 的命名：
+    /// `latest_funding_time` 是**即将到来**的那次结算(和币安 `nextFundingTime`
+    /// 同一时刻)，`latest_funding_rate` 就是那次要结算的费率；`next_funding_*`
+    /// 是再下一期。结算周期用两者时间差推出来。
+    async fn predicted_funding_rates(&self) -> anyhow::Result<Vec<PredictedFundingRate>> {
+        let text = self.public_request("/futures/funding-rate", &[]).await?;
+        parse_predicted_funding_rates(&text)
     }
 }
 
@@ -249,6 +318,72 @@ fn parse_spot_market_precisions(text: &str) -> anyhow::Result<Vec<MarketPrecisio
         .collect())
 }
 
+#[derive(Debug, Deserialize)]
+struct FundingRateHistoryEntry {
+    funding_time: u64,
+    actual_funding_rate: Decimal,
+}
+
+#[derive(Debug, Deserialize)]
+struct Pagination {
+    #[serde(default)]
+    has_next: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct PaginatedEnvelope {
+    #[serde(default)]
+    pagination: Option<Pagination>,
+}
+
+/// 返回 `(本页记录, 是否还有下一页)`。
+fn parse_funding_rate_history(text: &str, symbol: &Symbol) -> anyhow::Result<(Vec<FundingRateRecord>, bool)> {
+    let entries: Vec<FundingRateHistoryEntry> = unwrap_data(text)?;
+    let envelope: PaginatedEnvelope = serde_json::from_str(text)
+        .with_context(|| format!("failed to parse coinex pagination, raw body: {text}"))?;
+    let has_next = envelope.pagination.is_some_and(|p| p.has_next);
+    let records = entries
+        .into_iter()
+        .map(|e| FundingRateRecord { symbol: symbol.clone(), rate: e.actual_funding_rate, funding_time_ms: e.funding_time })
+        .collect();
+    Ok((records, has_next))
+}
+
+#[derive(Debug, Deserialize)]
+struct FundingRateEntry {
+    market: String,
+    #[serde(default)]
+    latest_funding_rate: Option<Decimal>,
+    #[serde(default)]
+    latest_funding_time: Option<u64>,
+    #[serde(default)]
+    next_funding_time: Option<u64>,
+}
+
+/// 只保留 `XXXUSDT` 合约；缺字段或推不出正的结算周期的条目跳过。周期按小时
+/// 四舍五入，吸收时间戳里毫秒级的抖动。
+fn parse_predicted_funding_rates(text: &str) -> anyhow::Result<Vec<PredictedFundingRate>> {
+    let entries: Vec<FundingRateEntry> = unwrap_data(text)?;
+    Ok(entries
+        .into_iter()
+        .filter_map(|e| {
+            let base = e.market.strip_suffix("USDT").filter(|b| !b.is_empty())?;
+            let settle_time = e.latest_funding_time.filter(|t| *t > 0)?;
+            let following_time = e.next_funding_time.filter(|t| *t > settle_time)?;
+            let interval_hours = (following_time - settle_time + MS_PER_HOUR / 2) / MS_PER_HOUR;
+            if interval_hours == 0 {
+                return None;
+            }
+            Some(PredictedFundingRate {
+                symbol: Symbol::new(base, "USDT"),
+                rate: e.latest_funding_rate?,
+                next_funding_time_ms: settle_time,
+                funding_interval_hours: interval_hours as u32,
+            })
+        })
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -350,5 +485,53 @@ mod tests {
         ],"message":"OK"}"#;
         let precisions = parse_spot_market_precisions(text).expect("should parse");
         assert!(precisions.is_empty());
+    }
+
+    #[test]
+    fn parses_funding_rate_history_with_pagination_flag() {
+        let text = r#"{"code":0,"data":[
+            {"actual_funding_rate":"-0.00112381","funding_time":1789689600919,"market":"BTCUSDT","theoretical_funding_rate":"-0.00112381"},
+            {"actual_funding_rate":"0.0003","funding_time":1789660800926,"market":"BTCUSDT","theoretical_funding_rate":"0.0005"}
+        ],"message":"OK","pagination":{"has_next":true}}"#;
+        let symbol = Symbol::new("BTC", "USDT");
+        let (records, has_next) = parse_funding_rate_history(text, &symbol).expect("should parse");
+        assert!(has_next);
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].rate, "-0.00112381".parse().unwrap());
+        assert_eq!(records[1].rate, "0.0003".parse().unwrap(), "should use actual, not theoretical rate");
+        assert_eq!(records[1].funding_time_ms, 1789660800926);
+    }
+
+    #[test]
+    fn parse_funding_rate_history_treats_missing_pagination_as_last_page() {
+        let text = r#"{"code":0,"data":[],"message":"OK"}"#;
+        let (records, has_next) = parse_funding_rate_history(text, &Symbol::new("BTC", "USDT")).expect("should parse");
+        assert!(records.is_empty());
+        assert!(!has_next);
+    }
+
+    #[test]
+    fn parses_predicted_funding_rates_using_latest_fields_as_upcoming_settlement() {
+        let text = r#"{"code":0,"data":[
+            {"latest_funding_rate":"-0.00165008","latest_funding_time":1789718400000,"mark_price":"77584","market":"BTCUSDT","max_funding_rate":"0.00375","min_funding_rate":"-0.00375","next_funding_rate":"-0.00165008","next_funding_time":1789747200000},
+            {"latest_funding_rate":"0.001","latest_funding_time":1789718400000,"market":"LPTUSDT","next_funding_rate":"0.001","next_funding_time":1789732800123},
+            {"latest_funding_rate":"0.001","latest_funding_time":1789718400000,"market":"BTCUSDC","next_funding_rate":"0.001","next_funding_time":1789747200000},
+            {"latest_funding_rate":"0.001","latest_funding_time":1789718400000,"market":"BADUSDT","next_funding_rate":"0.001","next_funding_time":1789718400000}
+        ],"message":"OK"}"#;
+        let rates = parse_predicted_funding_rates(text).expect("should parse");
+        assert_eq!(rates.len(), 2);
+        assert_eq!(rates[0].symbol, Symbol::new("BTC", "USDT"));
+        assert_eq!(rates[0].rate, "-0.00165008".parse().unwrap());
+        assert_eq!(rates[0].next_funding_time_ms, 1789718400000);
+        assert_eq!(rates[0].funding_interval_hours, 8);
+        assert_eq!(rates[1].symbol, Symbol::new("LPT", "USDT"));
+        assert_eq!(rates[1].funding_interval_hours, 4);
+    }
+
+    #[test]
+    fn parse_predicted_funding_rates_surfaces_error_response() {
+        let text = r#"{"code":1,"data":null,"message":"internal error"}"#;
+        let err = parse_predicted_funding_rates(text).unwrap_err();
+        assert!(err.to_string().contains("internal error"));
     }
 }

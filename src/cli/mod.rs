@@ -6,6 +6,7 @@
 pub mod accounting;
 pub mod args;
 pub mod close;
+pub mod cross_funding;
 pub mod engine_command;
 pub mod monitor;
 pub mod open;
@@ -66,6 +67,9 @@ pub enum Command {
     /// 用交易所后台的真实持仓覆盖写 Redis 里的仓位记录
     #[command(name = "set-position")]
     SetPosition(set_position::SetPositionArgs),
+    /// 跨所永续价差开仓：价差达到 EWMA 均值 + k·σ 时两边市价开仓
+    #[command(name = "cross-funding")]
+    CrossFunding(cross_funding::CrossFundingArgs),
 }
 
 /// 解析命令行并执行。参数非法时 clap 会自己打印用法并退出进程。
@@ -85,6 +89,7 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         Some(Command::Report(args)) => report::run(args).await,
         Some(Command::ReconcileOrder(args)) => reconcile_order::run(args).await,
         Some(Command::SetPosition(args)) => set_position::run(args).await,
+        Some(Command::CrossFunding(args)) => cross_funding::run(args).await,
         None => engine_command::run(cli.config.as_deref().unwrap_or(DEFAULT_CONFIG_PATH)).await,
     }
 }

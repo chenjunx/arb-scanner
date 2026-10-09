@@ -79,6 +79,12 @@ fn bucket_config(host: &str) -> (f64, f64) {
         "https://fapi.binance.com" | "https://testnet.binancefuture.com" => (20.0, 3.0),
         "https://api.kraken.com" => (15.0, 0.33),
         "https://futures.kraken.com" => (10.0, 1.0),
+        // Gate 公开接口 200 次/10s/接口，现货下单 10 次/s；按最严的下单限额再打折。
+        "https://api.gateio.ws" => (10.0, 5.0),
+        // OKX / Bitget 下单、查单、行情接口大多是 10~20 次/s/接口，统一按 10 次/s 再打折。
+        "https://www.okx.com" | "https://api.bitget.com" => (10.0, 5.0),
+        // 币安 fundingRate/fundingInfo 共享 500 次/5 分钟：20 + 1.5*300 = 470 < 500。
+        "binance:/fapi/v1/fundingRate" => (20.0, 1.5),
         other => {
             log::warn!("ratelimit: no explicit config for host {other}, using conservative default (5 burst, 1/s)");
             (5.0, 1.0)

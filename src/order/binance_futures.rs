@@ -250,6 +250,15 @@ impl OrderProvider for BinanceFuturesOrderProvider {
         let text = resp.text().await.context("failed to read binance futures ticker price response body")?;
         parse_ticker_price(&text)
     }
+
+    /// `GET /fapi/v3/positionRisk?symbol=X`：单向持仓模式下只有一条 `BOTH`
+    /// 记录，`positionAmt` 多正空负；没有持仓时返回空数组。保险起见把所有条目
+    /// 的 `positionAmt` 加总(双向持仓模式下 LONG/SHORT 两条加总也是净持仓)。
+    async fn perp_position(&self, symbol: &Symbol) -> anyhow::Result<Decimal> {
+        let params = vec![("symbol".to_string(), binance_symbol(symbol))];
+        let text = self.signed_request(reqwest::Method::GET, "/fapi/v3/positionRisk", params).await?;
+        parse_position_risk(&text)
+    }
 }
 
 impl BinanceFuturesOrderProvider {
@@ -685,6 +694,21 @@ fn parse_user_trades_response(text: &str) -> anyhow::Result<(Option<Decimal>, Op
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PositionRiskEntry {
+    position_amt: Decimal,
+}
+
+fn parse_position_risk(text: &str) -> anyhow::Result<Decimal> {
+    if let Ok(err) = serde_json::from_str::<ErrorResponse>(text) {
+        anyhow::bail!("binance futures error {}: {}", err.code, err.msg);
+    }
+    let entries: Vec<PositionRiskEntry> = serde_json::from_str(text)
+        .with_context(|| format!("failed to parse binance futures positionRisk response, raw body: {text}"))?;
+    Ok(entries.iter().map(|e| e.position_amt).sum())
+}
+
+#[derive(Debug, Deserialize)]
 struct TickerPriceResponse {
     price: Decimal,
 }
@@ -924,6 +948,15 @@ mod tests {
         let text = r#"{"code":-1121,"msg":"Invalid symbol."}"#;
         let err = parse_user_trades_response(text).unwrap_err();
         assert!(err.to_string().contains("Invalid symbol"));
+    }
+
+    #[test]
+    fn parses_position_risk_summing_entries() {
+        let text = r#"[{"symbol":"1000PEPEUSDT","positionSide":"BOTH","positionAmt":"-12000","entryPrice":"0.004"}]"#;
+        assert_eq!(parse_position_risk(text).unwrap(), Decimal::from(-12000));
+        assert_eq!(parse_position_risk("[]").unwrap(), Decimal::ZERO);
+        let err = parse_position_risk(r#"{"code":-2015,"msg":"Invalid API-key"}"#).unwrap_err();
+        assert!(err.to_string().contains("Invalid API-key"));
     }
 
     #[test]

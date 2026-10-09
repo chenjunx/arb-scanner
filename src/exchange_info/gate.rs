@@ -5,8 +5,10 @@ use serde::Deserialize;
 
 use crate::types::{Symbol, Venue};
 
-use super::ExchangeInfoProvider;
-use super::types::{MarketPrecision, QtyPrecision, TradingFee};
+use super::types::{
+    FundingRateRecord, MarketPrecision, PerpContractSpec, PredictedFundingRate, QtyPrecision, TradingFee,
+};
+use super::{ExchangeInfoProvider, FundingRateProvider};
 
 const HOST: &str = "https://api.gateio.ws";
 const API_PREFIX: &str = "/api/v4";
@@ -26,6 +28,9 @@ fn now_secs() -> u64 {
 /// 计价现货交易对。签名方式和 `order::gate` 完全相同(REST v4 HMAC-SHA512)，
 /// 但和 Kraken 系列的既有约定一样不共享这套签名/请求辅助函数，两个文件各自
 /// 独立一份。
+///
+/// USDT 本位永续合约(`/futures/usdt/*`)的精度、合约乘数、资金费率都是公开数据，
+/// 不需要签名。
 pub struct GateExchangeInfoProvider {
     venue: Venue,
     api_key: String,
@@ -91,7 +96,7 @@ impl ExchangeInfoProvider for GateExchangeInfoProvider {
     }
 
     async fn perpetual_trading_fee(&self, _symbol: &Symbol) -> anyhow::Result<TradingFee> {
-        anyhow::bail!("gate perpetual trading fee is not supported: no perpetual contracts are wired up for gate")
+        anyhow::bail!("gate perpetual trading fee is not supported yet")
     }
 
     async fn usdt_spot_symbols(&self) -> anyhow::Result<Vec<Symbol>> {
@@ -99,10 +104,9 @@ impl ExchangeInfoProvider for GateExchangeInfoProvider {
         parse_usdt_spot_symbols(&text)
     }
 
-    /// Gate 当前没有接入永续合约场景，返回空列表，和 Kraken
-    /// `usdt_perpetual_symbols` 的既有约定一致，不是 bug。
     async fn usdt_perpetual_symbols(&self) -> anyhow::Result<Vec<Symbol>> {
-        Ok(Vec::new())
+        let text = self.public_request("/futures/usdt/contracts", &[]).await?;
+        Ok(parse_perpetual_market_precisions(&text)?.into_iter().map(|p| p.symbol).collect())
     }
 
     async fn spot_market_precisions(&self) -> anyhow::Result<Vec<MarketPrecision>> {
@@ -111,8 +115,89 @@ impl ExchangeInfoProvider for GateExchangeInfoProvider {
     }
 
     async fn perpetual_market_precisions(&self) -> anyhow::Result<Vec<MarketPrecision>> {
-        Ok(Vec::new())
+        let text = self.public_request("/futures/usdt/contracts", &[]).await?;
+        parse_perpetual_market_precisions(&text)
     }
+
+    async fn perpetual_contract_spec(&self, symbol: &Symbol) -> anyhow::Result<PerpContractSpec> {
+        let text = self.public_request(&format!("/futures/usdt/contracts/{}", gate_contract(symbol)), &[]).await?;
+        parse_perp_contract_spec(&text)
+    }
+}
+
+/// `/futures/usdt/funding_rate` 单次最多返回 1000 条(`limit=1001` 会报
+/// `INVALID_PARAM_VALUE`)。只传 `to` 时实际返回的是 `to` 往前 30 天的窗口
+/// (1h 周期也才 720 条)，不会被这个上限截断。
+const FUNDING_HISTORY_PAGE_LIMIT: usize = 1000;
+
+#[async_trait]
+impl FundingRateProvider for GateExchangeInfoProvider {
+    fn venue(&self) -> Venue {
+        self.venue.clone()
+    }
+
+    /// `/futures/usdt/funding_rate` 按时间倒序返回、时间单位是秒。这个接口的
+    /// `from` 不能早于 180 天前(否则报 `from time exceeds 180-day limit`)，所以
+    /// 不传 `from`，只用 `to` 从区间末尾往前一段一段翻(每段约 30 天)，直到越过
+    /// `start_time_ms` 或翻到空页(合约上线前)，最后按毫秒边界过滤并升序排列。
+    async fn funding_rate_history(
+        &self,
+        symbol: &Symbol,
+        start_time_ms: u64,
+        end_time_ms: Option<u64>,
+    ) -> anyhow::Result<Vec<FundingRateRecord>> {
+        let contract = gate_contract(symbol);
+        let from_secs = start_time_ms / 1000;
+        let mut to_secs = end_time_ms.map(|ms| ms / 1000);
+        let mut records = Vec::new();
+        loop {
+            let mut query = vec![
+                ("contract".to_string(), contract.clone()),
+                ("limit".to_string(), FUNDING_HISTORY_PAGE_LIMIT.to_string()),
+            ];
+            if let Some(to) = to_secs {
+                query.push(("to".to_string(), to.to_string()));
+            }
+            let text = self.public_request("/futures/usdt/funding_rate", &query).await?;
+            let page = parse_funding_rate_history(&text, symbol)?;
+            let oldest_secs = page.iter().map(|r| r.funding_time_ms / 1000).min();
+            records.extend(page);
+            match oldest_secs {
+                // 要求 `to` 严格往前推进，防止接口行为变化时死循环。
+                Some(oldest) if oldest > from_secs && to_secs.is_none_or(|to| oldest <= to) => to_secs = Some(oldest - 1),
+                _ => break,
+            }
+        }
+        records.retain(|r| r.funding_time_ms >= start_time_ms && end_time_ms.is_none_or(|end| r.funding_time_ms <= end));
+        records.sort_by_key(|r| r.funding_time_ms);
+        records.dedup_by_key(|r| r.funding_time_ms);
+        Ok(records)
+    }
+
+    /// 不传 `from`/`to` 时 `/futures/usdt/funding_rate` 返回最近 `limit` 条(倒序)。
+    async fn recent_funding_rates(&self, symbol: &Symbol, limit: usize) -> anyhow::Result<Vec<FundingRateRecord>> {
+        let query = vec![
+            ("contract".to_string(), gate_contract(symbol)),
+            ("limit".to_string(), limit.clamp(1, FUNDING_HISTORY_PAGE_LIMIT).to_string()),
+        ];
+        let text = self.public_request("/futures/usdt/funding_rate", &query).await?;
+        let mut records = parse_funding_rate_history(&text, symbol)?;
+        records.sort_by_key(|r| r.funding_time_ms);
+        Ok(records)
+    }
+
+    /// `/futures/usdt/contracts` 一次返回全部合约：`funding_rate` 是将在
+    /// `funding_next_apply`(秒)结算的费率，`funding_interval` 是结算周期(秒)。
+    /// `funding_rate_indicative` 已被 Gate 标记为废弃，和 `funding_rate` 同值，不用它。
+    async fn predicted_funding_rates(&self) -> anyhow::Result<Vec<PredictedFundingRate>> {
+        let text = self.public_request("/futures/usdt/contracts", &[]).await?;
+        parse_predicted_funding_rates(&text)
+    }
+}
+
+/// Gate 永续合约名是 `BASE_QUOTE`(如 `BTC_USDT`)。
+fn gate_contract(symbol: &Symbol) -> String {
+    format!("{}_{}", symbol.base, symbol.quote).to_ascii_uppercase()
 }
 
 fn build_http_client(proxy: Option<&str>) -> anyhow::Result<reqwest::Client> {
@@ -222,6 +307,129 @@ fn parse_spot_market_precisions(text: &str) -> anyhow::Result<Vec<MarketPrecisio
         .collect())
 }
 
+#[derive(Debug, Deserialize)]
+struct FundingRateEntry {
+    t: u64,
+    r: Decimal,
+}
+
+fn parse_funding_rate_history(text: &str, symbol: &Symbol) -> anyhow::Result<Vec<FundingRateRecord>> {
+    if let Ok(err) = serde_json::from_str::<GateErrorResponse>(text) {
+        anyhow::bail!("gate error {}: {}", err.label, err.message);
+    }
+    let entries: Vec<FundingRateEntry> =
+        serde_json::from_str(text).with_context(|| format!("failed to parse gate funding_rate response, raw body: {text}"))?;
+    Ok(entries
+        .into_iter()
+        .map(|e| FundingRateRecord { symbol: symbol.clone(), rate: e.r, funding_time_ms: e.t * 1000 })
+        .collect())
+}
+
+#[derive(Debug, Deserialize)]
+struct FuturesContractEntry {
+    name: String,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    funding_rate: Option<Decimal>,
+    /// Gate 文档里标的是 double，按 f64 读再取整，避免带小数时反序列化失败。
+    #[serde(default)]
+    funding_next_apply: Option<f64>,
+    #[serde(default)]
+    funding_interval: Option<u64>,
+}
+
+/// Gate 合约接口里数值字段有的是字符串(`quanto_multiplier`/`order_price_round`)，
+/// 有的是 JSON 数字(`order_size_min`)，统一按 `Value` 读再转 `Decimal`。
+fn json_decimal(value: &serde_json::Value) -> Option<Decimal> {
+    match value {
+        serde_json::Value::String(s) => s.parse().ok(),
+        serde_json::Value::Number(n) => n.to_string().parse().ok(),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct FuturesContractSpecEntry {
+    name: String,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    quanto_multiplier: serde_json::Value,
+    #[serde(default)]
+    order_size_min: serde_json::Value,
+    #[serde(default)]
+    order_price_round: serde_json::Value,
+}
+
+/// 下单量单位是"张"，统一按整数张下单：步进 1、最少 1 张(`order_size_min`
+/// 更大时取它)。部分合约 `enable_decimal=true` 允许小数张，这里不用，避免
+/// 下单接口对小数 size 的兼容性问题。价格 tick 取 `order_price_round`，缺失时
+/// 记 0(不按 tick 取整)。
+fn parse_perpetual_market_precisions(text: &str) -> anyhow::Result<Vec<MarketPrecision>> {
+    if let Ok(err) = serde_json::from_str::<GateErrorResponse>(text) {
+        anyhow::bail!("gate error {}: {}", err.label, err.message);
+    }
+    let contracts: Vec<FuturesContractSpecEntry> =
+        serde_json::from_str(text).with_context(|| format!("failed to parse gate futures contracts response, raw body: {text}"))?;
+    Ok(contracts
+        .into_iter()
+        .filter(|c| c.status.as_deref().is_none_or(|s| s == "trading"))
+        .filter_map(|c| {
+            let (base, quote) = c.name.split_once('_')?;
+            if !quote.eq_ignore_ascii_case("USDT") || base.is_empty() {
+                return None;
+            }
+            let min_qty = json_decimal(&c.order_size_min).unwrap_or(Decimal::ONE).max(Decimal::ONE).ceil();
+            let price_tick = json_decimal(&c.order_price_round).unwrap_or(Decimal::ZERO);
+            let qty_precision = QtyPrecision { qty_step: Decimal::ONE, min_qty };
+            Some(MarketPrecision { symbol: Symbol::new(base, "USDT"), market: qty_precision, limit: qty_precision, price_tick })
+        })
+        .collect())
+}
+
+/// Gate 永续报价就是每币价格(`price_unit = 1`)，下单量单位是张，
+/// 1 张 = `quanto_multiplier` 个币。
+fn parse_perp_contract_spec(text: &str) -> anyhow::Result<PerpContractSpec> {
+    if let Ok(err) = serde_json::from_str::<GateErrorResponse>(text) {
+        anyhow::bail!("gate error {}: {}", err.label, err.message);
+    }
+    let contract: FuturesContractSpecEntry =
+        serde_json::from_str(text).with_context(|| format!("failed to parse gate futures contract response, raw body: {text}"))?;
+    let qty_unit = json_decimal(&contract.quanto_multiplier)
+        .filter(|m| *m > Decimal::ZERO)
+        .with_context(|| format!("gate contract {} has no valid quanto_multiplier", contract.name))?;
+    Ok(PerpContractSpec { price_unit: Decimal::ONE, qty_unit })
+}
+
+/// 只保留 `status == "trading"` 的 `XXX_USDT` 合约；缺费率/结算时间/周期的条目
+/// 跳过而不是拿猜测值凑数。
+fn parse_predicted_funding_rates(text: &str) -> anyhow::Result<Vec<PredictedFundingRate>> {
+    if let Ok(err) = serde_json::from_str::<GateErrorResponse>(text) {
+        anyhow::bail!("gate error {}: {}", err.label, err.message);
+    }
+    let contracts: Vec<FuturesContractEntry> =
+        serde_json::from_str(text).with_context(|| format!("failed to parse gate futures contracts response, raw body: {text}"))?;
+    Ok(contracts
+        .into_iter()
+        .filter(|c| c.status.as_deref().is_none_or(|s| s == "trading"))
+        .filter_map(|c| {
+            let (base, quote) = c.name.split_once('_')?;
+            if !quote.eq_ignore_ascii_case("USDT") || base.is_empty() {
+                return None;
+            }
+            let next_apply_secs = c.funding_next_apply.filter(|t| *t > 0.0)?;
+            let interval_secs = c.funding_interval.filter(|s| *s > 0)?;
+            Some(PredictedFundingRate {
+                symbol: Symbol::new(base, "USDT"),
+                rate: c.funding_rate?,
+                next_funding_time_ms: next_apply_secs as u64 * 1000,
+                funding_interval_hours: (interval_secs / 3600) as u32,
+            })
+        })
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -311,5 +519,80 @@ mod tests {
         ]"#;
         let precisions = parse_spot_market_precisions(text).expect("should parse");
         assert!(precisions.is_empty());
+    }
+
+    #[test]
+    fn gate_contract_uses_underscore_separator() {
+        assert_eq!(gate_contract(&Symbol::new("btc", "usdt")), "BTC_USDT");
+    }
+
+    #[test]
+    fn parses_funding_rate_history_converting_seconds_to_ms() {
+        let text = r#"[{"r":"0.00002","t":1789689601},{"r":"-0.000049","t":1789660801}]"#;
+        let symbol = Symbol::new("BTC", "USDT");
+        let records = parse_funding_rate_history(text, &symbol).expect("should parse");
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].funding_time_ms, 1789689601000);
+        assert_eq!(records[1].rate, "-0.000049".parse().unwrap());
+    }
+
+    #[test]
+    fn parse_funding_rate_history_surfaces_error_response() {
+        let text = r#"{"label":"INVALID_PARAM_VALUE","message":"Invalid request parameter `limit` value: 1001"}"#;
+        let err = parse_funding_rate_history(text, &Symbol::new("BTC", "USDT")).unwrap_err();
+        assert!(err.to_string().contains("INVALID_PARAM_VALUE"));
+    }
+
+    #[test]
+    fn parses_predicted_funding_rates_filters_status_and_quote() {
+        let text = r#"[
+            {"name":"BTC_USDT","status":"trading","funding_rate":"0.000057","funding_rate_indicative":"0.000057","funding_next_apply":1789718400,"funding_interval":28800},
+            {"name":"LPT_USDT","status":"trading","funding_rate":"-0.0005","funding_next_apply":1789718400.0,"funding_interval":14400},
+            {"name":"OLD_USDT","status":"delisted","funding_rate":"0.0001","funding_next_apply":1789718400,"funding_interval":28800},
+            {"name":"BTC_USD","status":"trading","funding_rate":"0.0001","funding_next_apply":1789718400,"funding_interval":28800}
+        ]"#;
+        let rates = parse_predicted_funding_rates(text).expect("should parse");
+        assert_eq!(rates.len(), 2);
+        assert_eq!(rates[0].symbol, Symbol::new("BTC", "USDT"));
+        assert_eq!(rates[0].rate, "0.000057".parse().unwrap());
+        assert_eq!(rates[0].next_funding_time_ms, 1789718400000);
+        assert_eq!(rates[0].funding_interval_hours, 8);
+        assert_eq!(rates[1].funding_interval_hours, 4);
+    }
+
+    #[test]
+    fn parse_perpetual_market_precisions_uses_whole_contracts() {
+        let text = r#"[
+            {"name":"PEPE_USDT","status":"trading","quanto_multiplier":"10000000","order_size_min":0,"order_price_round":"0.000000001"},
+            {"name":"BTC_USDT","status":"trading","quanto_multiplier":"0.0001","order_size_min":5,"order_price_round":"0.1"},
+            {"name":"OLD_USDT","status":"delisted","quanto_multiplier":"1","order_size_min":1,"order_price_round":"0.1"}
+        ]"#;
+        let precisions = parse_perpetual_market_precisions(text).expect("should parse");
+        assert_eq!(precisions.len(), 2);
+        assert_eq!(precisions[0].symbol, Symbol::new("PEPE", "USDT"));
+        assert_eq!(precisions[0].market.qty_step, Decimal::ONE);
+        assert_eq!(precisions[0].market.min_qty, Decimal::ONE);
+        assert_eq!(precisions[0].price_tick, "0.000000001".parse().unwrap());
+        assert_eq!(precisions[1].market.min_qty, Decimal::from(5));
+    }
+
+    #[test]
+    fn parses_perp_contract_spec_from_quanto_multiplier() {
+        let text = r#"{"name":"PEPE_USDT","status":"trading","quanto_multiplier":"10000000","order_size_min":0}"#;
+        let spec = parse_perp_contract_spec(text).expect("should parse");
+        assert_eq!(spec, PerpContractSpec { price_unit: Decimal::ONE, qty_unit: Decimal::from(10_000_000) });
+    }
+
+    #[test]
+    fn parse_perp_contract_spec_rejects_missing_multiplier_and_errors() {
+        assert!(parse_perp_contract_spec(r#"{"name":"X_USDT"}"#).is_err());
+        let err = parse_perp_contract_spec(r#"{"label":"CONTRACT_NOT_FOUND","message":"contract not found"}"#).unwrap_err();
+        assert!(err.to_string().contains("CONTRACT_NOT_FOUND"));
+    }
+
+    #[test]
+    fn parse_predicted_funding_rates_skips_entries_missing_funding_fields() {
+        let text = r#"[{"name":"BTC_USDT","status":"trading","funding_rate":"0.000057"}]"#;
+        assert!(parse_predicted_funding_rates(text).expect("should parse").is_empty());
     }
 }

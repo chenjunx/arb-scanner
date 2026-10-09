@@ -47,3 +47,40 @@ pub enum PrecisionKind {
     Market,
     Limit,
 }
+
+/// 一次已经结算的资金费率。`rate` 是小数比例(如 `0.0001` 表示 0.01%)，
+/// 正数=多头付给空头。
+#[derive(Debug, Clone, PartialEq)]
+pub struct FundingRateRecord {
+    pub symbol: Symbol,
+    pub rate: Decimal,
+    pub funding_time_ms: u64,
+}
+
+/// 下一次(即将到来的那一次)结算的预测资金费率。各交易所字段命名不统一
+/// (币安 `lastFundingRate`、Gate `funding_rate`、CoinEx `latest_funding_rate`)，
+/// 实现方负责统一成"将在 `next_funding_time_ms` 结算的费率"这一语义。
+///
+/// `funding_interval_hours` 是该合约的结算周期：同样的 `rate`，1h 结算和 8h
+/// 结算的年化收益差 8 倍，跨交易所/跨币种比较前必须按周期换算。
+#[derive(Debug, Clone, PartialEq)]
+pub struct PredictedFundingRate {
+    pub symbol: Symbol,
+    pub rate: Decimal,
+    pub next_funding_time_ms: u64,
+    pub funding_interval_hours: u32,
+}
+
+/// USDT 本位永续合约的计价/下单单位，用来把各交易所的报价和下单量统一换算到
+/// "每个币"的口径。两个系数分开是因为交易所之间的约定不同：
+/// - 币安 `1000PEPEUSDT`：报价是 1000 个 PEPE 的价格，数量 1 也是 1000 个
+///   PEPE，两个系数都是 1000。
+/// - Gate `PEPE_USDT`：报价是 1 个 PEPE 的价格(`price_unit=1`)，数量单位是
+///   张，一张 = `quanto_multiplier` 个 PEPE(`qty_unit=10000000`)。
+///
+/// 每币价格 = 报价 / `price_unit`；下单量 = 币数 / `qty_unit`。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PerpContractSpec {
+    pub price_unit: Decimal,
+    pub qty_unit: Decimal,
+}

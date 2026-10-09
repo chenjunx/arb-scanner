@@ -1,13 +1,14 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use async_trait::async_trait;
 use log::info;
 use rust_decimal::Decimal;
 
 use crate::topic::{Topic, TopicBus};
 use crate::types::{Quote, Symbol, Venue};
 
-use super::{FeeSchedule, Opportunity, OpportunityKind, Strategy};
+use super::{FeeSchedule, Opportunity, OpportunityKind, Strategy, StrategySubscriber};
 
 /// 三角套利路径中的一腿：Buy 表示用 quote 买入 base（按 ask 成交），
 /// Sell 表示用 base 换回 quote（按 bid 成交）。三条腿依次执行需首尾相接，
@@ -56,7 +57,7 @@ impl TriangularStrategy {
         }
     }
 
-    /// `subscriptions()` 只会为 `paths` 里出现过的 venue 订阅行情，所以这里
+    /// `init` 只会为 `paths` 里出现过的 venue 订阅行情，所以这里
     /// 查不到只可能是调用方传入的行情不在订阅范围内——修 bug 而不是兜底掩盖它。
     fn fee_for(&self, venue: &Venue) -> FeeSchedule {
         self.fees
@@ -102,20 +103,19 @@ fn log_opportunity(opportunity: &Opportunity) {
     );
 }
 
+#[async_trait]
 impl Strategy for TriangularStrategy {
     fn name(&self) -> &str {
         "triangular"
     }
 
-    fn subscriptions(&self) -> Vec<Topic> {
-        self.paths
-            .iter()
-            .flat_map(|path| {
-                path.legs
-                    .iter()
-                    .map(move |leg| Topic::quote(path.venue.clone(), leg.symbol.clone()))
-            })
-            .collect()
+    async fn init(&self, subscriber: &mut StrategySubscriber) -> anyhow::Result<()> {
+        subscriber.subscribe_quotes(self.paths.iter().flat_map(|path| {
+            path.legs
+                .iter()
+                .map(move |leg| Topic::quote(path.venue.clone(), leg.symbol.clone()))
+        }));
+        Ok(())
     }
 
     fn bus(&self) -> &Arc<TopicBus> {

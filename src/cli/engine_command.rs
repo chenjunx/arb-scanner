@@ -190,7 +190,7 @@ pub async fn run(config_path: &str) -> anyhow::Result<()> {
 
     info!("arb-scanner engine starting");
     let engine = ArbitrageEngine::new(strategies);
-    engine.run(bus).await;
+    engine.run(bus).await?;
 
     for handle in source_handles {
         let _ = handle.await;

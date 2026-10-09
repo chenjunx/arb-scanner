@@ -1,7 +1,10 @@
 pub mod binance;
 pub mod binance_futures;
+pub mod bitget_futures;
 pub mod gate;
+pub mod gate_futures;
 pub mod kraken;
+pub mod okx_futures;
 pub mod types;
 
 use async_trait::async_trait;
@@ -135,6 +138,13 @@ pub trait OrderProvider: Send + Sync {
     /// 由调用方按失败处理。
     async fn quote_usdt_price(&self, _asset: &str) -> anyhow::Result<Decimal> {
         anyhow::bail!("quote_usdt_price not supported for venue {}", self.venue())
+    }
+
+    /// 查询某个永续合约当前的净持仓(单向持仓模式)，多头为正、空头为负、
+    /// 无持仓为 0。单位是交易所自己的下单单位(币安是合约名对应的币数，
+    /// Gate 是张数)。默认实现是报错，现货交易所不需要实现。
+    async fn perp_position(&self, symbol: &Symbol) -> anyhow::Result<Decimal> {
+        anyhow::bail!("perp_position not supported for venue {} ({symbol})", self.venue())
     }
 }
 

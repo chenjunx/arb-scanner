@@ -6,8 +6,9 @@ use rust_decimal::Decimal;
 
 use arb_scanner::engine::ArbitrageEngine;
 use arb_scanner::market_data::link_health::LinkHealthMonitor;
+use arb_scanner::order_manager::types::{OrderEvent, OrderId};
 use arb_scanner::strategy::cross_exchange::CrossExchangeStrategy;
-use arb_scanner::strategy::{FeeSchedule, Strategy};
+use arb_scanner::strategy::{FeeSchedule, Strategy, StrategySubscriber};
 use arb_scanner::topic::{Topic, TopicBus};
 use arb_scanner::types::{Quote, Symbol, Venue};
 
@@ -115,6 +116,7 @@ async fn measures_bus_dispatch_latency_from_publish_to_on_quote() {
         tx: mpsc::UnboundedSender<Instant>,
     }
 
+    #[async_trait::async_trait]
     impl Strategy for LatencyProbeStrategy {
         fn name(&self) -> &str {
             "latency_probe"
@@ -122,8 +124,9 @@ async fn measures_bus_dispatch_latency_from_publish_to_on_quote() {
         fn bus(&self) -> &Arc<TopicBus> {
             &self.bus
         }
-        fn subscriptions(&self) -> Vec<Topic> {
-            vec![Topic::quote(self.venue.clone(), self.symbol.clone())]
+        async fn init(&self, subscriber: &mut StrategySubscriber) -> anyhow::Result<()> {
+            subscriber.subscribe_quote(Topic::quote(self.venue.clone(), self.symbol.clone()));
+            Ok(())
         }
         fn on_quote(&self, _topic: &Topic, _quote: &Quote) {
             let _ = self.tx.send(Instant::now());
@@ -173,4 +176,69 @@ async fn measures_bus_dispatch_latency_from_publish_to_on_quote() {
         "bus dispatch latency (bus.publish -> Strategy::on_quote), n={}: min={min:?} p50={p50:?} mean={mean:?} p95={p95:?} max={max:?}",
         samples.len(),
     );
+}
+
+/// 记录 `init`/`on_order_event` 调用顺序的探针策略。`init` 里自己往 bus 发一条
+/// 订单事件，用来验证"引擎先订阅订单事件、再 init"：初始化期间产生的事件不会丢。
+struct InitProbeStrategy {
+    bus: Arc<TopicBus>,
+    calls: Arc<std::sync::Mutex<Vec<String>>>,
+    fail_init: bool,
+}
+
+#[async_trait::async_trait]
+impl Strategy for InitProbeStrategy {
+    fn name(&self) -> &str {
+        "init_probe"
+    }
+    fn bus(&self) -> &Arc<TopicBus> {
+        &self.bus
+    }
+    fn on_quote(&self, _topic: &Topic, _quote: &Quote) {}
+
+    async fn init(&self, _subscriber: &mut StrategySubscriber) -> anyhow::Result<()> {
+        if self.fail_init {
+            anyhow::bail!("boom");
+        }
+        self.bus.publish(
+            Topic::order_event(self.name().to_string()),
+            OrderEvent::Submitted { order_id: OrderId::new("1"), client_order_id: None },
+        );
+        self.calls.lock().unwrap().push("init".to_string());
+        Ok(())
+    }
+
+    fn on_order_event(&self, _event: &OrderEvent) {
+        self.calls.lock().unwrap().push("on_order_event".to_string());
+    }
+}
+
+#[tokio::test]
+async fn engine_runs_init_before_event_loop_without_losing_events() {
+    let bus = Arc::new(TopicBus::new());
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let strategies: Vec<Box<dyn Strategy>> =
+        vec![Box::new(InitProbeStrategy { bus: bus.clone(), calls: calls.clone(), fail_init: false })];
+
+    let handle = tokio::spawn(ArbitrageEngine::new(strategies).run(bus.clone()));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    handle.abort();
+
+    assert_eq!(*calls.lock().unwrap(), vec!["init".to_string(), "on_order_event".to_string()]);
+}
+
+#[tokio::test]
+async fn engine_run_returns_error_when_strategy_init_fails() {
+    let bus = Arc::new(TopicBus::new());
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let strategies: Vec<Box<dyn Strategy>> =
+        vec![Box::new(InitProbeStrategy { bus: bus.clone(), calls: calls.clone(), fail_init: true })];
+
+    let result = tokio::time::timeout(Duration::from_secs(2), ArbitrageEngine::new(strategies).run(bus.clone()))
+        .await
+        .expect("run should return immediately on init failure");
+    let err = result.expect_err("init failure should propagate");
+    assert!(format!("{err:#}").contains("init_probe"));
+    assert!(format!("{err:#}").contains("boom"));
+    assert!(calls.lock().unwrap().is_empty());
 }

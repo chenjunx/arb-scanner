@@ -11,8 +11,10 @@ use serde::Deserialize;
 use crate::market_data::now_ms;
 use crate::types::{Symbol, Venue};
 
-use super::ExchangeInfoProvider;
-use super::types::{MarketPrecision, QtyPrecision, SpotPerpPair, TradingFee};
+use super::types::{
+    FundingRateRecord, MarketPrecision, PerpContractSpec, PredictedFundingRate, QtyPrecision, SpotPerpPair, TradingFee,
+};
+use super::{ExchangeInfoProvider, FundingRateProvider};
 
 const SPOT_MAINNET_HOST: &str = "https://api.binance.com";
 const SPOT_TESTNET_HOST: &str = "https://testnet.binance.vision";
@@ -153,6 +155,85 @@ impl ExchangeInfoProvider for BinanceExchangeInfoProvider {
             .public_request(self.futures_host, "/fapi/v1/exchangeInfo", Vec::new())
             .await?;
         parse_perpetual_market_precisions(&text)
+    }
+
+    /// 币安 U 本位永续的报价单位和数量单位一致，都由合约名的乘数前缀决定，
+    /// 不需要查接口，见 [`binance_perp_contract_spec`]。
+    async fn perpetual_contract_spec(&self, symbol: &Symbol) -> anyhow::Result<PerpContractSpec> {
+        Ok(binance_perp_contract_spec(symbol))
+    }
+}
+
+/// `/fapi/v1/fundingRate` 单次最多返回 1000 条。
+const FUNDING_HISTORY_PAGE_LIMIT: usize = 1000;
+/// `/fapi/v1/fundingRate` 和 `/fapi/v1/fundingInfo` 另有共享的 500 次/5 分钟/IP
+/// 额度(和合约 host 的权重额度分开算，超了直接 403 封 IP)，单独一个令牌桶。
+const FUNDING_RATE_LIMIT_KEY: &str = "binance:/fapi/v1/fundingRate";
+/// `/fapi/v1/fundingInfo` 只列出结算周期/上下限被调整过的合约，没列出的就是默认 8h。
+const DEFAULT_FUNDING_INTERVAL_HOURS: u32 = 8;
+
+#[async_trait]
+impl FundingRateProvider for BinanceExchangeInfoProvider {
+    fn venue(&self) -> Venue {
+        self.venue.clone()
+    }
+
+    /// `/fapi/v1/fundingRate` 按时间升序返回，满页时从最后一条之后继续翻。
+    async fn funding_rate_history(
+        &self,
+        symbol: &Symbol,
+        start_time_ms: u64,
+        end_time_ms: Option<u64>,
+    ) -> anyhow::Result<Vec<FundingRateRecord>> {
+        let mut records = Vec::new();
+        let mut cursor = start_time_ms;
+        loop {
+            let mut params = vec![
+                ("symbol".to_string(), Self::binance_symbol(symbol)),
+                ("startTime".to_string(), cursor.to_string()),
+                ("limit".to_string(), FUNDING_HISTORY_PAGE_LIMIT.to_string()),
+            ];
+            if let Some(end) = end_time_ms {
+                params.push(("endTime".to_string(), end.to_string()));
+            }
+            crate::ratelimit::throttle(FUNDING_RATE_LIMIT_KEY).await;
+            let text = self.public_request(self.futures_host, "/fapi/v1/fundingRate", params).await?;
+            let page = parse_funding_rate_history(&text, symbol)?;
+            let page_len = page.len();
+            let last_time = page.last().map(|r| r.funding_time_ms);
+            records.extend(page);
+            match last_time {
+                Some(last) if page_len >= FUNDING_HISTORY_PAGE_LIMIT && last >= cursor => cursor = last + 1,
+                _ => break,
+            }
+        }
+        Ok(records)
+    }
+
+    /// 不传 `startTime`/`endTime` 时 `/fapi/v1/fundingRate` 返回最近 `limit` 条(升序)。
+    async fn recent_funding_rates(&self, symbol: &Symbol, limit: usize) -> anyhow::Result<Vec<FundingRateRecord>> {
+        let params = vec![
+            ("symbol".to_string(), Self::binance_symbol(symbol)),
+            ("limit".to_string(), limit.clamp(1, FUNDING_HISTORY_PAGE_LIMIT).to_string()),
+        ];
+        crate::ratelimit::throttle(FUNDING_RATE_LIMIT_KEY).await;
+        let text = self.public_request(self.futures_host, "/fapi/v1/fundingRate", params).await?;
+        parse_funding_rate_history(&text, symbol)
+    }
+
+    /// `/fapi/v1/premiumIndex` 不传 symbol 返回全部合约，`lastFundingRate` 就是
+    /// 本期实时估算、将在 `nextFundingTime` 结算的费率；结算周期另查
+    /// `/fapi/v1/fundingInfo`。
+    async fn predicted_funding_rates(&self) -> anyhow::Result<Vec<PredictedFundingRate>> {
+        let (premium_text, info_text) = tokio::try_join!(
+            self.public_request(self.futures_host, "/fapi/v1/premiumIndex", Vec::new()),
+            async {
+                crate::ratelimit::throttle(FUNDING_RATE_LIMIT_KEY).await;
+                self.public_request(self.futures_host, "/fapi/v1/fundingInfo", Vec::new()).await
+            },
+        )?;
+        let intervals = parse_funding_intervals(&info_text)?;
+        parse_predicted_funding_rates(&premium_text, &intervals)
     }
 }
 
@@ -375,6 +456,77 @@ fn parse_perpetual_market_precisions(text: &str) -> anyhow::Result<Vec<MarketPre
         .collect())
 }
 
+#[derive(Debug, Deserialize)]
+struct FundingRateEntry {
+    #[serde(rename = "fundingTime")]
+    funding_time: u64,
+    #[serde(rename = "fundingRate")]
+    funding_rate: Decimal,
+}
+
+fn parse_funding_rate_history(text: &str, symbol: &Symbol) -> anyhow::Result<Vec<FundingRateRecord>> {
+    if let Ok(err) = serde_json::from_str::<ErrorResponse>(text) {
+        anyhow::bail!("binance futures error {}: {}", err.code, err.msg);
+    }
+    let entries: Vec<FundingRateEntry> = serde_json::from_str(text)
+        .with_context(|| format!("failed to parse binance fundingRate response, raw body: {text}"))?;
+    let mut records: Vec<FundingRateRecord> = entries
+        .into_iter()
+        .map(|e| FundingRateRecord { symbol: symbol.clone(), rate: e.funding_rate, funding_time_ms: e.funding_time })
+        .collect();
+    records.sort_by_key(|r| r.funding_time_ms);
+    Ok(records)
+}
+
+#[derive(Debug, Deserialize)]
+struct FundingInfoEntry {
+    symbol: String,
+    #[serde(rename = "fundingIntervalHours")]
+    funding_interval_hours: u32,
+}
+
+fn parse_funding_intervals(text: &str) -> anyhow::Result<HashMap<String, u32>> {
+    if let Ok(err) = serde_json::from_str::<ErrorResponse>(text) {
+        anyhow::bail!("binance futures error {}: {}", err.code, err.msg);
+    }
+    let entries: Vec<FundingInfoEntry> = serde_json::from_str(text)
+        .with_context(|| format!("failed to parse binance fundingInfo response, raw body: {text}"))?;
+    Ok(entries.into_iter().map(|e| (e.symbol, e.funding_interval_hours)).collect())
+}
+
+#[derive(Debug, Deserialize)]
+struct PremiumIndexEntry {
+    symbol: String,
+    #[serde(rename = "lastFundingRate")]
+    last_funding_rate: Decimal,
+    #[serde(rename = "nextFundingTime")]
+    next_funding_time: u64,
+}
+
+/// `premiumIndex` 里混着 USDC 永续和交割合约(`BTCUSDT_261225`，
+/// `nextFundingTime=0`)，只保留 `XXXUSDT` 形式、有下一次结算时间的永续。
+fn parse_predicted_funding_rates(text: &str, intervals: &HashMap<String, u32>) -> anyhow::Result<Vec<PredictedFundingRate>> {
+    if let Ok(err) = serde_json::from_str::<ErrorResponse>(text) {
+        anyhow::bail!("binance futures error {}: {}", err.code, err.msg);
+    }
+    let entries: Vec<PremiumIndexEntry> = serde_json::from_str(text)
+        .with_context(|| format!("failed to parse binance premiumIndex response, raw body: {text}"))?;
+    Ok(entries
+        .into_iter()
+        .filter(|e| e.next_funding_time > 0 && !e.symbol.contains('_'))
+        .filter_map(|e| {
+            let base = e.symbol.strip_suffix("USDT").filter(|b| !b.is_empty())?;
+            let funding_interval_hours = intervals.get(&e.symbol).copied().unwrap_or(DEFAULT_FUNDING_INTERVAL_HOURS);
+            Some(PredictedFundingRate {
+                symbol: Symbol::new(base, "USDT"),
+                rate: e.last_funding_rate,
+                next_funding_time_ms: e.next_funding_time,
+                funding_interval_hours,
+            })
+        })
+        .collect())
+}
+
 /// 按 base 把现货和永续列表配成对：优先精确匹配(覆盖 "1INCH" 这类本身就以
 /// 数字开头的真实 ticker，两边 base 完全一致，不会走到剥离前缀那一步)；精确
 /// 匹配不上时，尝试剥离永续 base 开头的"合约乘数"前缀(见
@@ -409,11 +561,17 @@ fn build_spot_perp_pairs(spot: &[Symbol], perp: &[Symbol]) -> Vec<SpotPerpPair> 
 }
 
 /// 剥离币安永续合约 base 开头的"合约乘数"前缀，如 `"1000PEPE"` ->
-/// `(1000, "PEPE")`。只认形如 "1" 后面跟若干个 "0" 的前缀(10/100/1000/10000/
-/// 1000000...)，这是币安目前实际在用的换算倍数(`1000PEPEUSDT`/
-/// `1000SHIBUSDT`/`1000000BABYDOGEUSDT` 等)。要求前缀至少 2 位数字，避免把
-/// 单个数字开头的真实 ticker 误判成带乘数。
-fn strip_contract_multiplier(perp_base: &str) -> Option<(u64, String)> {
+/// `(1000, "PEPE")`。认两种前缀：
+/// - "1" 后面跟若干个 "0"(10/100/1000/10000/1000000...)，如 `1000PEPEUSDT`/
+///   `1000SHIBUSDT`/`1000000MOGUSDT`。要求至少 2 位数字，避免把单个数字开头的
+///   真实 ticker(`1INCH`)误判成带乘数。
+/// - "1M"(=1000000)，如 `1MBABYDOGEUSDT`。
+///
+/// 调用方应先按原 base 精确匹配，匹配不上再用这个函数剥离后重试。
+pub fn strip_contract_multiplier(perp_base: &str) -> Option<(u64, String)> {
+    if let Some(core) = perp_base.strip_prefix("1M").filter(|c| !c.is_empty() && !c.starts_with(|ch: char| ch.is_ascii_digit())) {
+        return Some((1_000_000, core.to_string()));
+    }
     let digit_len = perp_base.chars().take_while(|c| c.is_ascii_digit()).count();
     if digit_len < 2 {
         return None;
@@ -424,6 +582,17 @@ fn strip_contract_multiplier(perp_base: &str) -> Option<(u64, String)> {
     }
     let multiplier: u64 = digits.parse().ok()?;
     Some((multiplier, core.to_string()))
+}
+
+/// `1000PEPEUSDT` 这类带乘数前缀的合约，报价和数量 1 都对应 1000 个币；
+/// 没有前缀的合约两个单位都是 1。前缀规则见 [`strip_contract_multiplier`]——
+/// 它只能按名字猜(真实 ticker 恰好以 `1000` 开头时会误判)，调用方应当再用
+/// 实际价格做一次合理性检查兜底。
+pub fn binance_perp_contract_spec(symbol: &Symbol) -> PerpContractSpec {
+    let multiplier = strip_contract_multiplier(&symbol.base.to_ascii_uppercase())
+        .map(|(multiplier, _)| Decimal::from(multiplier))
+        .unwrap_or(Decimal::ONE);
+    PerpContractSpec { price_unit: multiplier, qty_unit: multiplier }
 }
 
 #[cfg(test)]
@@ -631,9 +800,60 @@ mod tests {
     }
 
     #[test]
+    fn parses_funding_rate_history_sorted_ascending() {
+        let text = r#"[
+            {"symbol":"BTCUSDT","fundingTime":1789689600003,"fundingRate":"0.00007769","markPrice":"76385.9","rateType":"Regular"},
+            {"symbol":"BTCUSDT","fundingTime":1789660800000,"fundingRate":"-0.00008505","markPrice":"76755.7","rateType":"Regular"}
+        ]"#;
+        let symbol = Symbol::new("BTC", "USDT");
+        let records = parse_funding_rate_history(text, &symbol).expect("should parse");
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].funding_time_ms, 1789660800000);
+        assert_eq!(records[0].rate, "-0.00008505".parse().unwrap());
+        assert_eq!(records[1].symbol, symbol);
+    }
+
+    #[test]
+    fn parse_funding_rate_history_surfaces_error_response() {
+        let text = r#"{"code":-1121,"msg":"Invalid symbol."}"#;
+        let err = parse_funding_rate_history(text, &Symbol::new("BTC", "USDT")).unwrap_err();
+        assert!(err.to_string().contains("-1121"));
+    }
+
+    #[test]
+    fn parses_predicted_funding_rates_filters_non_usdt_perpetuals_and_applies_intervals() {
+        let premium = r#"[
+            {"symbol":"BTCUSDT","markPrice":"77697.6","lastFundingRate":"0.00007217","nextFundingTime":1789718400000,"time":1789715993003},
+            {"symbol":"LPTUSDT","markPrice":"5.1","lastFundingRate":"-0.0005","nextFundingTime":1789718400000,"time":1789715993003},
+            {"symbol":"AAVEUSDC","markPrice":"300","lastFundingRate":"0.0001","nextFundingTime":1789718400000,"time":1789715993003},
+            {"symbol":"BTCUSDT_261225","markPrice":"78800","lastFundingRate":"0.00000000","nextFundingTime":0,"time":1789715993003}
+        ]"#;
+        let info = r#"[{"symbol":"LPTUSDT","adjustedFundingRateCap":"0.02","adjustedFundingRateFloor":"-0.02","fundingIntervalHours":4,"disclaimer":false,"updateTime":1752854309429}]"#;
+        let intervals = parse_funding_intervals(info).expect("should parse fundingInfo");
+        let rates = parse_predicted_funding_rates(premium, &intervals).expect("should parse premiumIndex");
+        assert_eq!(rates.len(), 2);
+        assert_eq!(rates[0].symbol, Symbol::new("BTC", "USDT"));
+        assert_eq!(rates[0].rate, "0.00007217".parse().unwrap());
+        assert_eq!(rates[0].next_funding_time_ms, 1789718400000);
+        assert_eq!(rates[0].funding_interval_hours, 8);
+        assert_eq!(rates[1].symbol, Symbol::new("LPT", "USDT"));
+        assert_eq!(rates[1].funding_interval_hours, 4);
+    }
+
+    #[test]
+    fn perp_contract_spec_uses_multiplier_prefix_for_both_units() {
+        let pepe = binance_perp_contract_spec(&Symbol::new("1000PEPE", "USDT"));
+        assert_eq!(pepe, PerpContractSpec { price_unit: Decimal::from(1000), qty_unit: Decimal::from(1000) });
+        let btc = binance_perp_contract_spec(&Symbol::new("BTC", "USDT"));
+        assert_eq!(btc, PerpContractSpec { price_unit: Decimal::ONE, qty_unit: Decimal::ONE });
+        assert_eq!(binance_perp_contract_spec(&Symbol::new("1INCH", "USDT")).qty_unit, Decimal::ONE);
+    }
+
+    #[test]
     fn strip_contract_multiplier_recognizes_power_of_ten_prefixes() {
         assert_eq!(strip_contract_multiplier("1000PEPE"), Some((1000, "PEPE".to_string())));
         assert_eq!(strip_contract_multiplier("1000000BABYDOGE"), Some((1_000_000, "BABYDOGE".to_string())));
+        assert_eq!(strip_contract_multiplier("1MBABYDOGE"), Some((1_000_000, "BABYDOGE".to_string())));
     }
 
     #[test]
@@ -641,6 +861,7 @@ mod tests {
         assert_eq!(strip_contract_multiplier("1INCH"), None);
         assert_eq!(strip_contract_multiplier("25BTC"), None);
         assert_eq!(strip_contract_multiplier("1000"), None);
+        assert_eq!(strip_contract_multiplier("1M"), None);
     }
 
     #[test]

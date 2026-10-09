@@ -9,6 +9,14 @@ pub enum OrderSide {
     Sell,
 }
 
+/// 永续合约保证金模式。OKX/Bitget 每笔下单都必须带上，且要和账户里该合约
+/// 实际设置的模式一致；程序不去修改交易所设置。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarginMode {
+    Cross,
+    Isolated,
+}
+
 /// 市价单的下单量：按基础币数量，或按计价币金额(如 Binance 的
 /// `quoteOrderQty`)。后者下单前不知道精确的基础币数量，买/卖多少基础币由
 /// 交易所按下单那一刻的价格决定。目前只有 `order::binance::BinanceOrderProvider`
