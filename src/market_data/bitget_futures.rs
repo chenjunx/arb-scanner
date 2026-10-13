@@ -17,7 +17,7 @@ use crate::net::connect_tcp;
 use crate::topic::{Topic, TopicBus};
 use crate::types::{Quote, Symbol, Venue};
 
-use super::{Kline, KlineProvider, MarketDataSource, closed_hourly_klines, now_ms};
+use super::{Kline, KlineInterval, KlineProvider, MarketDataSource, closed_klines, now_ms};
 
 const WS_HOST: &str = "ws.bitget.com";
 const WS_PORT: u16 = 443;
@@ -236,17 +236,21 @@ impl KlineProvider for BitgetFuturesKlineClient {
         self.venue.clone()
     }
 
-    /// `GET /api/v2/mix/market/candles?granularity=1H`，最后一根是当前未收盘的
-    /// 小时，所以多要 1 根再交给 [`closed_hourly_klines`] 剔除。
-    async fn hourly_klines(&self, symbol: &Symbol, limit: usize) -> anyhow::Result<Vec<Kline>> {
+    /// `GET /api/v2/mix/market/candles`，最后一根是当前未收盘的，所以多要 1 根
+    /// 再交给 [`closed_klines`] 剔除。
+    async fn klines(&self, symbol: &Symbol, interval: KlineInterval, limit: usize) -> anyhow::Result<Vec<Kline>> {
+        let granularity = match interval {
+            KlineInterval::M5 => "5m",
+            KlineInterval::H1 => "1H",
+        };
         let query = [
             ("symbol", bitget_symbol(symbol)),
             ("productType", BITGET_USDT_FUTURES.to_string()),
-            ("granularity", "1H".to_string()),
+            ("granularity", granularity.to_string()),
             ("limit", (limit + 1).min(CANDLES_LIMIT_MAX).to_string()),
         ];
         let text = self.public_get("/api/v2/mix/market/candles", &query).await?;
-        Ok(closed_hourly_klines(parse_candles(&text)?, now_ms(), limit))
+        Ok(closed_klines(parse_candles(&text)?, interval, now_ms(), limit))
     }
 
     /// `GET /api/v2/mix/market/ticker` 返回只含一个元素的数组，取 `quoteVolume`。
@@ -326,7 +330,7 @@ mod tests {
             ["7200000","1","1","1","26200.1","1","1"]
         ]}"#;
         let klines = parse_candles(text).unwrap();
-        let closed = closed_hourly_klines(klines, 2 * HOUR_MS + 1, 10);
+        let closed = closed_klines(klines, KlineInterval::H1, 2 * HOUR_MS + 1, 10);
         assert_eq!(closed, vec![Kline { open_time_ms: HOUR_MS, close: "26194.5".parse().unwrap() }]);
         assert!(parse_candles(r#"{"code":"40034","msg":"Parameter does not exist","data":null}"#).is_err());
     }

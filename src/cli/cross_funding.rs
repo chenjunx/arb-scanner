@@ -22,7 +22,7 @@ use crate::exchange_info::binance::BinanceExchangeInfoProvider;
 use crate::exchange_info::bitget::BitgetExchangeInfoProvider;
 use crate::exchange_info::gate::GateExchangeInfoProvider;
 use crate::exchange_info::okx::OkxExchangeInfoProvider;
-use crate::market_data::MarketDataSource;
+use crate::market_data::{HOUR_MS, MarketDataSource};
 use crate::market_data::binance_futures::{BinanceFuturesKlineClient, BinanceFuturesSource};
 use crate::market_data::bitget_futures::{BitgetFuturesKlineClient, BitgetFuturesSource};
 use crate::market_data::gate_futures::{GateFuturesKlineClient, GateFuturesSource};
@@ -36,7 +36,7 @@ use crate::order::okx_futures::{OkxFuturesOrderProvider, OkxFuturesPrivateOrderS
 use crate::order::types::MarginMode;
 use crate::order_manager::OrderStreamSource;
 use crate::strategy::cross_funding::{
-    CrossFundingParams, CrossFundingStrategy, PairRow, PerpExchange, VenueClients, parse_pairs_csv,
+    CrossFundingParams, CrossFundingStrategy, KLINE_INTERVAL, PairRow, PerpExchange, VenueClients, parse_pairs_csv,
 };
 use crate::topic::TopicBus;
 use crate::types::{Symbol, Venue};
@@ -59,17 +59,17 @@ pub struct CrossFundingArgs {
     #[arg(long)]
     pub testnet: bool,
 
-    /// 启动/整点刷新时拉多少根 1h K 线
+    /// 启动/每 5 分钟刷新时拉多少小时的 5m K 线
     #[arg(long, default_value_t = 72)]
     pub kline_hours: usize,
 
-    /// 两边对齐后至少要有多少根 K 线
+    /// 两边对齐后至少要覆盖多少小时(按 5m 根数折算)
     #[arg(long, default_value_t = 48)]
-    pub min_samples: usize,
+    pub min_hours: usize,
 
-    /// EWMA 半衰期(根数)
+    /// EWMA 半衰期(小时，按 5m 根数折算)
     #[arg(long, default_value_t = 36.0)]
-    pub half_life: f64,
+    pub half_life_hours: f64,
 
     /// 触发阈值 = μ + sigma_k·σ
     #[arg(long, default_value_t = 1.0)]
@@ -131,23 +131,20 @@ impl From<MarginModeArg> for MarginMode {
 
 impl CrossFundingArgs {
     fn params(&self) -> anyhow::Result<CrossFundingParams> {
-        if self.kline_hours == 0 || self.min_samples == 0 || self.min_samples > self.kline_hours {
-            anyhow::bail!(
-                "--min-samples({}) 必须在 1..=--kline-hours({}) 之间",
-                self.min_samples,
-                self.kline_hours
-            );
+        if self.kline_hours == 0 || self.min_hours == 0 || self.min_hours > self.kline_hours {
+            anyhow::bail!("--min-hours({}) 必须在 1..=--kline-hours({}) 之间", self.min_hours, self.kline_hours);
         }
-        if !(self.half_life.is_finite() && self.half_life > 0.0) {
-            anyhow::bail!("--half-life 必须为正数");
+        if !(self.half_life_hours.is_finite() && self.half_life_hours > 0.0) {
+            anyhow::bail!("--half-life-hours 必须为正数");
         }
+        let bars_per_hour = (HOUR_MS / KLINE_INTERVAL.millis()) as usize;
         if !self.sigma_k.is_finite() {
             anyhow::bail!("--sigma-k 必须是有限数");
         }
         Ok(CrossFundingParams {
-            kline_hours: self.kline_hours,
-            min_samples: self.min_samples,
-            half_life: self.half_life,
+            kline_bars: self.kline_hours * bars_per_hour,
+            min_samples: self.min_hours * bars_per_hour,
+            half_life: self.half_life_hours * bars_per_hour as f64,
             sigma_k: self.sigma_k,
             max_price_diff_pct: self.max_price_diff_pct,
             fill_timeout_ms: self.fill_timeout_secs * 1000,
@@ -341,9 +338,14 @@ mod tests {
         let Some(Command::CrossFunding(args)) = cli.command else { panic!("expected cross-funding") };
         assert!(!args.live);
         let params = args.params().unwrap();
-        assert_eq!(params.kline_hours, 72);
-        assert_eq!(params.min_samples, 48);
-        assert_eq!(params.half_life, 36.0);
+        assert_eq!(params.kline_bars, 864);
+        assert_eq!(params.min_samples, 576);
+        assert_eq!(params.half_life, 432.0);
+        let defaults = CrossFundingParams::default();
+        assert_eq!(
+            (params.kline_bars, params.min_samples, params.half_life),
+            (defaults.kline_bars, defaults.min_samples, defaults.half_life)
+        );
         assert_eq!(params.fill_timeout_ms, 30_000);
         assert_eq!(params.max_price_diff_pct, Decimal::from(5));
         assert_eq!(args.margin_mode, MarginModeArg::Cross);
@@ -363,7 +365,7 @@ mod tests {
             "pairs.csv",
             "--kline-hours",
             "24",
-            "--min-samples",
+            "--min-hours",
             "48",
         ])
         .unwrap();

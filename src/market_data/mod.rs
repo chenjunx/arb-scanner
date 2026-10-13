@@ -40,6 +40,22 @@ pub trait MarketDataSource: Send + 'static {
 
 pub const HOUR_MS: u64 = 3_600_000;
 
+/// [`KlineProvider::klines`] 支持的 K 线周期。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KlineInterval {
+    M5,
+    H1,
+}
+
+impl KlineInterval {
+    pub fn millis(self) -> u64 {
+        match self {
+            KlineInterval::M5 => 5 * 60_000,
+            KlineInterval::H1 => HOUR_MS,
+        }
+    }
+}
+
 /// 一根 K 线里策略用到的字段：开盘时间(毫秒)和收盘价(交易所原始报价，
 /// 没有按合约乘数换算)。
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -54,21 +70,21 @@ pub struct Kline {
 pub trait KlineProvider: Send + Sync {
     fn venue(&self) -> Venue;
 
-    /// 最近 `limit` 根**已收盘**的 1h K 线，按开盘时间升序。交易所返回的最后一根
-    /// 通常是当前还没走完的小时，由实现负责剔除(见 [`closed_hourly_klines`])。
-    async fn hourly_klines(&self, symbol: &Symbol, limit: usize) -> anyhow::Result<Vec<Kline>>;
+    /// 最近 `limit` 根**已收盘**的 `interval` 周期 K 线，按开盘时间升序。交易所
+    /// 返回的最后一根通常是当前还没走完的那根，由实现负责剔除(见 [`closed_klines`])。
+    async fn klines(&self, symbol: &Symbol, interval: KlineInterval, limit: usize) -> anyhow::Result<Vec<Kline>>;
 
     /// 最近 24h 的计价币(USDT)成交额。
     async fn quote_volume_24h(&self, symbol: &Symbol) -> anyhow::Result<Decimal>;
 }
 
-/// 按开盘时间升序去重，剔除 `open_time + 1h > now` 的未收盘 K 线，最后只保留
-/// 最近 `limit` 根。实现 [`KlineProvider::hourly_klines`] 时向交易所多要 1 根，
+/// 按开盘时间升序去重，剔除 `open_time + 周期 > now` 的未收盘 K 线，最后只保留
+/// 最近 `limit` 根。实现 [`KlineProvider::klines`] 时向交易所多要 1 根，
 /// 再交给这个函数处理。
-pub(crate) fn closed_hourly_klines(mut klines: Vec<Kline>, now_ms: u64, limit: usize) -> Vec<Kline> {
+pub(crate) fn closed_klines(mut klines: Vec<Kline>, interval: KlineInterval, now_ms: u64, limit: usize) -> Vec<Kline> {
     klines.sort_by_key(|k| k.open_time_ms);
     klines.dedup_by_key(|k| k.open_time_ms);
-    klines.retain(|k| k.open_time_ms + HOUR_MS <= now_ms);
+    klines.retain(|k| k.open_time_ms + interval.millis() <= now_ms);
     let skip = klines.len().saturating_sub(limit);
     klines.split_off(skip)
 }
@@ -82,16 +98,23 @@ mod tests {
     }
 
     #[test]
-    fn closed_hourly_klines_drops_unclosed_bar_and_keeps_latest() {
+    fn closed_klines_drops_unclosed_bar_and_keeps_latest() {
         let now = 10 * HOUR_MS + 5_000;
         let klines = vec![kline(10 * HOUR_MS), kline(7 * HOUR_MS), kline(9 * HOUR_MS), kline(8 * HOUR_MS), kline(9 * HOUR_MS)];
-        let closed = closed_hourly_klines(klines, now, 2);
+        let closed = closed_klines(klines, KlineInterval::H1, now, 2);
         assert_eq!(closed, vec![kline(8 * HOUR_MS), kline(9 * HOUR_MS)]);
     }
 
     #[test]
-    fn closed_hourly_klines_keeps_bar_closing_exactly_now() {
-        let closed = closed_hourly_klines(vec![kline(0), kline(HOUR_MS)], HOUR_MS, 10);
+    fn closed_klines_keeps_bar_closing_exactly_now() {
+        let closed = closed_klines(vec![kline(0), kline(HOUR_MS)], KlineInterval::H1, HOUR_MS, 10);
         assert_eq!(closed, vec![kline(0)]);
+    }
+
+    #[test]
+    fn closed_klines_uses_interval_length() {
+        let m5 = KlineInterval::M5.millis();
+        let closed = closed_klines(vec![kline(0), kline(m5), kline(2 * m5)], KlineInterval::M5, 2 * m5 + 1, 10);
+        assert_eq!(closed, vec![kline(0), kline(m5)]);
     }
 }

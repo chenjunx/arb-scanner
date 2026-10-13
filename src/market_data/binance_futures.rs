@@ -16,7 +16,7 @@ use crate::net::connect_tcp;
 use crate::topic::{Topic, TopicBus};
 use crate::types::{Quote, Symbol, Venue};
 
-use super::{Kline, KlineProvider, MarketDataSource, closed_hourly_klines, now_ms};
+use super::{Kline, KlineInterval, KlineProvider, MarketDataSource, closed_klines, now_ms};
 
 const MAINNET_WS_HOST: &str = "fstream.binance.com";
 const MAINNET_WS_PORT: u16 = 443;
@@ -222,16 +222,20 @@ impl KlineProvider for BinanceFuturesKlineClient {
         self.venue.clone()
     }
 
-    /// `GET /fapi/v1/klines` 按开盘时间升序返回，最后一根是当前未收盘的小时，
+    /// `GET /fapi/v1/klines` 按开盘时间升序返回，最后一根是当前未收盘的，
     /// 所以多要 1 根再剔除。
-    async fn hourly_klines(&self, symbol: &Symbol, limit: usize) -> anyhow::Result<Vec<Kline>> {
+    async fn klines(&self, symbol: &Symbol, interval: KlineInterval, limit: usize) -> anyhow::Result<Vec<Kline>> {
+        let interval_param = match interval {
+            KlineInterval::M5 => "5m",
+            KlineInterval::H1 => "1h",
+        };
         let query = [
             ("symbol", BinanceFuturesSource::binance_symbol(symbol)),
-            ("interval", "1h".to_string()),
+            ("interval", interval_param.to_string()),
             ("limit", (limit + 1).min(1500).to_string()),
         ];
         let text = self.public_get("/fapi/v1/klines", &query).await?;
-        Ok(closed_hourly_klines(parse_klines(&text)?, now_ms(), limit))
+        Ok(closed_klines(parse_klines(&text)?, interval, now_ms(), limit))
     }
 
     async fn quote_volume_24h(&self, symbol: &Symbol) -> anyhow::Result<Decimal> {

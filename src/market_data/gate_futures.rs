@@ -16,7 +16,7 @@ use crate::net::connect_tcp;
 use crate::topic::{Topic, TopicBus};
 use crate::types::{Quote, Symbol, Venue};
 
-use super::{Kline, KlineProvider, MarketDataSource, closed_hourly_klines, now_ms};
+use super::{Kline, KlineInterval, KlineProvider, MarketDataSource, closed_klines, now_ms};
 
 const WS_HOST: &str = "fx-ws.gateio.ws";
 const WS_PORT: u16 = 443;
@@ -219,15 +219,19 @@ impl KlineProvider for GateFuturesKlineClient {
     }
 
     /// `GET /futures/usdt/candlesticks` 按时间升序返回，`t` 是开盘时间(秒)，最后
-    /// 一根是当前未收盘的小时，所以多要 1 根再剔除。
-    async fn hourly_klines(&self, symbol: &Symbol, limit: usize) -> anyhow::Result<Vec<Kline>> {
+    /// 一根是当前未收盘的，所以多要 1 根再剔除。
+    async fn klines(&self, symbol: &Symbol, interval: KlineInterval, limit: usize) -> anyhow::Result<Vec<Kline>> {
+        let interval_param = match interval {
+            KlineInterval::M5 => "5m",
+            KlineInterval::H1 => "1h",
+        };
         let query = [
             ("contract", gate_contract(symbol)),
-            ("interval", "1h".to_string()),
+            ("interval", interval_param.to_string()),
             ("limit", (limit + 1).min(CANDLESTICK_LIMIT_MAX).to_string()),
         ];
         let text = self.public_get("/futures/usdt/candlesticks", &query).await?;
-        Ok(closed_hourly_klines(parse_candlesticks(&text)?, now_ms(), limit))
+        Ok(closed_klines(parse_candlesticks(&text)?, interval, now_ms(), limit))
     }
 
     /// `GET /futures/usdt/tickers?contract=X` 返回只含一个元素的数组。

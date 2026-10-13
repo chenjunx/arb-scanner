@@ -17,7 +17,7 @@ use crate::net::connect_tcp;
 use crate::topic::{Topic, TopicBus};
 use crate::types::{Quote, Symbol, Venue};
 
-use super::{Kline, KlineProvider, MarketDataSource, closed_hourly_klines, now_ms};
+use super::{Kline, KlineInterval, KlineProvider, MarketDataSource, closed_klines, now_ms};
 
 const WS_HOST: &str = "ws.okx.com";
 const WS_PORT: u16 = 8443;
@@ -29,6 +29,8 @@ const MAX_BACKOFF: Duration = Duration::from_secs(30);
 const WS_PING_INTERVAL: Duration = Duration::from_secs(20);
 /// `/api/v5/market/candles` 单次最多 300 根。
 const CANDLES_LIMIT_MAX: usize = 300;
+/// 翻页上限，防止交易所一直返回满页时死循环(10 页 = 3000 根，远超用量)。
+const CANDLES_MAX_PAGES: usize = 10;
 
 /// OKX USDT 本位永续一档盘口行情源：订阅公开频道 `bbo-tbt`(逐笔推送的最优
 /// 买卖价)。发布的报价是交易所原始报价(每币价格)，挂单量单位是张。
@@ -230,16 +232,37 @@ impl KlineProvider for OkxFuturesKlineClient {
         self.venue.clone()
     }
 
-    /// `GET /api/v5/market/candles?bar=1H` 按时间倒序返回，第一根是当前未收盘
-    /// 的小时，所以多要 1 根再交给 [`closed_hourly_klines`] 排序、剔除。
-    async fn hourly_klines(&self, symbol: &Symbol, limit: usize) -> anyhow::Result<Vec<Kline>> {
-        let query = [
-            ("instId", okx_swap_inst_id(symbol)),
-            ("bar", "1H".to_string()),
-            ("limit", (limit + 1).min(CANDLES_LIMIT_MAX).to_string()),
-        ];
-        let text = self.public_get("/api/v5/market/candles", &query).await?;
-        Ok(closed_hourly_klines(parse_candles(&text)?, now_ms(), limit))
+    /// `GET /api/v5/market/candles` 按时间倒序返回，第一根是当前未收盘的，所以
+    /// 多要 1 根再交给 [`closed_klines`] 排序、剔除。单次最多 300 根，不够就用
+    /// `after`(早于该时间戳)往前翻页。
+    async fn klines(&self, symbol: &Symbol, interval: KlineInterval, limit: usize) -> anyhow::Result<Vec<Kline>> {
+        let bar = match interval {
+            KlineInterval::M5 => "5m",
+            KlineInterval::H1 => "1H",
+        };
+        let want = limit + 1;
+        let mut klines: Vec<Kline> = Vec::with_capacity(want);
+        let mut after: Option<u64> = None;
+        for _ in 0..CANDLES_MAX_PAGES {
+            let page_limit = (want - klines.len()).min(CANDLES_LIMIT_MAX);
+            let mut query = vec![
+                ("instId", okx_swap_inst_id(symbol)),
+                ("bar", bar.to_string()),
+                ("limit", page_limit.to_string()),
+            ];
+            if let Some(ts) = after {
+                query.push(("after", ts.to_string()));
+            }
+            let text = self.public_get("/api/v5/market/candles", &query).await?;
+            let page = parse_candles(&text)?;
+            let page_len = page.len();
+            after = page.iter().map(|k| k.open_time_ms).min();
+            klines.extend(page);
+            if klines.len() >= want || page_len < page_limit {
+                break;
+            }
+        }
+        Ok(closed_klines(klines, interval, now_ms(), limit))
     }
 
     /// `GET /api/v5/market/ticker`：永续的 `volCcy24h` 是 base 币数量，没有直接
@@ -324,7 +347,7 @@ mod tests {
         ]}"#;
         let klines = parse_candles(text).unwrap();
         assert_eq!(klines[0], Kline { open_time_ms: 2 * HOUR_MS, close: "0.000004".parse().unwrap() });
-        let closed = closed_hourly_klines(klines, 2 * HOUR_MS + 1, 10);
+        let closed = closed_klines(klines, KlineInterval::H1, 2 * HOUR_MS + 1, 10);
         assert_eq!(closed, vec![Kline { open_time_ms: HOUR_MS, close: "0.0000039".parse().unwrap() }]);
         assert!(parse_candles(r#"{"code":"51001","msg":"Instrument ID does not exist","data":[]}"#).is_err());
     }

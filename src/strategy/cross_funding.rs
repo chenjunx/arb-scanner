@@ -1,5 +1,5 @@
 //! 跨所永续价差开仓策略(`cross_funding`)：从 CSV 读入若干"在 A 所做多、在 B 所
-//! 做空"的永续合约对，启动时用过去一段时间的 1h K 线收盘价算出价差
+//! 做空"的永续合约对，启动时用过去一段时间的 5m K 线收盘价算出价差
 //! (`空腿每币价格 − 多腿每币价格`)的 EWMA 均值 μ 和标准差 σ，盘中盯两边
 //! bookTicker，一旦 `空腿 bid − 多腿 ask ≥ μ + k·σ` 就两边同时市价开仓。
 //!
@@ -22,7 +22,7 @@ use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 
 use crate::exchange_info::types::{PerpContractSpec, PrecisionKind};
 use crate::exchange_info::{ExchangeInfoProvider, PrecisionCache};
-use crate::market_data::{HOUR_MS, Kline, KlineProvider, now_ms};
+use crate::market_data::{Kline, KlineInterval, KlineProvider, now_ms};
 use crate::order::OrderProvider;
 use crate::order::types::{OrderAmount, OrderSide, OrderStatus};
 use crate::order_manager::OrderManager;
@@ -34,9 +34,11 @@ use super::{Strategy, StrategySubscriber};
 
 pub const STRATEGY_NAME: &str = "cross_funding";
 const CSV_HEADER: [&str; 5] = ["long_venue", "long_symbol", "short_venue", "short_symbol", "quantity"];
-/// 整点后多久去拉新 K 线(给交易所一点时间把上一根收盘)。
-const REFRESH_DELAY_AFTER_HOUR_MS: u64 = 10_000;
-/// 整点刷新时最后一根还不是上一小时的话，隔多久重试、最多重试几次。
+/// 算价差统计用的 K 线周期，也是 μ/σ 的刷新周期。
+pub const KLINE_INTERVAL: KlineInterval = KlineInterval::M5;
+/// 每根 K 线收盘后多久去拉新 K 线(给交易所一点时间把上一根收盘)。
+const REFRESH_DELAY_AFTER_BAR_MS: u64 = 10_000;
+/// 刷新时最后一根还不是刚收盘的那根的话，隔多久重试、最多重试几次。
 const REFRESH_RETRY_DELAY: Duration = Duration::from_secs(5);
 const REFRESH_MAX_RETRIES: usize = 3;
 
@@ -191,8 +193,8 @@ pub struct VenueClients {
 /// 策略运行参数(命令行传入)。
 #[derive(Debug, Clone)]
 pub struct CrossFundingParams {
-    /// 拉多少根 1h K 线。
-    pub kline_hours: usize,
+    /// 拉多少根 [`KLINE_INTERVAL`] K 线。
+    pub kline_bars: usize,
     /// 两边对齐后至少要有多少根才算数。
     pub min_samples: usize,
     /// EWMA 半衰期(根数)。
@@ -212,9 +214,10 @@ pub struct CrossFundingParams {
 impl Default for CrossFundingParams {
     fn default() -> Self {
         Self {
-            kline_hours: 72,
-            min_samples: 48,
-            half_life: 36.0,
+            // 72h / 48h / 36h 的 5m 根数
+            kline_bars: 864,
+            min_samples: 576,
+            half_life: 432.0,
             sigma_k: 1.0,
             max_price_diff_pct: Decimal::from(5),
             fill_timeout_ms: 30_000,
@@ -296,7 +299,7 @@ pub fn compute_spread_stats(
     let aligned = align_closes(long, short);
     if aligned.len() < min_samples {
         anyhow::bail!(
-            "only {} aligned 1h klines (long {}, short {}), need at least {min_samples}",
+            "only {} aligned klines (long {}, short {}), need at least {min_samples}",
             aligned.len(),
             long.len(),
             short.len()
@@ -547,8 +550,10 @@ impl CrossFundingStrategy {
         }
 
         // 3. K 线 + 统计量
-        let long_klines = long_clients.klines.hourly_klines(&row.long.symbol, self.params.kline_hours).await?;
-        let short_klines = short_clients.klines.hourly_klines(&row.short.symbol, self.params.kline_hours).await?;
+        let long_klines =
+            long_clients.klines.klines(&row.long.symbol, KLINE_INTERVAL, self.params.kline_bars).await?;
+        let short_klines =
+            short_clients.klines.klines(&row.short.symbol, KLINE_INTERVAL, self.params.kline_bars).await?;
         let (stats, last_long, last_short) = compute_spread_stats(
             &long_klines,
             &short_klines,
@@ -622,7 +627,7 @@ impl CrossFundingStrategy {
     /// 精度不合法时给提示用的 USDT 估值：拿多腿最近一根 K 线收盘价估算，失败返回 None。
     async fn approx_usdt(&self, leg: &LegSpec, spec: &PerpContractSpec, coins: Decimal) -> Option<Decimal> {
         let clients = self.clients.get(&leg.venue())?;
-        let klines = clients.klines.hourly_klines(&leg.symbol, 1).await.ok()?;
+        let klines = clients.klines.klines(&leg.symbol, KLINE_INTERVAL, 1).await.ok()?;
         Some(per_coin(klines.last()?.close, spec) * coins)
     }
 
@@ -634,7 +639,8 @@ impl CrossFundingStrategy {
         let handle = tokio::spawn(async move {
             loop {
                 let now = now_ms();
-                let next = (now / HOUR_MS + 1) * HOUR_MS + REFRESH_DELAY_AFTER_HOUR_MS;
+                let bar_ms = KLINE_INTERVAL.millis();
+                let next = (now / bar_ms + 1) * bar_ms + REFRESH_DELAY_AFTER_BAR_MS;
                 tokio::time::sleep(Duration::from_millis(next - now)).await;
                 refresh_all(&state, &klines, &params).await;
             }
@@ -720,8 +726,8 @@ impl Drop for CrossFundingStrategy {
     }
 }
 
-/// 整点刷新：对所有还在 Watching 的行重新拉 K 线、重算 μ/σ。最后一根不是上一
-/// 小时的就隔几秒重试，重试用完或请求失败就保留旧值并打 warn。
+/// 每根 K 线收盘后刷新：对所有还在 Watching 的行重新拉 K 线、重算 μ/σ。最后
+/// 一根不是刚收盘的那根就隔几秒重试，重试用完或请求失败就保留旧值并打 warn。
 async fn refresh_all(
     state: &Arc<Mutex<State>>,
     klines: &HashMap<Venue, Arc<dyn KlineProvider>>,
@@ -738,7 +744,8 @@ async fn refresh_all(
             .collect()
     };
     for (idx, row) in targets {
-        let expected_last = (now_ms() / HOUR_MS) * HOUR_MS - HOUR_MS;
+        let bar_ms = KLINE_INTERVAL.millis();
+        let expected_last = (now_ms() / bar_ms) * bar_ms - bar_ms;
         let mut result = Err(anyhow::anyhow!("not attempted"));
         for attempt in 0..=REFRESH_MAX_RETRIES {
             if attempt > 0 {
@@ -746,7 +753,7 @@ async fn refresh_all(
             }
             result = refresh_row(&row, klines, params).await.and_then(|stats| {
                 if stats.last_open_time_ms < expected_last {
-                    anyhow::bail!("最后一根 K 线开盘时间 {} 还不是上一小时 {expected_last}", stats.last_open_time_ms)
+                    anyhow::bail!("最后一根 K 线开盘时间 {} 还不是刚收盘的那根 {expected_last}", stats.last_open_time_ms)
                 }
                 Ok(stats)
             });
@@ -762,7 +769,7 @@ async fn refresh_all(
                     continue;
                 }
                 info!(
-                    "cross_funding {}: 整点更新 samples={} μ={} → {} σ={} → {} 触发线={}",
+                    "cross_funding {}: 定时更新 samples={} μ={} → {} σ={} → {} 触发线={}",
                     row.label,
                     stats.samples,
                     fmt_num(row.stats.mean),
@@ -773,7 +780,7 @@ async fn refresh_all(
                 );
                 row.stats = stats;
             }
-            Err(err) => warn!("cross_funding {}: 整点更新失败，沿用旧的 μ/σ: {err:#}", row.label),
+            Err(err) => warn!("cross_funding {}: 定时更新失败，沿用旧的 μ/σ: {err:#}", row.label),
         }
     }
 }
@@ -784,8 +791,8 @@ async fn refresh_row(
     params: &CrossFundingParams,
 ) -> anyhow::Result<SpreadStats> {
     let provider = |venue: &Venue| klines.get(venue).ok_or_else(|| anyhow::anyhow!("no kline provider for {venue}"));
-    let long = provider(&row.long.venue)?.hourly_klines(&row.long.symbol, params.kline_hours).await?;
-    let short = provider(&row.short.venue)?.hourly_klines(&row.short.symbol, params.kline_hours).await?;
+    let long = provider(&row.long.venue)?.klines(&row.long.symbol, KLINE_INTERVAL, params.kline_bars).await?;
+    let short = provider(&row.short.venue)?.klines(&row.short.symbol, KLINE_INTERVAL, params.kline_bars).await?;
     let (stats, _, _) =
         compute_spread_stats(&long, &short, &row.long.spec, &row.short.spec, params.min_samples, params.half_life)?;
     Ok(stats)
@@ -999,6 +1006,7 @@ impl Strategy for CrossFundingStrategy {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::market_data::HOUR_MS;
 
     fn d(s: &str) -> Decimal {
         s.parse().unwrap()
