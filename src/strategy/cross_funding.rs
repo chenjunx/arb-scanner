@@ -214,10 +214,10 @@ pub struct CrossFundingParams {
 impl Default for CrossFundingParams {
     fn default() -> Self {
         Self {
-            // 72h / 48h / 36h 的 5m 根数
-            kline_bars: 864,
-            min_samples: 576,
-            half_life: 432.0,
+            // 24h / 16h / 6h 的 5m 根数
+            kline_bars: 288,
+            min_samples: 192,
+            half_life: 72.0,
             sigma_k: 1.0,
             max_price_diff_pct: Decimal::from(5),
             fill_timeout_ms: 30_000,

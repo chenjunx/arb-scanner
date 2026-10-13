@@ -60,15 +60,16 @@ pub struct CrossFundingArgs {
     pub testnet: bool,
 
     /// 启动/每 5 分钟刷新时拉多少小时的 5m K 线
-    #[arg(long, default_value_t = 72)]
+    #[arg(long, default_value_t = 24)]
     pub kline_hours: usize,
 
     /// 两边对齐后至少要覆盖多少小时(按 5m 根数折算)
-    #[arg(long, default_value_t = 48)]
+    #[arg(long, default_value_t = 16)]
     pub min_hours: usize,
 
-    /// EWMA 半衰期(小时，按 5m 根数折算)
-    #[arg(long, default_value_t = 36.0)]
+    /// EWMA 半衰期(小时，按 5m 根数折算)。要明显短于 --kline-hours：EWMA 以窗口
+    /// 第一根为初值，它的残留权重是 0.5^(窗口/半衰期)，24h/6h 时约 6%
+    #[arg(long, default_value_t = 6.0)]
     pub half_life_hours: f64,
 
     /// 触发阈值 = μ + sigma_k·σ
@@ -338,9 +339,9 @@ mod tests {
         let Some(Command::CrossFunding(args)) = cli.command else { panic!("expected cross-funding") };
         assert!(!args.live);
         let params = args.params().unwrap();
-        assert_eq!(params.kline_bars, 864);
-        assert_eq!(params.min_samples, 576);
-        assert_eq!(params.half_life, 432.0);
+        assert_eq!(params.kline_bars, 288);
+        assert_eq!(params.min_samples, 192);
+        assert_eq!(params.half_life, 72.0);
         let defaults = CrossFundingParams::default();
         assert_eq!(
             (params.kline_bars, params.min_samples, params.half_life),
