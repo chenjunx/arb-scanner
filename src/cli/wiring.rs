@@ -15,12 +15,13 @@ use dashmap::DashMap;
 use log::info;
 use rust_decimal::Decimal;
 
-use crate::accounting::FundingFeeProvider;
+use crate::accounting::{FundingFeeProvider, FundingFeeTracker, RedisFundingCursorStore, RedisFundingLease};
 use crate::exchange_info::ExchangeInfoProvider;
 use crate::exchange_info::coinex::CoinexExchangeInfoProvider;
 use crate::exchange_info::kraken::KrakenExchangeInfoProvider;
 use crate::exchange_info::nonkyc::NonkycExchangeInfoProvider;
 use crate::market_data::MarketDataSource;
+use crate::market_data::cache::MarketDataCache;
 use crate::market_data::kraken::KrakenSpotSource;
 use crate::order::OrderProvider;
 use crate::order::binance::{BinanceOrderProvider, BinanceUserDataStream};
@@ -36,7 +37,7 @@ use crate::portfolio::PortfolioManager;
 use crate::position::{InMemoryPositionStore, PositionManager, RedisAdjustmentLog, RedisPositionStore};
 use crate::pricing::FeeUsdtConverter;
 use crate::strategy::manual::ManualStrategy;
-use crate::topic::TopicBus;
+use crate::topic::{Topic, TopicBus};
 use crate::types::{Quote, Symbol, Venue};
 use crate::wallet::WalletProvider;
 use crate::wallet::binance::BinanceWalletProvider;
@@ -46,6 +47,9 @@ use crate::wallet::nonkyc::NonkycWalletProvider;
 
 /// 等每条私有 WS 建连+鉴权/订阅完成的超时。
 const STREAM_READY_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// 资金费租约 TTL 在两倍轮询间隔之外再加的余量，吸收单轮轮询本身的耗时。
+const FUNDING_LEASE_TTL_SLACK: Duration = Duration::from_secs(60);
 
 /// 所有需要 Redis 的子命令统一从这里取连接串，避免各处重复抄同一行 fallback。
 pub fn redis_url() -> String {
@@ -108,17 +112,93 @@ pub struct ManualPipeline {
     pub stream_handles: Vec<tokio::task::JoinHandle<()>>,
 }
 
+/// 常驻策略命令随下单流水线一起起的后台服务。一次性的手动命令用
+/// `PipelineServices::default()`(什么都不起)。
+#[derive(Default)]
+pub struct PipelineServices {
+    /// `Some` 时起定期报告(`ReportTracker`)：额外起一个 `MarketDataCache` 订阅
+    /// 每条腿 venue × `symbols` 的行情，喂给 `PortfolioManager` 做 mark-to-market，
+    /// 本进程交易的仓位能显示市值/浮动盈亏；Redis 里其它进程的仓位如果本进程没
+    /// 订阅它的行情，仍显示 N/A。
+    pub report_interval: Option<Duration>,
+    /// `Some` 时起资金费记账(`FundingFeeTracker`，带按 venue 的 Redis 租约)。
+    pub funding: Option<FundingSettings>,
+}
+
+/// 资金费记账参数，见 [`spawn_funding_tracker`]。
+pub struct FundingSettings {
+    pub providers: HashMap<Venue, Arc<dyn FundingFeeProvider>>,
+    pub poll_interval: Duration,
+    pub initial_lookback: Duration,
+}
+
+/// 起一个带 Redis 租约的 `FundingFeeTracker`。`accounting`/`monitor`/常驻策略命令
+/// 都走这里：多个进程同时挂 tracker 时，同一个 venue 只有抢到租约的那个进程
+/// 记账，避免同一笔资金费被重复入账(见 [`RedisFundingLease`])。
+pub fn spawn_funding_tracker(
+    redis_url: &str,
+    position_manager: Arc<PositionManager>,
+    settings: FundingSettings,
+) -> anyhow::Result<()> {
+    if settings.providers.is_empty() {
+        info!("funding tracker: no funding provider for any venue, not started");
+        return Ok(());
+    }
+    let cursor_store =
+        RedisFundingCursorStore::new(redis_url).context("failed to connect RedisFundingCursorStore to redis")?;
+    // 租约 TTL 要比轮询间隔长，持有者每轮续期；持有者退出后最多一个 TTL 由别的进程接手。
+    let lease_ttl = settings.poll_interval * 2 + FUNDING_LEASE_TTL_SLACK;
+    let lease = RedisFundingLease::new(redis_url, lease_ttl).context("failed to connect RedisFundingLease to redis")?;
+    let venues: Vec<String> = settings.providers.keys().map(|v| v.to_string()).collect();
+    let tracker = FundingFeeTracker::new(
+        settings.providers,
+        position_manager,
+        Arc::new(cursor_store),
+        settings.poll_interval,
+        settings.initial_lookback,
+    )
+    .with_lease(Arc::new(lease));
+    Arc::new(tracker).spawn();
+    info!(
+        "funding tracker started venues={venues:?} poll_interval_secs={} initial_lookback_hours={}",
+        settings.poll_interval.as_secs(),
+        settings.initial_lookback.as_secs() / 3600
+    );
+    Ok(())
+}
+
+/// 搭建 [`ManualPipeline`] 描述的 live 流水线，并按 `services` 起后台服务。
 pub async fn build_manual_pipeline(
     redis_url: &str,
     bus: Arc<TopicBus>,
     symbols: &[Symbol],
     legs: Vec<ManualLeg>,
     asset_imbalance_limits: HashMap<String, AssetImbalanceLimit>,
+    services: PipelineServices,
 ) -> anyhow::Result<ManualPipeline> {
     let order_store = Arc::new(RedisOrderStore::new(redis_url).context("failed to connect RedisOrderStore to redis")?);
     let order_id_allocator =
         RedisOrderIdAllocator::new(redis_url).context("failed to connect RedisOrderIdAllocator to redis")?;
-    let (position_manager, _portfolio_manager) = build_portfolio_stack(redis_url, Arc::new(DashMap::new()))?;
+    let quote_cache = match services.report_interval {
+        Some(_) => {
+            let topics: Vec<Topic> = legs
+                .iter()
+                .flat_map(|leg| symbols.iter().map(|symbol| Topic::quote(leg.venue.clone(), symbol.clone())))
+                .collect();
+            let cache = Arc::new(MarketDataCache::new());
+            cache.clone().spawn(bus.clone(), topics);
+            cache.snapshot()
+        }
+        None => Arc::new(DashMap::new()),
+    };
+    let (position_manager, portfolio_manager) = build_portfolio_stack(redis_url, quote_cache)?;
+    if let Some(interval) = services.report_interval {
+        spawn_report_tracker(redis_url, portfolio_manager, interval)?;
+        info!("periodic report enabled, interval_secs={}", interval.as_secs());
+    }
+    if let Some(funding) = services.funding {
+        spawn_funding_tracker(redis_url, position_manager.clone(), funding)?;
+    }
 
     let mut risk_limits = HashMap::new();
     let mut adapters = HashMap::new();
@@ -196,6 +276,7 @@ where
         std::slice::from_ref(symbol),
         legs,
         asset_imbalance_limits,
+        PipelineServices::default(),
     )
     .await?;
 

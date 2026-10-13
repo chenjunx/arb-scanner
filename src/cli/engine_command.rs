@@ -315,6 +315,11 @@ async fn build_cross_execution_config(
             },
         ],
         asset_imbalance_limits,
+        wiring::PipelineServices {
+            report_interval: (cfg.report_interval_secs > 0).then(|| Duration::from_secs(cfg.report_interval_secs)),
+            // 只有现货腿，没有资金费
+            funding: None,
+        },
     )
     .await
     .context("failed to build cross_exchange_execution OrderManager pipeline")?;

@@ -2,16 +2,21 @@
 //! [`CrossFundingStrategy`]，价差达到 EWMA 均值 + k·σ 时两边市价开仓。
 //!
 //! 默认 dry run：只打日志、不连 Redis、不建订单流水线(启动检查仍然要查持仓，
-//! 所以 API Key 照样需要)。`--live` 才真的下单。
+//! 所以 API Key 照样需要)。`--live` 才真的下单，并默认带上两个后台服务：每 5 分钟
+//! 打印一次组合盈亏/仓位/订单报告(`--report-interval-secs`)，每 30 分钟把四家的
+//! 资金费流水累加进仓位盈亏(`--funding-interval-secs`，按交易所抢 Redis 租约，
+//! 和 `accounting`/`monitor` 同时跑也不会重复记账)。
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context;
 use clap::{Args, ValueEnum};
 use log::info;
 use rust_decimal::Decimal;
 
+use crate::accounting::FundingFeeProvider;
 use crate::engine::ArbitrageEngine;
 use crate::exchange_info::binance::BinanceExchangeInfoProvider;
 use crate::exchange_info::bitget::BitgetExchangeInfoProvider;
@@ -23,6 +28,7 @@ use crate::market_data::bitget_futures::{BitgetFuturesKlineClient, BitgetFutures
 use crate::market_data::gate_futures::{GateFuturesKlineClient, GateFuturesSource};
 use crate::market_data::okx_futures::{OkxFuturesKlineClient, OkxFuturesSource};
 use crate::net;
+use crate::order::OrderProvider;
 use crate::order::binance_futures::{BinanceFuturesOrderProvider, BinanceFuturesUserDataStream};
 use crate::order::bitget_futures::{BitgetFuturesOrderProvider, BitgetFuturesPrivateOrderStream};
 use crate::order::gate_futures::{GateFuturesOrderProvider, GateFuturesPrivateOrderStream};
@@ -33,7 +39,7 @@ use crate::strategy::cross_funding::{
     CrossFundingParams, CrossFundingStrategy, PairRow, PerpExchange, VenueClients, parse_pairs_csv,
 };
 use crate::topic::TopicBus;
-use crate::types::Symbol;
+use crate::types::{Symbol, Venue};
 
 use super::wiring::{self, ManualLeg};
 
@@ -81,6 +87,29 @@ pub struct CrossFundingArgs {
     /// (币安/Gate 不需要，沿用账户设置)
     #[arg(long, value_enum, default_value_t = MarginModeArg::Cross)]
     pub margin_mode: MarginModeArg,
+
+    /// --live 时定期打印组合盈亏/仓位/订单报告的间隔(秒)，0 表示不打印；
+    /// dry run 不连 Redis，不打印报告
+    #[arg(long, default_value_t = 300)]
+    pub report_interval_secs: u64,
+
+    /// --live 时轮询资金费流水、累加进仓位盈亏的间隔(秒)，0 表示不记账。
+    /// 多个进程同时记账时按交易所抢 Redis 租约，同一交易所只有一个进程在记
+    #[arg(long, default_value_t = 1800)]
+    pub funding_interval_secs: u64,
+
+    /// 某个仓位第一次记资金费时向前回溯多久(小时)，之后按 Redis 里的游标增量拉取
+    #[arg(long, default_value_t = 168)]
+    pub funding_initial_lookback_hours: u64,
+}
+
+/// 同一个下单 provider 同时当下单客户端和资金费查询客户端用。
+fn order_and_funding<P>(provider: P) -> (Arc<dyn OrderProvider>, Arc<dyn FundingFeeProvider>)
+where
+    P: OrderProvider + FundingFeeProvider + 'static,
+{
+    let provider = Arc::new(provider);
+    (provider.clone(), provider)
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
@@ -160,12 +189,20 @@ pub async fn run(args: CrossFundingArgs) -> anyhow::Result<()> {
 
     let mut clients = HashMap::new();
     let mut legs = Vec::new();
+    let mut funding_providers: HashMap<Venue, Arc<dyn FundingFeeProvider>> = HashMap::new();
     let mut sources: Vec<Box<dyn MarketDataSource>> = Vec::new();
     for (&exchange, exchange_symbols) in &symbols {
         let venue = exchange.venue();
-        let (client, stream, source): (VenueClients, Box<dyn OrderStreamSource>, Box<dyn MarketDataSource>) =
-            match exchange {
-                PerpExchange::Binance => (
+        let (client, stream, source, funding): (
+            VenueClients,
+            Box<dyn OrderStreamSource>,
+            Box<dyn MarketDataSource>,
+            Arc<dyn FundingFeeProvider>,
+        ) = match exchange {
+            PerpExchange::Binance => {
+                let (orders, funding) =
+                    order_and_funding(BinanceFuturesOrderProvider::from_env(venue.clone(), testnet, proxy.as_deref())?);
+                (
                     VenueClients {
                         exchange_info: Arc::new(BinanceExchangeInfoProvider::from_env(
                             venue.clone(),
@@ -173,7 +210,7 @@ pub async fn run(args: CrossFundingArgs) -> anyhow::Result<()> {
                             proxy.as_deref(),
                         )?),
                         klines: Arc::new(BinanceFuturesKlineClient::new(venue.clone(), testnet, proxy.as_deref())?),
-                        orders: Arc::new(BinanceFuturesOrderProvider::from_env(venue.clone(), testnet, proxy.as_deref())?),
+                        orders,
                     },
                     Box::new(
                         BinanceFuturesUserDataStream::from_env(
@@ -185,62 +222,96 @@ pub async fn run(args: CrossFundingArgs) -> anyhow::Result<()> {
                         .context("failed to build binance futures user data stream")?,
                     ),
                     Box::new(BinanceFuturesSource::new(venue.clone(), exchange_symbols.clone(), testnet, proxy.clone())),
-                ),
-                PerpExchange::Gate => (
+                    funding,
+                )
+            }
+            PerpExchange::Gate => {
+                let (orders, funding) =
+                    order_and_funding(GateFuturesOrderProvider::from_env(venue.clone(), proxy.as_deref())?);
+                (
                     VenueClients {
                         exchange_info: Arc::new(GateExchangeInfoProvider::from_env(venue.clone(), proxy.as_deref())?),
                         klines: Arc::new(GateFuturesKlineClient::new(venue.clone(), proxy.as_deref())?),
-                        orders: Arc::new(GateFuturesOrderProvider::from_env(venue.clone(), proxy.as_deref())?),
+                        orders,
                     },
                     Box::new(
                         GateFuturesPrivateOrderStream::from_env(venue.clone(), proxy.as_deref())
                             .context("failed to build gate futures order stream")?,
                     ),
                     Box::new(GateFuturesSource::new(venue.clone(), exchange_symbols.clone(), proxy.clone())),
-                ),
-                PerpExchange::Okx => (
+                    funding,
+                )
+            }
+            PerpExchange::Okx => {
+                let (orders, funding) = order_and_funding(OkxFuturesOrderProvider::from_env(
+                    venue.clone(),
+                    margin_mode,
+                    proxy.as_deref(),
+                )?);
+                (
                     VenueClients {
                         exchange_info: Arc::new(OkxExchangeInfoProvider::new(venue.clone(), proxy.as_deref())?),
                         klines: Arc::new(OkxFuturesKlineClient::new(venue.clone(), proxy.as_deref())?),
-                        orders: Arc::new(OkxFuturesOrderProvider::from_env(venue.clone(), margin_mode, proxy.as_deref())?),
+                        orders,
                     },
                     Box::new(
                         OkxFuturesPrivateOrderStream::from_env(venue.clone(), proxy.as_deref())
                             .context("failed to build okx order stream")?,
                     ),
                     Box::new(OkxFuturesSource::new(venue.clone(), exchange_symbols.clone(), proxy.clone())),
-                ),
-                PerpExchange::Bitget => (
+                    funding,
+                )
+            }
+            PerpExchange::Bitget => {
+                let (orders, funding) = order_and_funding(BitgetFuturesOrderProvider::from_env(
+                    venue.clone(),
+                    margin_mode,
+                    proxy.as_deref(),
+                )?);
+                (
                     VenueClients {
                         exchange_info: Arc::new(BitgetExchangeInfoProvider::new(venue.clone(), proxy.as_deref())?),
                         klines: Arc::new(BitgetFuturesKlineClient::new(venue.clone(), proxy.as_deref())?),
-                        orders: Arc::new(BitgetFuturesOrderProvider::from_env(
-                            venue.clone(),
-                            margin_mode,
-                            proxy.as_deref(),
-                        )?),
+                        orders,
                     },
                     Box::new(
                         BitgetFuturesPrivateOrderStream::from_env(venue.clone(), proxy.as_deref())
                             .context("failed to build bitget order stream")?,
                     ),
                     Box::new(BitgetFuturesSource::new(venue.clone(), exchange_symbols.clone(), proxy.clone())),
-                ),
-            };
+                    funding,
+                )
+            }
+        };
         legs.push(ManualLeg {
             venue: venue.clone(),
             provider: client.orders.clone(),
             stream,
             limits: wiring::manual_risk_limits(),
         });
+        funding_providers.insert(venue.clone(), funding);
         clients.insert(venue, client);
         sources.push(source);
     }
 
     let (order_manager, stream_handles) = if args.live {
-        let pipeline =
-            wiring::build_manual_pipeline(&wiring::redis_url(), bus.clone(), &all_symbols, legs, HashMap::new())
-                .await?;
+        let services = wiring::PipelineServices {
+            report_interval: (args.report_interval_secs > 0).then(|| Duration::from_secs(args.report_interval_secs)),
+            funding: (args.funding_interval_secs > 0).then(|| wiring::FundingSettings {
+                providers: funding_providers,
+                poll_interval: Duration::from_secs(args.funding_interval_secs),
+                initial_lookback: Duration::from_secs(args.funding_initial_lookback_hours * 3600),
+            }),
+        };
+        let pipeline = wiring::build_manual_pipeline(
+            &wiring::redis_url(),
+            bus.clone(),
+            &all_symbols,
+            legs,
+            HashMap::new(),
+            services,
+        )
+        .await?;
         (Some(pipeline.order_manager), pipeline.stream_handles)
     } else {
         info!("cross_funding: dry run 模式，不连 Redis、不下单；加 --live 才会真实下单");
@@ -276,6 +347,9 @@ mod tests {
         assert_eq!(params.fill_timeout_ms, 30_000);
         assert_eq!(params.max_price_diff_pct, Decimal::from(5));
         assert_eq!(args.margin_mode, MarginModeArg::Cross);
+        assert_eq!(args.report_interval_secs, 300);
+        assert_eq!(args.funding_interval_secs, 1800);
+        assert_eq!(args.funding_initial_lookback_hours, 168);
 
         let cli =
             Cli::try_parse_from(["arb-scanner", "cross-funding", "--csv", "pairs.csv", "--margin-mode", "isolated"]).unwrap();

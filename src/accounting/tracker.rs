@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -11,12 +11,17 @@ use crate::position::{AdjustmentReason, PositionManager};
 use crate::types::Venue;
 
 use super::cursor_store::{FundingCursor, FundingCursorStore};
+use super::lease::{AlwaysHeldFundingLease, FundingLease};
 use super::provider::FundingFeeProvider;
 
 /// 定期轮询各交易所的资金费流水，去重后通过 `PositionManager::apply_adjustment`
 /// (`AdjustmentReason::Funding`) 累加进对应仓位的 `realized_pnl`。每次 tick 都从
 /// `PositionManager` 重新读取当前非零仓位，而不是启动时固定一份 symbol 列表，
 /// 这样新开/平仓的期货仓位不需要重启这个任务就能被自动跟踪/停止跟踪。
+///
+/// 每轮先通过 [`FundingLease`] 抢/续各 venue 的租约，只处理本进程持有租约的
+/// venue，避免多个进程同时挂 tracker 时把同一笔资金费重复入账。默认
+/// [`AlwaysHeldFundingLease`]，多进程场景用 [`Self::with_lease`] 换成 Redis 租约。
 pub struct FundingFeeTracker {
     providers: HashMap<Venue, Arc<dyn FundingFeeProvider>>,
     position_manager: Arc<PositionManager>,
@@ -24,6 +29,7 @@ pub struct FundingFeeTracker {
     poll_interval: Duration,
     /// 某个 (venue, symbol) 第一次被轮询、还没有游标时，往回补多久的历史。
     initial_lookback: Duration,
+    lease: Arc<dyn FundingLease>,
 }
 
 impl FundingFeeTracker {
@@ -40,7 +46,13 @@ impl FundingFeeTracker {
             cursor_store,
             poll_interval,
             initial_lookback,
+            lease: Arc::new(AlwaysHeldFundingLease),
         }
+    }
+
+    pub fn with_lease(mut self, lease: Arc<dyn FundingLease>) -> Self {
+        self.lease = lease;
+        self
     }
 
     pub fn spawn(self: Arc<Self>) -> JoinHandle<()> {
@@ -54,8 +66,17 @@ impl FundingFeeTracker {
     }
 
     async fn poll_once(&self) {
+        let held: HashSet<&Venue> = self.providers.keys().filter(|venue| self.lease.try_hold(venue)).collect();
+        if held.is_empty() {
+            debug!("funding tracker: no venue lease held this round, skipping");
+            return;
+        }
         let all_positions = self.position_manager.all_positions();
-        info!("funding tracker: poll_once start total_positions={}", all_positions.len());
+        info!(
+            "funding tracker: poll_once start total_positions={} held_venues={:?}",
+            all_positions.len(),
+            held.iter().map(|v| v.to_string()).collect::<Vec<_>>()
+        );
         for pos in all_positions {
             if pos.net_qty == Decimal::ZERO {
                 debug!("funding tracker: skip venue={} symbol={} reason=flat", pos.venue, pos.symbol);
@@ -70,6 +91,9 @@ impl FundingFeeTracker {
                 );
                 continue;
             };
+            if !held.contains(&pos.venue) {
+                continue;
+            }
 
             let cursor = self.cursor_store.get(&pos.venue, &pos.symbol);
             let start_time_ms = cursor
@@ -199,6 +223,29 @@ mod tests {
 
         let pos = position_manager.venue_position(&venue(), &symbol()).unwrap();
         assert_eq!(pos.realized_pnl, Decimal::new(-10, 0));
+    }
+
+    struct NeverHeld;
+    impl FundingLease for NeverHeld {
+        fn try_hold(&self, _venue: &Venue) -> bool {
+            false
+        }
+    }
+
+    #[tokio::test]
+    async fn skips_venues_whose_lease_is_held_elsewhere() {
+        let (tracker, position_manager) = setup(vec![FundingIncomeRecord {
+            symbol: symbol(),
+            income: Decimal::new(-10, 0),
+            time_ms: 1000,
+            tran_id: 1,
+        }]);
+        let tracker = Arc::try_unwrap(tracker).ok().unwrap().with_lease(Arc::new(NeverHeld));
+
+        tracker.poll_once().await;
+
+        let pos = position_manager.venue_position(&venue(), &symbol()).unwrap();
+        assert_eq!(pos.realized_pnl, Decimal::ZERO);
     }
 
     #[tokio::test]

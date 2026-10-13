@@ -13,6 +13,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 use crate::exchange_info::okx::{OkxResponse, okx_swap_inst_id, opt_decimal, parse_okx_data, parse_okx_swap_inst_id};
+use crate::accounting::FundingIncomeRecord;
 use crate::market_data::now_ms;
 use crate::net::connect_tcp;
 use crate::order_manager::OrderManager;
@@ -30,6 +31,10 @@ const MIN_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 /// OKX 30 秒没有任何收发就断开连接，定时发文本 `ping` 保活(服务端回 `pong`)。
 const WS_PING_INTERVAL: Duration = Duration::from_secs(20);
+/// 资金费流水每页条数(OKX 上限 100)和最多翻几页。7 天内最密 1h 结算一次是 168 条，
+/// 20 页绰绰有余；超过说明翻页逻辑出了问题，宁可报错也不返回不完整的结果。
+const FUNDING_PAGE_LIMIT: &str = "100";
+const FUNDING_MAX_PAGES: usize = 20;
 /// `clOrdId` 只能是字母数字，1~32 位。
 const CL_ORD_ID_MAX_LEN: usize = 32;
 
@@ -113,6 +118,48 @@ impl OkxFuturesOrderProvider {
         }
         let resp = request.send().await.context("okx request failed")?;
         resp.text().await.context("failed to read okx response body")
+    }
+
+    /// `GET /api/v5/account/bills?type=8`(资金费)：该合约从 `start_time_ms` 起的资金费
+    /// 流水，供 `accounting::FundingFeeTracker` 使用。只能查最近 7 天。
+    ///
+    /// 每页最多 100 条、按时间倒序，用 `after=<最后一条 billId>` 往前翻页。`tran_id`
+    /// 用结算时间(毫秒)——同一合约每个结算时点只有一条资金费记录。
+    pub(crate) async fn funding_history(
+        &self,
+        symbol: &Symbol,
+        start_time_ms: Option<u64>,
+    ) -> anyhow::Result<Vec<FundingIncomeRecord>> {
+        let inst_id = okx_swap_inst_id(symbol);
+        let begin = start_time_ms.map(|t| t.to_string());
+        let mut after: Option<String> = None;
+        let mut records = Vec::new();
+        for _ in 0..FUNDING_MAX_PAGES {
+            let mut query = vec![
+                ("instType", "SWAP"),
+                ("instId", inst_id.as_str()),
+                ("type", "8"),
+                ("limit", FUNDING_PAGE_LIMIT),
+            ];
+            if let Some(begin) = &begin {
+                query.push(("begin", begin.as_str()));
+            }
+            if let Some(after) = &after {
+                query.push(("after", after.as_str()));
+            }
+            let text = self.signed_request(reqwest::Method::GET, "/api/v5/account/bills", &query, None).await?;
+            let (page, last_bill_id) = parse_funding_bills(&text, symbol)?;
+            let full_page = page.len() >= FUNDING_PAGE_LIMIT.parse::<usize>().unwrap_or(100);
+            records.extend(page);
+            match last_bill_id {
+                Some(id) if full_page => after = Some(id),
+                _ => {
+                    records.sort_by_key(|r: &FundingIncomeRecord| r.tran_id);
+                    return Ok(records);
+                }
+            }
+        }
+        anyhow::bail!("okx funding bills for {inst_id} exceed {FUNDING_MAX_PAGES} pages, refusing partial result")
     }
 }
 
@@ -349,6 +396,29 @@ struct PositionEntry {
     pos_side: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BillEntry {
+    bill_id: String,
+    bal_chg: String,
+    ts: String,
+}
+
+/// 解析一页资金费账单，返回记录和本页最后一条(最早)的 `billId`，供翻页用。
+fn parse_funding_bills(text: &str, symbol: &Symbol) -> anyhow::Result<(Vec<FundingIncomeRecord>, Option<String>)> {
+    let bills: Vec<BillEntry> = parse_okx_data(text, "bills")?;
+    let last_bill_id = bills.last().map(|b| b.bill_id.clone());
+    let records = bills
+        .into_iter()
+        .map(|b| {
+            let time_ms: u64 = b.ts.parse().with_context(|| format!("invalid okx bill ts '{}'", b.ts))?;
+            let income = opt_decimal(&b.bal_chg).with_context(|| format!("invalid okx bill balChg '{}'", b.bal_chg))?;
+            Ok(FundingIncomeRecord { symbol: symbol.clone(), income, time_ms, tran_id: time_ms as i64 })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    Ok((records, last_bill_id))
+}
+
 fn parse_positions(text: &str) -> anyhow::Result<Decimal> {
     let positions: Vec<PositionEntry> = parse_okx_data(text, "positions")?;
     Ok(positions
@@ -563,6 +633,25 @@ fn parse_private_message(text: &str, venue: &Venue) -> PrivateMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_funding_bills_page() {
+        let text = r#"{"code":"0","msg":"","data":[
+            {"billId":"200","balChg":"-0.31","ts":"1700028800000","instId":"BTC-USDT-SWAP","type":"8","subType":"173"},
+            {"billId":"100","balChg":"0.12","ts":"1700000000000","instId":"BTC-USDT-SWAP","type":"8","subType":"174"}
+        ]}"#;
+        let (records, last) = parse_funding_bills(text, &Symbol::new("BTC", "USDT")).unwrap();
+        assert_eq!(last.as_deref(), Some("100"));
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].income, Decimal::new(-31, 2));
+        assert_eq!(records[0].tran_id, 1_700_028_800_000);
+        assert_eq!(records[1].time_ms, 1_700_000_000_000);
+
+        let (records, last) = parse_funding_bills(r#"{"code":"0","msg":"","data":[]}"#, &Symbol::new("BTC", "USDT")).unwrap();
+        assert!(records.is_empty() && last.is_none());
+
+        assert!(parse_funding_bills(r#"{"code":"50113","msg":"Invalid Sign","data":[]}"#, &Symbol::new("BTC", "USDT")).is_err());
+    }
 
     #[test]
     fn formats_iso8601_timestamps() {

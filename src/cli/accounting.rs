@@ -14,7 +14,6 @@ use clap::Args;
 use dashmap::DashMap;
 use log::info;
 
-use crate::accounting::{FundingFeeTracker, RedisFundingCursorStore};
 use crate::net;
 use crate::types::Venue;
 
@@ -45,17 +44,15 @@ pub async fn run(args: AccountingArgs) -> anyhow::Result<()> {
     let redis_url = wiring::redis_url();
     info!("accounting: connecting to redis at {redis_url}");
     let (position_manager, _portfolio_manager) = wiring::build_portfolio_stack(&redis_url, Arc::new(DashMap::new()))?;
-    let cursor_store =
-        RedisFundingCursorStore::new(&redis_url).context("failed to connect RedisFundingCursorStore to redis")?;
-
-    let tracker = Arc::new(FundingFeeTracker::new(
-        providers,
+    wiring::spawn_funding_tracker(
+        &redis_url,
         position_manager,
-        Arc::new(cursor_store),
-        Duration::from_secs(interval_secs),
-        Duration::from_secs(initial_lookback_hours * 3600),
-    ));
-    tracker.spawn();
+        wiring::FundingSettings {
+            providers,
+            poll_interval: Duration::from_secs(interval_secs),
+            initial_lookback: Duration::from_secs(initial_lookback_hours * 3600),
+        },
+    )?;
 
     info!(
         "accounting: tracking funding fees testnet={testnet} interval_secs={interval_secs} initial_lookback_hours={initial_lookback_hours}, press ctrl-c to stop"

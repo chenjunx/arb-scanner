@@ -24,14 +24,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::Context;
 use clap::Args;
 use futures_util::StreamExt;
 use futures_util::stream;
 use log::info;
 use rust_decimal::Decimal;
 
-use crate::accounting::{FundingFeeTracker, RedisFundingCursorStore};
 use crate::config::{ScanConfig, VenueConfig};
 use crate::engine::ArbitrageEngine;
 use crate::exchange_info::ExchangeInfoProvider;
@@ -281,16 +279,15 @@ pub async fn run(args: MonitorArgs) -> anyhow::Result<()> {
 
         let providers =
             wiring::binance_futures_funding_providers(futures_venue, testnet, proxy.as_deref())?;
-        let cursor_store =
-            RedisFundingCursorStore::new(&redis_url).context("failed to connect RedisFundingCursorStore to redis")?;
-        let funding_tracker = Arc::new(FundingFeeTracker::new(
-            providers,
-            position_manager.clone(),
-            Arc::new(cursor_store),
-            Duration::from_secs(funding_interval_secs),
-            Duration::from_secs(funding_initial_lookback_hours * 3600),
-        ));
-        funding_tracker.spawn();
+        wiring::spawn_funding_tracker(
+            &redis_url,
+            position_manager,
+            wiring::FundingSettings {
+                providers,
+                poll_interval: Duration::from_secs(funding_interval_secs),
+                initial_lookback: Duration::from_secs(funding_initial_lookback_hours * 3600),
+            },
+        )?;
 
         wiring::spawn_report_tracker(&redis_url, portfolio_manager, Duration::from_secs(report_interval_secs))?;
 

@@ -11,6 +11,7 @@ use serde::Deserialize;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
+use crate::accounting::FundingIncomeRecord;
 use crate::market_data::now_ms;
 use crate::net::connect_tcp;
 use crate::order_manager::OrderManager;
@@ -63,9 +64,29 @@ impl GateFuturesOrderProvider {
         &self,
         method: reqwest::Method,
         path: &str,
+        query: &str,
         body: Option<serde_json::Value>,
     ) -> anyhow::Result<String> {
-        signed_request(&self.http, &self.api_key, &self.api_secret, method, path, body).await
+        signed_request(&self.http, &self.api_key, &self.api_secret, method, path, query, body).await
+    }
+
+    /// `GET /futures/usdt/account_book?type=fund`：该合约从 `start_time_ms` 起的资金费
+    /// 流水，供 `accounting::FundingFeeTracker` 使用。
+    ///
+    /// Gate 流水 `id` 不保证在同一合约内单调递增，`tran_id` 统一用结算时间(毫秒)——
+    /// 同一合约每个结算时点只有一条资金费记录。`limit=1000` 足够覆盖默认 7 天回溯
+    /// (最密 1h 结算一次也只有 168 条)，不分页。
+    pub(crate) async fn funding_history(
+        &self,
+        symbol: &Symbol,
+        start_time_ms: Option<u64>,
+    ) -> anyhow::Result<Vec<FundingIncomeRecord>> {
+        let mut query = format!("contract={}&type=fund&limit=1000", gate_contract(symbol));
+        if let Some(start) = start_time_ms {
+            query.push_str(&format!("&from={}", start / 1000));
+        }
+        let text = self.signed_request(reqwest::Method::GET, "/futures/usdt/account_book", &query, None).await?;
+        parse_funding_history(&text, symbol, start_time_ms)
     }
 }
 
@@ -75,16 +96,18 @@ async fn signed_request(
     api_secret: &str,
     method: reqwest::Method,
     path: &str,
+    query: &str,
     body: Option<serde_json::Value>,
 ) -> anyhow::Result<String> {
     let body_str = body.as_ref().map(|b| b.to_string()).unwrap_or_default();
     let timestamp = (now_ms() / 1000).to_string();
     let full_path = format!("{API_PREFIX}{path}");
-    let signature = gate_sign(api_secret, method.as_str(), &full_path, "", &body_str, &timestamp);
+    let signature = gate_sign(api_secret, method.as_str(), &full_path, query, &body_str, &timestamp);
+    let url = if query.is_empty() { format!("{HOST}{full_path}") } else { format!("{HOST}{full_path}?{query}") };
 
     crate::ratelimit::throttle(HOST).await;
     let mut request = http
-        .request(method, format!("{HOST}{full_path}"))
+        .request(method, url)
         .header("KEY", api_key)
         .header("Timestamp", &timestamp)
         .header("SIGN", &signature);
@@ -107,14 +130,14 @@ impl OrderProvider for GateFuturesOrderProvider {
             anyhow::bail!("{} does not support quote-amount market orders", self.venue());
         };
         let body = build_market_order_body(&req.symbol, req.side, quantity, req.client_order_id.as_deref())?;
-        let text = self.signed_request(reqwest::Method::POST, "/futures/usdt/orders", Some(body)).await?;
+        let text = self.signed_request(reqwest::Method::POST, "/futures/usdt/orders", "", Some(body)).await?;
         parse_order_response(&text)
     }
 
     /// `GET /futures/usdt/orders/{id}`，合约订单号全局唯一，不需要 symbol。
     async fn query_order(&self, _symbol: &Symbol, exchange_order_id: &str) -> anyhow::Result<OrderResult> {
         let path = format!("/futures/usdt/orders/{exchange_order_id}");
-        let text = self.signed_request(reqwest::Method::GET, &path, None).await?;
+        let text = self.signed_request(reqwest::Method::GET, &path, "", None).await?;
         parse_order_response(&text)
     }
 
@@ -122,7 +145,7 @@ impl OrderProvider for GateFuturesOrderProvider {
     /// 张数(多正空负)；双向持仓模式下这个接口报错，正好当作前置条件检查。
     async fn perp_position(&self, symbol: &Symbol) -> anyhow::Result<Decimal> {
         let path = format!("/futures/usdt/positions/{}", gate_contract(symbol));
-        let text = self.signed_request(reqwest::Method::GET, &path, None).await?;
+        let text = self.signed_request(reqwest::Method::GET, &path, "", None).await?;
         parse_position(&text)
     }
 }
@@ -309,6 +332,46 @@ fn parse_position(text: &str) -> anyhow::Result<Decimal> {
     Ok(position.size)
 }
 
+/// `account_book` 的一条流水。`time` 是带小数的秒(数字)，`change` 是字符串。
+#[derive(Debug, Deserialize)]
+struct AccountBookEntry {
+    time: serde_json::Value,
+    change: String,
+}
+
+fn parse_funding_history(
+    text: &str,
+    symbol: &Symbol,
+    start_time_ms: Option<u64>,
+) -> anyhow::Result<Vec<FundingIncomeRecord>> {
+    if let Ok(err) = serde_json::from_str::<GateErrorResponse>(text) {
+        anyhow::bail!("gate futures error {}: {}", err.label, err.message);
+    }
+    let entries: Vec<AccountBookEntry> = serde_json::from_str(text)
+        .with_context(|| format!("failed to parse gate futures account_book response, raw body: {text}"))?;
+    let mut records = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let secs: Decimal = match &entry.time {
+            serde_json::Value::Number(n) => n.to_string().parse().ok(),
+            serde_json::Value::String(s) => s.parse().ok(),
+            _ => None,
+        }
+        .with_context(|| format!("invalid gate account_book time {:?}, raw body: {text}", entry.time))?;
+        let time_ms = (secs * Decimal::from(1000)).trunc().to_u64().context("gate account_book time out of range")?;
+        // `from` 只精确到秒，可能带回游标之前的记录，这里按毫秒再过滤一次。
+        if start_time_ms.is_some_and(|start| time_ms < start) {
+            continue;
+        }
+        let income: Decimal = entry
+            .change
+            .parse()
+            .with_context(|| format!("invalid gate account_book change '{}'", entry.change))?;
+        records.push(FundingIncomeRecord { symbol: symbol.clone(), income, time_ms, tran_id: time_ms as i64 });
+    }
+    records.sort_by_key(|r| r.tran_id);
+    Ok(records)
+}
+
 #[derive(Debug, Deserialize)]
 struct AccountResponse {
     user: serde_json::Value,
@@ -358,6 +421,7 @@ impl GateFuturesPrivateOrderStream {
             &self.api_secret,
             reqwest::Method::GET,
             "/futures/usdt/accounts",
+            "",
             None,
         )
         .await?;
@@ -605,6 +669,28 @@ mod tests {
     fn parse_order_response_surfaces_error() {
         let err = parse_order_response(r#"{"label":"INSUFFICIENT_AVAILABLE","message":"balance not enough"}"#).unwrap_err();
         assert!(err.to_string().contains("INSUFFICIENT_AVAILABLE"));
+    }
+
+    #[test]
+    fn parses_funding_history_sorted_and_filtered_by_start() {
+        let text = r#"[
+            {"time": 1700028800.123, "change": "0.5", "balance": "100", "type": "fund", "text": "", "contract": "BTC_USDT", "id": "9"},
+            {"time": 1700000000, "change": "-1.25", "balance": "99", "type": "fund", "text": "", "contract": "BTC_USDT", "id": "3"}
+        ]"#;
+        let symbol = Symbol::new("BTC", "USDT");
+        let records = parse_funding_history(text, &symbol, None).unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].time_ms, 1_700_000_000_000);
+        assert_eq!(records[0].income, Decimal::new(-125, 2));
+        assert_eq!(records[1].time_ms, 1_700_028_800_123);
+        assert_eq!(records[1].tran_id, 1_700_028_800_123);
+
+        let records = parse_funding_history(text, &symbol, Some(1_700_000_000_001)).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].income, Decimal::new(5, 1));
+
+        let err = parse_funding_history(r#"{"label":"INVALID_KEY","message":"bad key"}"#, &symbol, None).unwrap_err();
+        assert!(err.to_string().contains("INVALID_KEY"));
     }
 
     #[test]

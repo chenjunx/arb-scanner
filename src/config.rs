@@ -89,10 +89,17 @@ pub struct CrossExchangeExecutionConfig {
     /// 不写(默认 None)时那些资产完全不受这项检查约束。
     #[serde(default)]
     pub default_asset_imbalance_ratio: Option<Decimal>,
+    /// live 下单时定期打印组合盈亏/仓位/订单报告的间隔(秒)，0 表示不打印。
+    #[serde(default = "default_report_interval_secs")]
+    pub report_interval_secs: u64,
 }
 
 fn default_ioc_wait_ms() -> u64 {
     5_000
+}
+
+fn default_report_interval_secs() -> u64 {
+    300
 }
 
 fn default_source() -> String {

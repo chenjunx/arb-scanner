@@ -13,6 +13,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 use crate::exchange_info::bitget::{BITGET_USDT_FUTURES, bitget_symbol, opt_decimal, parse_bitget_data};
+use crate::accounting::FundingIncomeRecord;
 use crate::market_data::now_ms;
 use crate::net::connect_tcp;
 use crate::order_manager::OrderManager;
@@ -31,6 +32,11 @@ const MAX_BACKOFF: Duration = Duration::from_secs(30);
 /// Bitget 要求客户端每 30 秒发一次文本 `ping`(服务端回 `pong`)，2 分钟收不到就断开。
 const WS_PING_INTERVAL: Duration = Duration::from_secs(20);
 const MARGIN_COIN: &str = "USDT";
+/// 资金费流水每页条数(Bitget 上限 100)和最多翻几页，超过就报错而不是返回不完整的结果。
+const FUNDING_PAGE_LIMIT: &str = "100";
+const FUNDING_MAX_PAGES: usize = 20;
+/// `startTime`~`endTime` 允许的最大跨度(30 天)，留 1 分钟余量。
+const FUNDING_MAX_RANGE_MS: u64 = 30 * 24 * 3_600_000 - 60_000;
 
 /// Bitget USDT 本位永续下单客户端(v2 `/api/v2/mix/*`，`productType=USDT-FUTURES`)。
 /// 凭证读 `BITGET_API_KEY` / `BITGET_API_SECRET` / `BITGET_API_PASSPHRASE`。
@@ -112,6 +118,52 @@ impl BitgetFuturesOrderProvider {
         }
         let resp = request.send().await.context("bitget request failed")?;
         resp.text().await.context("failed to read bitget response body")
+    }
+
+    /// `GET /api/v2/mix/account/bill?businessType=contract_settle_fee`(资金费结算)：
+    /// 该合约从 `start_time_ms` 起的资金费流水，供 `accounting::FundingFeeTracker` 使用。
+    ///
+    /// Bitget 要求 `startTime`~`endTime` 不超过 30 天，起点早于 30 天前时截到 30 天内。
+    /// 每页最多 100 条、按时间倒序，用 `idLessThan=<endId>` 往前翻页。`tran_id` 用
+    /// 结算时间(毫秒)——同一合约每个结算时点只有一条资金费记录。
+    pub(crate) async fn funding_history(
+        &self,
+        symbol: &Symbol,
+        start_time_ms: Option<u64>,
+    ) -> anyhow::Result<Vec<FundingIncomeRecord>> {
+        let native = bitget_symbol(symbol);
+        let end = now_ms();
+        let start = start_time_ms
+            .unwrap_or(0)
+            .max(end.saturating_sub(FUNDING_MAX_RANGE_MS));
+        let (start, end) = (start.to_string(), end.to_string());
+        let mut id_less_than: Option<String> = None;
+        let mut records = Vec::new();
+        for _ in 0..FUNDING_MAX_PAGES {
+            let mut query = vec![
+                ("productType", BITGET_USDT_FUTURES),
+                ("symbol", native.as_str()),
+                ("businessType", "contract_settle_fee"),
+                ("startTime", start.as_str()),
+                ("endTime", end.as_str()),
+                ("limit", FUNDING_PAGE_LIMIT),
+            ];
+            if let Some(id) = &id_less_than {
+                query.push(("idLessThan", id.as_str()));
+            }
+            let text = self.signed_request(reqwest::Method::GET, "/api/v2/mix/account/bill", &query, None).await?;
+            let (page, end_id) = parse_funding_bills(&text, symbol)?;
+            let full_page = page.len() >= FUNDING_PAGE_LIMIT.parse::<usize>().unwrap_or(100);
+            records.extend(page);
+            match end_id {
+                Some(id) if full_page => id_less_than = Some(id),
+                _ => {
+                    records.sort_by_key(|r: &FundingIncomeRecord| r.tran_id);
+                    return Ok(records);
+                }
+            }
+        }
+        anyhow::bail!("bitget funding bills for {native} exceed {FUNDING_MAX_PAGES} pages, refusing partial result")
     }
 }
 
@@ -276,6 +328,37 @@ struct PositionEntry {
     hold_side: String,
     #[serde(default)]
     total: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BillPage {
+    #[serde(default)]
+    bills: Vec<BillEntry>,
+    #[serde(default)]
+    end_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BillEntry {
+    amount: String,
+    c_time: String,
+}
+
+/// 解析一页资金费账单，返回记录和翻页用的 `endId`。
+fn parse_funding_bills(text: &str, symbol: &Symbol) -> anyhow::Result<(Vec<FundingIncomeRecord>, Option<String>)> {
+    let page: BillPage = parse_bitget_data(text, "bills")?;
+    let records = page
+        .bills
+        .into_iter()
+        .map(|b| {
+            let time_ms: u64 = b.c_time.parse().with_context(|| format!("invalid bitget bill cTime '{}'", b.c_time))?;
+            let income = opt_decimal(&b.amount).with_context(|| format!("invalid bitget bill amount '{}'", b.amount))?;
+            Ok(FundingIncomeRecord { symbol: symbol.clone(), income, time_ms, tran_id: time_ms as i64 })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    Ok((records, page.end_id.filter(|id| !id.is_empty())))
 }
 
 fn parse_positions(text: &str) -> anyhow::Result<Decimal> {
@@ -549,6 +632,26 @@ fn parse_private_message(text: &str, venue: &Venue) -> PrivateMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_funding_bills_page() {
+        let text = r#"{"code":"00000","msg":"success","data":{"bills":[
+            {"billId":"2","symbol":"BTCUSDT","amount":"-0.42","fee":"0","businessType":"contract_settle_fee","coin":"USDT","cTime":"1700028800000"},
+            {"billId":"1","symbol":"BTCUSDT","amount":"0.1","fee":"0","businessType":"contract_settle_fee","coin":"USDT","cTime":"1700000000000"}
+        ],"endId":"1"}}"#;
+        let (records, end_id) = parse_funding_bills(text, &Symbol::new("BTC", "USDT")).unwrap();
+        assert_eq!(end_id.as_deref(), Some("1"));
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].income, Decimal::new(-42, 2));
+        assert_eq!(records[1].tran_id, 1_700_000_000_000);
+
+        let (records, end_id) =
+            parse_funding_bills(r#"{"code":"00000","msg":"success","data":{"bills":[],"endId":""}}"#, &Symbol::new("BTC", "USDT"))
+                .unwrap();
+        assert!(records.is_empty() && end_id.is_none());
+
+        assert!(parse_funding_bills(r#"{"code":"40009","msg":"sign error","data":null}"#, &Symbol::new("BTC", "USDT")).is_err());
+    }
 
     #[test]
     fn signs_and_builds_paths() {

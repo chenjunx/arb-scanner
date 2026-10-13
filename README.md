@@ -224,6 +224,8 @@ cargo run -- close --symbol BTC/USDT --kraken-spot-qty 0.005 --live
 
 独立常驻进程：定期轮询交易所资金费流水，通过 `PositionManager::apply_adjustment`（`AdjustmentReason::Funding`）累加进对应仓位的 `realized_pnl`。跟踪对象是 `PositionManager`（Redis 支撑）里每次轮询时读到的**当前非零仓位**，而不是启动时固定的一份列表，所以 `open`/`close` 开平的期货仓位不需要重启这个进程就能被自动跟踪/停止跟踪。如果 `monitor` 已经在跑且没加 `--no-portfolio`，通常不需要单独起本命令；只需要资金费追踪、不想启动价差扫描和行情连接时单独使用。
 
+`cross-funding --live` 也会自带资金费追踪，覆盖它用到的币安/Gate/OKX/Bitget 永续，用 `--funding-interval-secs`（默认 1800，0 关闭）和 `--funding-initial-lookback-hours`（默认 168）控制。默认引擎只有现货腿，不带资金费追踪。
+
 ```bash
 cargo run -- accounting
 cargo run -- accounting --testnet --interval-secs 900 --initial-lookback-hours 72
@@ -234,13 +236,25 @@ cargo run -- accounting --testnet --interval-secs 900 --initial-lookback-hours 7
 - `--interval-secs <secs>`（可选，默认 1800）：轮询间隔。
 - `--initial-lookback-hours <hours>`（可选，默认 168）：某个 `(venue, symbol)` 第一次被轮询、还没有游标时往回补多久的历史资金费记录。
 
-流程：每次 tick 从 `PositionManager::all_positions()` 重新读非零仓位，按 venue 找对应的 `FundingFeeProvider`（目前只注册了 `binance_futures` 一家）；用 Redis 里的游标（`arb_scanner:funding_cursor` Hash，field=`"{venue}|{symbol}"`，同时存 `last_time_ms`/`last_tran_id`，因为 Binance 只能按时间范围查、没有增量参数）算出本次查询起点，拉回流水后按 `tran_id` 过滤掉已入账的记录，累加进仓位已实现盈亏（`PositionManager::apply_adjustment`），游标推进到最新位置。
+流程：每次 tick 从 `PositionManager::all_positions()` 重新读非零仓位，按 venue 找对应的 `FundingFeeProvider`（`accounting`/`monitor` 只注册了 `binance_futures`；`cross-funding` 注册了它实际用到的币安/Gate/OKX/Bitget 永续）；用 Redis 里的游标（`arb_scanner:funding_cursor` Hash，field=`"{venue}|{symbol}"`，同时存 `last_time_ms`/`last_tran_id`，因为 Binance 只能按时间范围查、没有增量参数）算出本次查询起点，拉回流水后按 `tran_id` 过滤掉已入账的记录，累加进仓位已实现盈亏（`PositionManager::apply_adjustment`），游标推进到最新位置。
+
+Gate/OKX/Bitget 的资金费流水分别来自 `GET /futures/usdt/account_book?type=fund`、`GET /api/v5/account/bills?type=8`、`GET /api/v2/mix/account/bill?businessType=contract_settle_fee`，三家都用结算时间（毫秒）作为 `tran_id`。这三家是按官方文档写的，还没有用真实账户验证过。
+
+多进程互斥：游标的"读 → 入账 → 写回"不是原子操作，`accounting`、`monitor`、`cross-funding --live` 同时跑时，同一笔资金费可能被记好几次。所以每轮轮询前要先按 venue 抢 Redis 租约（key 为 `arb_scanner:funding_lease:{venue}`，value 是进程级随机 token，TTL 为轮询间隔的 2 倍再加 60 秒）：
+
+- 没有人持有就占上，已经是自己的就续期。
+- 被别的进程持有就跳过这个 venue。
+- 抢锁时 Redis 出错，也跳过这一轮。
+
+锁是按 venue 分的，没有用全局锁，因为不同进程注册的 provider 不一样。持有者退出后不会主动释放，等 TTL 过期后由其它进程接手。这段时间没记的流水，接手的进程会按游标补回来。
 
 依赖 `REDIS_URL`（默认 `redis://127.0.0.1:6379/`）连接 `RedisPositionStore`/`RedisPnlStore`/`RedisFundingCursorStore`，凭证走 `BINANCE_API_KEY`/`BINANCE_API_SECRET`。跑起来后一直轮询直到 ctrl-c。
 
 ## 定期报告（`report` 子命令）
 
 独立常驻进程：定期把投资组合盈亏/仓位明细/订单概览汇总成一份报告，分发给已注册的输出渠道（目前只有把内容打到日志的 `LogChannel`）。单独跑本命令时只连接 Redis 读数据，不接入实时行情，所以报告里的 `market_value`/`unrealized_pnl` 会显示为 `N/A`；如果通过 `monitor`（未加 `--no-portfolio`）驱动，接了实时行情，会有真实数字。如果 `monitor` 已经在跑且没加 `--no-portfolio`，通常不需要单独起本命令；只需要报告、不想启动价差扫描和行情连接时单独使用。
+
+常驻的策略命令在 live 下单时也会自带同一份报告，不用另起本命令：`cross-funding --live` 用 `--report-interval-secs`（默认 300，0 关闭）控制；默认引擎在 `[cross_exchange_execution]` 里用 `report_interval_secs`（默认 300，0 关闭）控制。这两种情况下，本进程交易的腿会接实时行情，市值和浮动盈亏有真实数字。报告内容仍然是 Redis 里的全局数据，同时跑多个策略进程时每个进程都会各打一份。
 
 ```bash
 cargo run -- report
