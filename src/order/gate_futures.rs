@@ -232,6 +232,8 @@ fn build_market_order_body(
 #[derive(Debug, Deserialize)]
 struct GateErrorResponse {
     label: String,
+    /// 有的错误只带 `label`(如 `{"label":"POSITION_NOT_FOUND"}`)。
+    #[serde(default)]
     message: String,
 }
 
@@ -323,8 +325,12 @@ struct PositionResponse {
     size: Decimal,
 }
 
+/// 从没在该合约上开过仓时 Gate 返回 `POSITION_NOT_FOUND`，按 0 仓位处理。
 fn parse_position(text: &str) -> anyhow::Result<Decimal> {
     if let Ok(err) = serde_json::from_str::<GateErrorResponse>(text) {
+        if err.label == "POSITION_NOT_FOUND" {
+            return Ok(Decimal::ZERO);
+        }
         anyhow::bail!("gate futures error {}: {}", err.label, err.message);
     }
     let position: PositionResponse =
@@ -698,6 +704,7 @@ mod tests {
         assert_eq!(parse_position(r#"{"contract":"PEPE_USDT","size":-12,"mode":"single"}"#).unwrap(), Decimal::from(-12));
         assert_eq!(parse_position(r#"{"contract":"PEPE_USDT","size":0}"#).unwrap(), Decimal::ZERO);
         assert!(parse_position(r#"{"label":"POSITION_DUAL_MODE","message":"dual mode"}"#).is_err());
+        assert_eq!(parse_position(r#"{"label":"POSITION_NOT_FOUND"}"#).unwrap(), Decimal::ZERO);
     }
 
     #[test]
