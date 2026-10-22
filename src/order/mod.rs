@@ -13,6 +13,27 @@ use rust_decimal::Decimal;
 use crate::types::{Symbol, Venue};
 use types::{LimitIocOrderRequest, LimitOrderRequest, MarketOrderRequest, OrderResult, OrderStatus};
 
+/// 下单请求可能已经到达交易所、但没拿到明确结果(响应前连接断开、交易所自己
+/// 报"结果未知"等)。和交易所明确拒单区分开：这种情况订单在交易所上可能存活，
+/// 不能当成被拒处理。
+#[derive(Debug)]
+pub struct OrderOutcomeUnknown(pub String);
+
+impl std::fmt::Display for OrderOutcomeUnknown {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "order outcome unknown: {}", self.0)
+    }
+}
+
+impl std::error::Error for OrderOutcomeUnknown {}
+
+/// 下单报错时订单是否可能已经存在于交易所：错误链里有 [`OrderOutcomeUnknown`]，
+/// 或者有 `reqwest::Error`(HTTP 请求发送/读响应失败，包括超时——请求可能已经
+/// 被交易所受理)。其余错误都是拿到了交易所的明确拒绝或者请求根本没发出去。
+pub fn order_outcome_unknown(err: &anyhow::Error) -> bool {
+    err.chain().any(|e| e.is::<OrderOutcomeUnknown>() || e.is::<reqwest::Error>())
+}
+
 /// 下单(执行层)扩展点：每个交易所实现市价单提交逻辑。这是按需调用的请求/响应
 /// 接口，和 `wallet::WalletProvider` 一样不接入 engine 主循环，供需要真实下单
 /// 的场景按需调用。
@@ -142,7 +163,9 @@ pub trait OrderProvider: Send + Sync {
 
     /// 查询某个永续合约当前的净持仓(单向持仓模式)，多头为正、空头为负、
     /// 无持仓为 0。单位是交易所自己的下单单位(币安是合约名对应的币数，
-    /// Gate 是张数)。默认实现是报错，现货交易所不需要实现。
+    /// Gate 是张数)。账户不是单向持仓模式时报错——下单都不带持仓方向参数，
+    /// 双向持仓下会被交易所拒单，调用方靠这里提前拦住。默认实现是报错，
+    /// 现货交易所不需要实现。
     async fn perp_position(&self, symbol: &Symbol) -> anyhow::Result<Decimal> {
         anyhow::bail!("perp_position not supported for venue {} ({symbol})", self.venue())
     }

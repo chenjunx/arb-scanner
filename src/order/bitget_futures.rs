@@ -42,8 +42,9 @@ const FUNDING_MAX_RANGE_MS: u64 = 30 * 24 * 3_600_000 - 60_000;
 /// 凭证读 `BITGET_API_KEY` / `BITGET_API_SECRET` / `BITGET_API_PASSPHRASE`。
 ///
 /// 下单量单位是 base 币(合约名里的 base，含乘数前缀)。要求账户是单向持仓
-/// 模式(不传 `tradeSide`)；保证金模式 `marginMode` 每笔必填，由构造参数
-/// 给出，必须和用户在交易所设置的一致。杠杆、持仓模式由用户预先设置，这里不修改。
+/// 模式(不传 `tradeSide`，`perp_position` 会先检查)；保证金模式 `marginMode`
+/// 每笔必填，由构造参数给出，必须和用户在交易所设置的一致。杠杆、持仓模式由
+/// 用户预先设置，这里不修改。
 pub struct BitgetFuturesOrderProvider {
     venue: Venue,
     credentials: BitgetCredentials,
@@ -193,11 +194,15 @@ impl OrderProvider for BitgetFuturesOrderProvider {
         parse_order_detail_response(&text)
     }
 
+    /// 先 `GET /api/v2/mix/account/account` 确认是单向持仓(`one_way_mode`，下单
+    /// 不带 `tradeSide`，双向持仓下会被拒 40774)，再
     /// `GET /api/v2/mix/position/single-position`：没有持仓时返回空数组；按
     /// `holdSide`(long/short)定方向后求和。单位是 base 币。
     async fn perp_position(&self, symbol: &Symbol) -> anyhow::Result<Decimal> {
         let symbol = bitget_symbol(symbol);
         let query = [("symbol", symbol.as_str()), ("productType", BITGET_USDT_FUTURES), ("marginCoin", MARGIN_COIN)];
+        let text = self.signed_request(reqwest::Method::GET, "/api/v2/mix/account/account", &query, None).await?;
+        ensure_one_way_mode(&text)?;
         let text = self.signed_request(reqwest::Method::GET, "/api/v2/mix/position/single-position", &query, None).await?;
         parse_positions(&text)
     }
@@ -359,6 +364,21 @@ fn parse_funding_bills(text: &str, symbol: &Symbol) -> anyhow::Result<(Vec<Fundi
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
     Ok((records, page.end_id.filter(|id| !id.is_empty())))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AccountEntry {
+    #[serde(default)]
+    pos_mode: String,
+}
+
+fn ensure_one_way_mode(text: &str) -> anyhow::Result<()> {
+    let account: AccountEntry = parse_bitget_data(text, "account")?;
+    if account.pos_mode != "one_way_mode" {
+        anyhow::bail!("bitget 账户持仓模式是 '{}'，需要先在交易所改成单向持仓(one_way_mode)", account.pos_mode);
+    }
+    Ok(())
 }
 
 fn parse_positions(text: &str) -> anyhow::Result<Decimal> {
@@ -708,6 +728,16 @@ mod tests {
         let result = parse_order_detail_response(text).unwrap();
         assert_eq!(result.status, OrderStatus::Expired);
         assert_eq!(result.avg_price, None);
+    }
+
+    #[test]
+    fn one_way_mode_check_rejects_hedge_mode() {
+        let ok = r#"{"code":"00000","msg":"success","data":{"marginCoin":"USDT","marginMode":"crossed","posMode":"one_way_mode"}}"#;
+        ensure_one_way_mode(ok).unwrap();
+        let hedge = r#"{"code":"00000","msg":"success","data":{"marginCoin":"USDT","posMode":"hedge_mode"}}"#;
+        assert!(ensure_one_way_mode(hedge).unwrap_err().to_string().contains("hedge_mode"));
+        assert!(ensure_one_way_mode(r#"{"code":"00000","msg":"success","data":{"marginCoin":"USDT"}}"#).is_err());
+        assert!(ensure_one_way_mode(r#"{"code":"40037","msg":"Apikey does not exist","data":null}"#).is_err());
     }
 
     #[test]

@@ -6,7 +6,7 @@ use log::{error, info, warn};
 use rust_decimal::Decimal;
 use tokio::task::JoinHandle;
 
-use crate::order::OrderProvider;
+use crate::order::{OrderProvider, order_outcome_unknown};
 use crate::order::types::{LimitIocOrderRequest, LimitOrderRequest, MarketOrderRequest, OrderAmount, OrderResult, OrderStatus};
 use crate::position::PositionManager;
 use crate::topic::{Topic, TopicBus};
@@ -236,6 +236,7 @@ impl ExecutionService {
             None => {
                 let reason = format!("no adapter registered for venue {}", request.venue);
                 error!("ExecutionService: order_id={order_id} {reason}");
+                self.mark_rejected(&order_id, &reason);
                 self.publish_rejected(&request.strategy_id, order_id, request.client_order_id.clone(), reason);
                 return;
             }
@@ -267,6 +268,7 @@ impl ExecutionService {
 
                 if result.status == OrderStatus::Rejected {
                     let reason = format!("exchange rejected: status={:?}", result.status);
+                    self.mark_rejected(&order_id, &reason);
                     self.publish_rejected(&request.strategy_id, order_id, request.client_order_id.clone(), reason);
                 } else {
                     let exchange_order_id = result.order_id.clone();
@@ -294,6 +296,13 @@ impl ExecutionService {
             Err(err) => {
                 let reason = format!("exchange error: {err:#}");
                 error!("ExecutionService: order_id={order_id} {reason}");
+                // 结果未知(请求可能已被受理)时保持 New，交给后续 WS 推送/人工核对定终态；
+                // 否则交易所上不存在这笔单，永远不会有推送，必须在这里落 Rejected。
+                if order_outcome_unknown(&err) {
+                    warn!("ExecutionService: order_id={order_id} outcome unknown, keeping status New until exchange confirms");
+                } else {
+                    self.mark_rejected(&order_id, &reason);
+                }
                 self.publish_rejected(&request.strategy_id, order_id, request.client_order_id.clone(), reason);
             }
         }
@@ -414,6 +423,28 @@ impl ExecutionService {
         }
     }
 
+    /// 下单阶段就被拒的订单落 `Rejected` + 原因。只改仍是 `New` 的订单：WS 推送
+    /// 可能先一步把它推进到别的状态，那是更权威的结果，不能覆盖。
+    fn mark_rejected(&self, order_id: &super::types::OrderId, reason: &str) {
+        let reason = reason.to_string();
+        let updated_at_ms = current_timestamp_ms();
+        let outcome = self.order_store.update(
+            order_id,
+            Box::new(move |order| {
+                if order.status != OrderStatus::New {
+                    return false;
+                }
+                order.status = OrderStatus::Rejected;
+                order.reject_reason = Some(reason);
+                order.updated_at_ms = updated_at_ms;
+                true
+            }),
+        );
+        if matches!(outcome, super::store::OrderUpdateOutcome::NotFound) {
+            warn!("ExecutionService: order_id={order_id} not found when marking rejected");
+        }
+    }
+
     fn publish_rejected(
         &self,
         strategy_id: &str,
@@ -431,4 +462,81 @@ fn current_timestamp_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_millis() as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use async_trait::async_trait;
+
+    use super::*;
+    use crate::order::OrderOutcomeUnknown;
+    use crate::order::types::OrderSide;
+    use crate::order_manager::store::InMemoryOrderStore;
+    use crate::order_manager::types::OrderId;
+
+    /// 下单总是返回 `make_err` 造出的错误。
+    struct FailingProvider {
+        make_err: fn() -> anyhow::Error,
+    }
+
+    #[async_trait]
+    impl OrderProvider for FailingProvider {
+        fn venue(&self) -> Venue {
+            Venue::new("bitget_futures")
+        }
+
+        async fn place_market_order_raw(&self, _req: &MarketOrderRequest) -> anyhow::Result<OrderResult> {
+            Err((self.make_err)())
+        }
+    }
+
+    fn request() -> OrderRequest {
+        OrderRequest {
+            strategy_id: "test".to_string(),
+            venue: Venue::new("bitget_futures"),
+            symbol: Symbol::new("FUTU", "USDT"),
+            side: OrderSide::Buy,
+            amount: OrderAmount::Base(Decimal::ONE),
+            order_kind: OrderKind::Market,
+            client_order_id: Some("cf1".to_string()),
+            group_id: None,
+            metadata: None,
+            order_id: None,
+        }
+    }
+
+    async fn submit_with(make_err: fn() -> anyhow::Error) -> Order {
+        let store = Arc::new(InMemoryOrderStore::new());
+        let order_id = OrderId::new("ORD-1");
+        store.upsert(Order {
+            order_id: order_id.clone(),
+            request: AnyOrderRequest::Trade(request()),
+            status: OrderStatus::New,
+            filled_qty: Decimal::ZERO,
+            avg_price: None,
+            exchange_order_id: None,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            reject_reason: None,
+        });
+        let venue = Venue::new("bitget_futures");
+        let adapter = Arc::new(ExchangeAdapter::new(venue.clone(), Arc::new(FailingProvider { make_err })));
+        let service = ExecutionService::new(Arc::new(TopicBus::new()), HashMap::from([(venue, adapter)]), store.clone());
+        service.handle_trade(order_id.clone(), request()).await;
+        store.get(&order_id).unwrap()
+    }
+
+    #[tokio::test]
+    async fn explicit_exchange_rejection_is_persisted_as_rejected() {
+        let order = submit_with(|| anyhow::anyhow!("bitget error 40774: unilateral position")).await;
+        assert_eq!(order.status, OrderStatus::Rejected);
+        assert!(order.reject_reason.unwrap().contains("40774"));
+    }
+
+    #[tokio::test]
+    async fn unknown_outcome_keeps_order_new() {
+        let order = submit_with(|| anyhow::Error::new(OrderOutcomeUnknown("ws closed".to_string())).context("submit")).await;
+        assert_eq!(order.status, OrderStatus::New);
+        assert!(order.reject_reason.is_none());
+    }
 }

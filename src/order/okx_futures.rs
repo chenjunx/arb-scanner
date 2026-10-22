@@ -189,9 +189,12 @@ impl OrderProvider for OkxFuturesOrderProvider {
         parse_query_order_response(&text)
     }
 
-    /// `GET /api/v5/account/positions`：没有持仓时返回空数组；单向持仓下 `pos`
-    /// 自带正负，双向持仓下按 `posSide` 定方向后求和。单位是张。
+    /// 先 `GET /api/v5/account/config` 确认是单向持仓(`net_mode`，下单不带
+    /// `posSide`，双向持仓下会被拒)，再 `GET /api/v5/account/positions`：没有
+    /// 持仓时返回空数组；`pos` 自带正负。单位是张。
     async fn perp_position(&self, symbol: &Symbol) -> anyhow::Result<Decimal> {
+        let text = self.signed_request(reqwest::Method::GET, "/api/v5/account/config", &[], None).await?;
+        ensure_net_mode(&text)?;
         let inst_id = okx_swap_inst_id(symbol);
         let query = [("instType", "SWAP"), ("instId", inst_id.as_str())];
         let text = self.signed_request(reqwest::Method::GET, "/api/v5/account/positions", &query, None).await?;
@@ -419,6 +422,22 @@ fn parse_funding_bills(text: &str, symbol: &Symbol) -> anyhow::Result<(Vec<Fundi
     Ok((records, last_bill_id))
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AccountConfig {
+    #[serde(default)]
+    pos_mode: String,
+}
+
+fn ensure_net_mode(text: &str) -> anyhow::Result<()> {
+    let configs: Vec<AccountConfig> = parse_okx_data(text, "account config")?;
+    let pos_mode = configs.first().map(|c| c.pos_mode.as_str()).unwrap_or_default();
+    if pos_mode != "net_mode" {
+        anyhow::bail!("okx 账户持仓模式是 '{pos_mode}'，需要先在交易所改成单向持仓(net_mode)");
+    }
+    Ok(())
+}
+
 fn parse_positions(text: &str) -> anyhow::Result<Decimal> {
     let positions: Vec<PositionEntry> = parse_okx_data(text, "positions")?;
     Ok(positions
@@ -633,6 +652,15 @@ fn parse_private_message(text: &str, venue: &Venue) -> PrivateMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn net_mode_check_rejects_long_short_mode() {
+        ensure_net_mode(r#"{"code":"0","msg":"","data":[{"posMode":"net_mode","acctLv":"2"}]}"#).unwrap();
+        let err = ensure_net_mode(r#"{"code":"0","msg":"","data":[{"posMode":"long_short_mode"}]}"#).unwrap_err();
+        assert!(err.to_string().contains("long_short_mode"));
+        assert!(ensure_net_mode(r#"{"code":"0","msg":"","data":[]}"#).is_err());
+        assert!(ensure_net_mode(r#"{"code":"50113","msg":"Invalid Sign","data":[]}"#).is_err());
+    }
 
     #[test]
     fn parses_funding_bills_page() {

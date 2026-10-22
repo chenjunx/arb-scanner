@@ -22,7 +22,7 @@ use crate::order_manager::OrderManager;
 use crate::order_manager::stream::{ExchangeOrderUpdate, OrderStreamSource};
 use crate::types::{Symbol, Venue};
 
-use super::OrderProvider;
+use super::{OrderOutcomeUnknown, OrderProvider};
 use super::types::{LimitIocOrderRequest, LimitOrderRequest, MarketOrderRequest, OrderAmount, OrderResult, OrderSide, OrderStatus};
 
 const HOST: &str = "https://api.kraken.com";
@@ -492,9 +492,10 @@ impl KrakenPrivateWs {
             anyhow::bail!("kraken order ws for venue={} connection just closed", self.venue);
         }
 
+        // 请求已经发出去了，响应前连接断开：订单可能已被受理。
         match rx.await {
             Ok(result) => result,
-            Err(_) => anyhow::bail!("kraken order ws for venue={} response channel closed", self.venue),
+            Err(_) => Err(OrderOutcomeUnknown(format!("kraken order ws for venue={} response channel closed", self.venue)).into()),
         }
     }
 

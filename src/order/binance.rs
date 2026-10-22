@@ -20,7 +20,7 @@ use crate::order_manager::stream::{ExchangeOrderUpdate, OrderStreamSource};
 use crate::order_manager::OrderManager;
 use crate::types::{Symbol, Venue};
 
-use super::OrderProvider;
+use super::{OrderOutcomeUnknown, OrderProvider};
 use super::types::{LimitIocOrderRequest, LimitOrderRequest, MarketOrderRequest, OrderAmount, OrderResult, OrderSide, OrderStatus};
 
 const MAINNET_HOST: &str = "https://api.binance.com";
@@ -354,6 +354,10 @@ fn sum_fee_by_asset(fills: &[OrderFill]) -> (Option<Decimal>, Option<String>) {
 
 fn parse_order_response(text: &str) -> anyhow::Result<OrderResult> {
     if let Ok(err) = serde_json::from_str::<ErrorResponse>(text) {
+        // -1007：撮合后端超时，下单是否成功未知。
+        if err.code == -1007 {
+            return Err(OrderOutcomeUnknown(format!("binance error {}: {}", err.code, err.msg)).into());
+        }
         anyhow::bail!("binance error {}: {}", err.code, err.msg);
     }
     let resp: OrderResponse = serde_json::from_str(text)

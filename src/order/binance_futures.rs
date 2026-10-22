@@ -21,7 +21,7 @@ use crate::order_manager::stream::{ExchangeOrderUpdate, OrderStreamSource};
 use crate::order_manager::OrderManager;
 use crate::types::{Symbol, Venue};
 
-use super::OrderProvider;
+use super::{OrderOutcomeUnknown, OrderProvider};
 use super::types::{LimitIocOrderRequest, LimitOrderRequest, MarketOrderRequest, OrderAmount, OrderResult, OrderSide, OrderStatus};
 
 const MAINNET_HOST: &str = "https://fapi.binance.com";
@@ -42,8 +42,8 @@ const LISTEN_KEY_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30 * 60);
 /// 凭证也复用同一套环境变量(同一个 API Key 上勾选现货+合约交易权限即可)。
 ///
 /// 只支持币安账户默认的单向持仓模式(One-way Mode)：不传 `positionSide`。
-/// 如果账户被手动切换成双向持仓模式(Hedge Mode)，下单会报错，需要用户自行
-/// 确保账户模式和这里的假设一致。
+/// 如果账户被手动切换成双向持仓模式(Hedge Mode)，下单会报错；`perp_position`
+/// 会先检查持仓模式，双向持仓时直接报错。
 pub struct BinanceFuturesOrderProvider {
     venue: Venue,
     api_key: String,
@@ -251,10 +251,13 @@ impl OrderProvider for BinanceFuturesOrderProvider {
         parse_ticker_price(&text)
     }
 
-    /// `GET /fapi/v3/positionRisk?symbol=X`：单向持仓模式下只有一条 `BOTH`
-    /// 记录，`positionAmt` 多正空负；没有持仓时返回空数组。保险起见把所有条目
-    /// 的 `positionAmt` 加总(双向持仓模式下 LONG/SHORT 两条加总也是净持仓)。
+    /// 先 `GET /fapi/v1/positionSide/dual` 确认是单向持仓(下单不带
+    /// `positionSide`，双向持仓下会被拒)，再 `GET /fapi/v3/positionRisk?symbol=X`：
+    /// 单向持仓模式下只有一条 `BOTH` 记录，`positionAmt` 多正空负；没有持仓时
+    /// 返回空数组。
     async fn perp_position(&self, symbol: &Symbol) -> anyhow::Result<Decimal> {
+        let text = self.signed_request(reqwest::Method::GET, "/fapi/v1/positionSide/dual", Vec::new()).await?;
+        ensure_one_way_mode(&text)?;
         let params = vec![("symbol".to_string(), binance_symbol(symbol))];
         let text = self.signed_request(reqwest::Method::GET, "/fapi/v3/positionRisk", params).await?;
         parse_position_risk(&text)
@@ -642,6 +645,10 @@ struct OrderResponse {
 
 fn parse_order_response(text: &str) -> anyhow::Result<OrderResult> {
     if let Ok(err) = serde_json::from_str::<ErrorResponse>(text) {
+        // -1007：撮合后端超时，下单是否成功未知。
+        if err.code == -1007 {
+            return Err(OrderOutcomeUnknown(format!("binance futures error {}: {}", err.code, err.msg)).into());
+        }
         anyhow::bail!("binance futures error {}: {}", err.code, err.msg);
     }
     let resp: OrderResponse = serde_json::from_str(text)
@@ -697,6 +704,24 @@ fn parse_user_trades_response(text: &str) -> anyhow::Result<(Option<Decimal>, Op
 #[serde(rename_all = "camelCase")]
 struct PositionRiskEntry {
     position_amt: Decimal,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PositionSideDualResponse {
+    dual_side_position: bool,
+}
+
+fn ensure_one_way_mode(text: &str) -> anyhow::Result<()> {
+    if let Ok(err) = serde_json::from_str::<ErrorResponse>(text) {
+        anyhow::bail!("binance futures error {}: {}", err.code, err.msg);
+    }
+    let resp: PositionSideDualResponse = serde_json::from_str(text)
+        .with_context(|| format!("failed to parse binance futures positionSide/dual response, raw body: {text}"))?;
+    if resp.dual_side_position {
+        anyhow::bail!("binance futures 账户是双向持仓模式，需要先在交易所改成单向持仓");
+    }
+    Ok(())
 }
 
 fn parse_position_risk(text: &str) -> anyhow::Result<Decimal> {
@@ -956,6 +981,15 @@ mod tests {
         assert_eq!(parse_position_risk(text).unwrap(), Decimal::from(-12000));
         assert_eq!(parse_position_risk("[]").unwrap(), Decimal::ZERO);
         let err = parse_position_risk(r#"{"code":-2015,"msg":"Invalid API-key"}"#).unwrap_err();
+        assert!(err.to_string().contains("Invalid API-key"));
+    }
+
+    #[test]
+    fn one_way_mode_check_rejects_hedge_mode() {
+        ensure_one_way_mode(r#"{"dualSidePosition":false}"#).unwrap();
+        let err = ensure_one_way_mode(r#"{"dualSidePosition":true}"#).unwrap_err();
+        assert!(err.to_string().contains("双向持仓"));
+        let err = ensure_one_way_mode(r#"{"code":-2015,"msg":"Invalid API-key"}"#).unwrap_err();
         assert!(err.to_string().contains("Invalid API-key"));
     }
 
