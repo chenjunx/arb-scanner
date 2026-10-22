@@ -1,9 +1,13 @@
 //! `set-position` 子命令：用交易所后台核对出的真实持仓，覆盖写 Redis 里
 //! `PositionManager` 记的 `net_qty`/`avg_price`——用于修正历史 bug(WS 成交被
 //! REST 轮询覆盖、跨进程订单号碰撞导致重复计成交等)遗留下来的脏数据，这些
-//! 数据是纯增量累加出来的，代码修好之后也不会自动纠正。只支持
-//! `binance_spot`/`binance_futures` 两个 venue，和 `reconcile-order` 一样默认
-//! 只读、加 `--confirm` 才真正覆盖写入。
+//! 数据是纯增量累加出来的，代码修好之后也不会自动纠正；也用于手动补单后把
+//! 交易所上的真实持仓补录进来。只支持 [`VENUES`] 里列出的、真实下过单的
+//! venue，和 `reconcile-order` 一样默认只读、加 `--confirm` 才真正覆盖写入。
+//!
+//! `--qty` 的单位要和这个 venue 在 Redis 里已有记录的单位一致：仓位按交易所
+//! 回报的成交量直接累加，`gate_futures`/`okx_futures` 记的是**张数**，其余
+//! venue 记的是币数。
 
 use clap::Args;
 use log::info;
@@ -17,18 +21,33 @@ use anyhow::Context;
 use super::args::{now_ms, parse_symbol};
 use super::wiring;
 
-/// 只允许覆盖写这两个 venue：其它场所的仓位没有出现过需要人工修正的脏数据，
-/// 限制住可写范围，避免手滑把 venue 名打错后凭空写出一条无人认领的仓位记录。
+/// 各下单链路实际写进仓位记录的 venue 名：`binance`/`kraken` 是常驻引擎按
+/// config.toml 里的 venue 名下单，其余是各子命令写死的名字。限制住可写范围，
+/// 避免手滑把 venue 名打错后凭空写出一条无人认领的仓位记录。
+const VENUES: [&str; 9] = [
+    "binance",
+    "binance_spot",
+    "binance_futures",
+    "kraken",
+    "kraken_spot",
+    "gate_spot",
+    "gate_futures",
+    "okx_futures",
+    "bitget_futures",
+];
+
 fn parse_venue(raw: &str) -> Result<Venue, String> {
-    match raw {
-        "binance_spot" | "binance_futures" => Ok(Venue::new(raw)),
-        other => Err(format!("只支持 binance_spot/binance_futures，收到 '{other}'")),
+    if VENUES.contains(&raw) {
+        Ok(Venue::new(raw))
+    } else {
+        Err(format!("只支持 {}，收到 '{raw}'", VENUES.join("/")))
     }
 }
 
 #[derive(Args, Debug)]
 pub struct SetPositionArgs {
-    /// 要覆盖写的场所：binance_spot / binance_futures
+    /// 要覆盖写的场所：binance / binance_spot / binance_futures / kraken /
+    /// kraken_spot / gate_spot / gate_futures / okx_futures / bitget_futures
     #[arg(long, value_parser = parse_venue)]
     pub venue: Venue,
 
@@ -36,7 +55,8 @@ pub struct SetPositionArgs {
     #[arg(long, value_parser = parse_symbol)]
     pub symbol: Symbol,
 
-    /// 交易所后台查到的真实净持仓量(正=多头/净持有，负=空头)
+    /// 交易所后台查到的真实净持仓量(正=多头/净持有，负=空头)；
+    /// gate_futures/okx_futures 填张数，其余填币数
     #[arg(long)]
     pub qty: Decimal,
 
@@ -96,4 +116,18 @@ pub async fn run(args: SetPositionArgs) -> anyhow::Result<()> {
     println!("写入后的记录: {updated:#?}");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_venue_accepts_known_venues_and_rejects_typos() {
+        for venue in VENUES {
+            assert_eq!(parse_venue(venue).unwrap(), Venue::new(venue));
+        }
+        assert!(parse_venue("bitget").is_err());
+        assert!(parse_venue("gate_future").is_err());
+    }
 }
