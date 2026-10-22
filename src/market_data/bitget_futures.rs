@@ -33,6 +33,8 @@ const WS_PING_INTERVAL: Duration = Duration::from_secs(20);
 const CANDLES_LIMIT_MAX: usize = 1000;
 /// `/api/v2/mix/market/history-candles` 单次最多 200 根。
 const HISTORY_CANDLES_LIMIT_MAX: usize = 200;
+/// `history-candles` 在 host 级限流之外再单独限流，见 [`crate::ratelimit`]。
+const HISTORY_CANDLES_LIMIT_KEY: &str = "bitget:/api/v2/mix/market/history-candles";
 
 fn candle_granularity(interval: KlineInterval) -> &'static str {
     match interval {
@@ -283,6 +285,7 @@ impl KlineProvider for BitgetFuturesKlineClient {
                 ("endTime", end.to_string()),
                 ("limit", HISTORY_CANDLES_LIMIT_MAX.to_string()),
             ];
+            crate::ratelimit::throttle(HISTORY_CANDLES_LIMIT_KEY).await;
             let text = self.public_get("/api/v2/mix/market/history-candles", &query).await?;
             let page = parse_candles(&text)?;
             let Some(oldest) = page.iter().map(|k| k.open_time_ms).min() else {

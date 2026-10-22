@@ -85,6 +85,9 @@ fn bucket_config(host: &str) -> (f64, f64) {
         "https://www.okx.com" | "https://api.bitget.com" => (10.0, 5.0),
         // 币安 fundingRate/fundingInfo 共享 500 次/5 分钟：20 + 1.5*300 = 470 < 500。
         "binance:/fapi/v1/fundingRate" => (20.0, 1.5),
+        // Bitget 历史 K 线：按 host 的 5 次/s 连续翻页(一年小时线约 48 页)实测会 429，
+        // 单独再限到 2 次/s、不留突发。
+        "bitget:/api/v2/mix/market/history-candles" => (1.0, 2.0),
         other => {
             log::warn!("ratelimit: no explicit config for host {other}, using conservative default (5 burst, 1/s)");
             (5.0, 1.0)
