@@ -446,10 +446,14 @@ pub struct CalibratedBin {
 /// 按校准规则把 `limit_table` 变成可用的 k* 表：
 /// 1. 空档、粗档独立段数 < `min_segments`、期望 B ≤ 0 的档直接开；
 /// 2. 平台范围只有一个点的档，k* 取左右相邻有效档(不是直接开、平台也不止一个
-///    点)的 k* 平均；只有一侧有效就用那一侧，两侧都没有就直接开。
-pub fn apply_rules(samples: &[Sample], params: &RuleParams) -> Vec<CalibratedBin> {
+///    点)的 k* 平均；只有一侧有效就用那一侧，两侧都没有就直接开；
+/// 3. 数据不足(空档、段数不足)的档退回用全部样本(`overall`)的最优 k 等待，
+///    全部样本期望 B ≤ 0 时仍直接开。研究原规则是直接开，按用户要求改(上线不久的
+///    新币每档都段数不足，直接开等于不管价差高低一律立即吃单)。
+pub fn apply_rules(samples: &[Sample], params: &RuleParams, overall: Option<&BinStats>) -> Vec<CalibratedBin> {
     let fine = limit_table(samples, params.width);
     let coarse = limit_table(samples, params.segment_width);
+    let mut thin = Vec::new();
     let mut bins: Vec<CalibratedBin> = fine
         .into_iter()
         .enumerate()
@@ -459,6 +463,7 @@ pub fn apply_rules(samples: &[Sample], params: &RuleParams) -> Vec<CalibratedBin
                 .get(bin_index(lo, params.segment_width))
                 .and_then(|c| c.as_ref())
                 .map_or(0, |c| c.segments);
+            thin.push(stats.is_none() || coarse_segments < params.min_segments);
             let action = match &stats {
                 None => BinAction::DirectOpen { reason: "无样本".to_string() },
                 Some(_) if coarse_segments < params.min_segments => BinAction::DirectOpen {
@@ -506,6 +511,15 @@ pub fn apply_rules(samples: &[Sample], params: &RuleParams) -> Vec<CalibratedBin
     for (i, action) in fixes {
         bins[i].action = action;
     }
+
+    if let Some(o) = overall.filter(|o| o.b_expect_bp > 0.0) {
+        for (bin, _) in bins.iter_mut().zip(&thin).filter(|(_, thin)| **thin) {
+            if let BinAction::DirectOpen { reason } = &bin.action {
+                let note = format!("{reason}，用全部样本最优 k");
+                bin.action = BinAction::Wait { k_star: o.b_k, note: Some(note) };
+            }
+        }
+    }
     bins
 }
 
@@ -551,7 +565,7 @@ pub struct KStarTable {
     pub samples: usize,
     /// 365 天 σ 中位数(bp)，决策时算 σ 比用。
     pub sigma_median_bp: f64,
-    /// 全部样本一起算的汇总(参考)。
+    /// 全部样本一起算的汇总；数据不足的档用它的最优 k，见 [`apply_rules`]。
     pub overall: Option<BinStats>,
     pub bins: Vec<CalibratedBin>,
 }
@@ -573,6 +587,7 @@ pub fn calibrate(pair: &str, series: &HourlySpread, rules: RuleParams, version: 
     let sigma_median_bp =
         sigma_median(series, &stats.sigma_bp).ok_or_else(|| anyhow::anyhow!("{pair}: 算不出 365 天 σ 中位数"))?;
     let all: Vec<&Sample> = samples.iter().collect();
+    let overall = bin_stats(0.0, 100.0, &all);
     Ok(KStarTable {
         pair: pair.to_string(),
         version,
@@ -581,8 +596,8 @@ pub fn calibrate(pair: &str, series: &HourlySpread, rules: RuleParams, version: 
         rules,
         samples: samples.len(),
         sigma_median_bp,
-        overall: bin_stats(0.0, 100.0, &all),
-        bins: apply_rules(&samples, &rules),
+        bins: apply_rules(&samples, &rules, overall.as_ref()),
+        overall,
     })
 }
 
@@ -926,7 +941,7 @@ mod tests {
         samples.extend(bin_samples(45.0, 0.2, -50.0, 30_000)); // [40,50)：平台 0.2–0.2
         samples.extend(bin_samples(55.0, 3.0, -5.0, 40_000)); // [50,60)
         samples.push(sample(50_000, 95.0, 1.0, 1.0, -1.0)); // [90,100]：段数不足(粗档 [80,100] 只有 1 段)
-        let bins = apply_rules(&samples, &RuleParams::default());
+        let bins = apply_rules(&samples, &RuleParams::default(), None);
         assert_eq!(bins.len(), 10);
         assert_eq!(bins[0].action, BinAction::Wait { k_star: 1.0, note: None });
         assert!(matches!(&bins[1].action, BinAction::DirectOpen { reason } if reason.contains("期望 B")));
@@ -939,9 +954,35 @@ mod tests {
     }
 
     #[test]
+    fn thin_bins_fall_back_to_overall_k() {
+        let mut samples = bin_samples(15.0, 0.0, -1.0, 0); // [10,20)：B ≤ 0，仍直接开
+        samples.extend(bin_samples(25.0, 2.0, -5.0, 10_000)); // [20,30)：段数够，用自己的 k*
+        samples.push(sample(50_000, 95.0, 1.0, 1.0, -1.0)); // [90,100]：段数不足
+        let overall = |b| BinStats { b_k: 0.7, b_expect_bp: b, ..bin_stats(0.0, 100.0, &[&samples[0]]).unwrap() };
+
+        let bins = apply_rules(&samples, &RuleParams::default(), Some(&overall(5.0)));
+        assert!(matches!(&bins[1].action, BinAction::DirectOpen { reason } if reason.contains("期望 B")));
+        assert_eq!(bins[2].action, BinAction::Wait { k_star: 2.0, note: None });
+        for i in [0, 3, 9] {
+            // 空档和段数不足的档都用全部样本的 k=0.7，备注保留原因
+            assert!(
+                matches!(&bins[i].action, BinAction::Wait { k_star, note: Some(note) }
+                    if *k_star == 0.7 && note.contains("用全部样本最优 k")),
+                "bin {i}: {:?}",
+                bins[i].action
+            );
+        }
+        assert!(matches!(&bins[9].action, BinAction::Wait { note: Some(note), .. } if note.contains("独立段数 1 < 10")));
+
+        // 全部样本期望 B ≤ 0：数据不足的档照旧直接开
+        let bins = apply_rules(&samples, &RuleParams::default(), Some(&overall(0.0)));
+        assert!(matches!(&bins[9].action, BinAction::DirectOpen { reason } if reason.contains("独立段数 1 < 10")));
+    }
+
+    #[test]
     fn single_point_platform_without_usable_neighbors_opens_directly() {
         let samples = bin_samples(45.0, 0.2, -50.0, 0);
-        let bins = apply_rules(&samples, &RuleParams::default());
+        let bins = apply_rules(&samples, &RuleParams::default(), None);
         assert!(matches!(&bins[4].action, BinAction::DirectOpen { reason } if reason.contains("相邻也没有有效档")));
     }
 
@@ -950,7 +991,7 @@ mod tests {
         let mut samples = bin_samples(35.0, 1.0, -5.0, 0);
         samples.extend(bin_samples(45.0, 0.2, -50.0, 10_000));
         samples.extend(bin_samples(55.0, 2.0, -5.0, 20_000));
-        let bins = apply_rules(&samples, &RuleParams::default());
+        let bins = apply_rules(&samples, &RuleParams::default(), None);
         assert!(matches!(bins[4].action, BinAction::Wait { k_star, .. } if (k_star - 1.5).abs() < 1e-12));
     }
 
