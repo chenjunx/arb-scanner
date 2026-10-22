@@ -1,6 +1,8 @@
 pub mod cross_exchange;
 pub mod cross_funding;
+pub mod kstar_store;
 pub mod manual;
+pub mod spread_wait;
 pub mod triangular;
 
 use std::collections::HashSet;

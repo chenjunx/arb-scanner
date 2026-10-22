@@ -17,7 +17,9 @@ use crate::net::connect_tcp;
 use crate::topic::{Topic, TopicBus};
 use crate::types::{Quote, Symbol, Venue};
 
-use super::{Kline, KlineInterval, KlineProvider, MarketDataSource, closed_klines, now_ms};
+use super::{
+    Kline, KlineInterval, KlineProvider, MarketDataSource, RANGE_MAX_PAGES, closed_klines, closed_klines_in_range, now_ms,
+};
 
 const WS_HOST: &str = "ws.okx.com";
 const WS_PORT: u16 = 8443;
@@ -31,6 +33,15 @@ const WS_PING_INTERVAL: Duration = Duration::from_secs(20);
 const CANDLES_LIMIT_MAX: usize = 300;
 /// 翻页上限，防止交易所一直返回满页时死循环(10 页 = 3000 根，远超用量)。
 const CANDLES_MAX_PAGES: usize = 10;
+/// `/api/v5/market/history-candles` 单次最多 100 根。
+const HISTORY_CANDLES_LIMIT_MAX: usize = 100;
+
+fn candle_bar(interval: KlineInterval) -> &'static str {
+    match interval {
+        KlineInterval::M5 => "5m",
+        KlineInterval::H1 => "1H",
+    }
+}
 
 /// OKX USDT 本位永续一档盘口行情源：订阅公开频道 `bbo-tbt`(逐笔推送的最优
 /// 买卖价)。发布的报价是交易所原始报价(每币价格)，挂单量单位是张。
@@ -236,10 +247,7 @@ impl KlineProvider for OkxFuturesKlineClient {
     /// 多要 1 根再交给 [`closed_klines`] 排序、剔除。单次最多 300 根，不够就用
     /// `after`(早于该时间戳)往前翻页。
     async fn klines(&self, symbol: &Symbol, interval: KlineInterval, limit: usize) -> anyhow::Result<Vec<Kline>> {
-        let bar = match interval {
-            KlineInterval::M5 => "5m",
-            KlineInterval::H1 => "1H",
-        };
+        let bar = candle_bar(interval);
         let want = limit + 1;
         let mut klines: Vec<Kline> = Vec::with_capacity(want);
         let mut after: Option<u64> = None;
@@ -265,6 +273,39 @@ impl KlineProvider for OkxFuturesKlineClient {
         Ok(closed_klines(klines, interval, now_ms(), limit))
     }
 
+    /// `GET /api/v5/market/history-candles`(一年以前的也能拿到，普通 candles 接口
+    /// 只保留近期)，倒序返回，单次最多 100 根，从 `end_ms` 用 `after`(严格早于)
+    /// 往前翻页到 `start_ms`。
+    async fn klines_range(
+        &self,
+        symbol: &Symbol,
+        interval: KlineInterval,
+        start_ms: u64,
+        end_ms: u64,
+    ) -> anyhow::Result<Vec<Kline>> {
+        let mut klines: Vec<Kline> = Vec::new();
+        let mut after = end_ms + 1;
+        for _ in 0..RANGE_MAX_PAGES {
+            let query = vec![
+                ("instId", okx_swap_inst_id(symbol)),
+                ("bar", candle_bar(interval).to_string()),
+                ("after", after.to_string()),
+                ("limit", HISTORY_CANDLES_LIMIT_MAX.to_string()),
+            ];
+            let text = self.public_get("/api/v5/market/history-candles", &query).await?;
+            let page = parse_candles(&text)?;
+            let Some(oldest) = page.iter().map(|k| k.open_time_ms).min() else {
+                break;
+            };
+            klines.extend(page);
+            if oldest <= start_ms {
+                break;
+            }
+            after = oldest;
+        }
+        Ok(closed_klines_in_range(klines, interval, now_ms(), start_ms, end_ms))
+    }
+
     /// `GET /api/v5/market/ticker`：永续的 `volCcy24h` 是 base 币数量，没有直接
     /// 的计价币成交额，按 `volCcy24h × last` 估算。
     async fn quote_volume_24h(&self, symbol: &Symbol) -> anyhow::Result<Decimal> {
@@ -280,7 +321,8 @@ fn parse_candles(text: &str) -> anyhow::Result<Vec<Kline>> {
         .map(|row| {
             let open_time_ms: u64 = row.first().and_then(|t| t.parse().ok()).context("okx candle has no valid ts")?;
             let close: Decimal = row.get(4).and_then(|c| c.parse().ok()).context("okx candle has no valid close")?;
-            Ok(Kline { open_time_ms, close })
+            let volume: Decimal = row.get(5).and_then(|v| v.parse().ok()).context("okx candle has no valid vol")?;
+            Ok(Kline { open_time_ms, close, volume })
         })
         .collect()
 }
@@ -346,9 +388,15 @@ mod tests {
             ["3600000","1","1","1","0.0000039","1","1","1","1"]
         ]}"#;
         let klines = parse_candles(text).unwrap();
-        assert_eq!(klines[0], Kline { open_time_ms: 2 * HOUR_MS, close: "0.000004".parse().unwrap() });
+        assert_eq!(
+            klines[0],
+            Kline { open_time_ms: 2 * HOUR_MS, close: "0.000004".parse().unwrap(), volume: Decimal::ONE }
+        );
         let closed = closed_klines(klines, KlineInterval::H1, 2 * HOUR_MS + 1, 10);
-        assert_eq!(closed, vec![Kline { open_time_ms: HOUR_MS, close: "0.0000039".parse().unwrap() }]);
+        assert_eq!(
+            closed,
+            vec![Kline { open_time_ms: HOUR_MS, close: "0.0000039".parse().unwrap(), volume: Decimal::ONE }]
+        );
         assert!(parse_candles(r#"{"code":"51001","msg":"Instrument ID does not exist","data":[]}"#).is_err());
     }
 

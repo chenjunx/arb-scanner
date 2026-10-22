@@ -220,6 +220,108 @@ cargo run -- close --symbol BTC/USDT --kraken-spot-qty 0.005 --live
 
 **已知限制**：三条腿并发发起、互相独立，不做自动回滚——任意一条腿失败，其它已经成交的腿不会被撤销，返回的错误信息里会带上三条腿各自的成交/跳过/失败情况，需要人工介入对账。
 
+## 跨所永续开仓等价差（`cross-funding` / `cross-funding-kstar` / `cross-funding-review`）
+
+`cross-funding` 读 CSV 里的合约对（多腿/空腿，币安/Gate/OKX/Bitget 永续），只开仓不平仓。价差定义为 `(多腿每币价 − 空腿每币价) / 空腿每币价 × 10000`（bp），越低越适合开仓。每行流程：
+
+1. **t0 决策**：启动后该行第一次拿到两边新鲜报价时，用启动时拉的 30 天小时 K 线算当前价差在窗口里的分位数（落到 10 分一档）和 σ，再对照 Redis 里人工确认过的 k* 表：
+   - 最新有效小时 K 线已收盘超过 `max_bar_age_hours`（数据不新鲜，分位数和 σ 不可信）→ **不开仓**；
+   - σ ÷ 365 天 σ 中位数 > `max_sigma_ratio`（σ 告警，波动异常）→ **不开仓**；
+   - 不开仓时打一条 warn 日志写明原因和当时的数值，这一行在本进程内结束，结果记为 `skipped: 原因`，重启后才会重新拉 K 线、重新决策；
+   - 分位数或 σ 缺失（30 天窗口里有效小时不足 80%）→ 立即开；
+   - 当前档在表里是"直接开"（段数 < 10 或期望 B ≤ 0）→ 立即开；
+   - 其余情况等价差：目标 = t0 时盘口中间价价差 − k*·σ，24 小时内固定不变。
+2. **触发**：可成交价差（多腿卖一 / 空腿买一）≤ 目标时两腿市价开仓；t0 + 24h 还没触发也两腿市价开仓。
+3. **记录**：t0 决策和最终结果各写一行 JSON 到 `record_file`，供 `cross-funding-review` 复盘。
+
+### 配置
+
+CSV 表头为 `long_venue,long_symbol,short_venue,short_symbol,quantity`，venue 填 `binance`/`gate`/`okx`/`bitget`，symbol 填交易所原生合约名（如 `1000PEPEUSDT`、`PEPE_USDT`、`PEPE-USDT-SWAP`），quantity 是币数，例见 `cross_funding_pairs.csv`。
+
+风控和执行参数在 `config.toml` 的 `[cross_funding]` 段（`--config` 指定文件，缺这一段会直接报错）：
+
+| 字段 | 默认 | 含义 |
+|---|---|---|
+| `max_notional_usdt` | 必填 | 单行名义上限（币数 × 多腿每币价），启动时超过就跳过该行，触发时超过就停止该行 |
+| `max_unhedged_usdt` | 必填 | 已结束各行未对冲敞口之和的上限，超过后所有行停止下单 |
+| `max_slippage_bp` | 10 | 单腿成交价相对触发时对手价的滑点超过此值打 warn |
+| `max_price_diff_pct` | 5 | 启动时两腿每币价相差超过此百分比跳过该行 |
+| `fill_timeout_secs` | 30 | 下单后两腿仍未全部成交就停止该行 |
+| `quote_max_age_ms` | 5000 | 报价超过多久未更新不参与决策和触发 |
+| `max_bar_age_hours` | 2 | 见 t0 决策 |
+| `max_sigma_ratio` | 3.0 | 见 t0 决策 |
+| `kill_switch_file` | `cross_funding.stop` | kill switch 文件路径 |
+| `record_file` | `logs/cross_funding_orders.jsonl` | 决策/结果记录 |
+
+仓库里 `config.toml` 的 `max_notional_usdt = "200"`、`max_unhedged_usdt = "50"` 是占位值，上线前按实际资金改。杠杆、持仓模式需要在交易所提前设好；OKX/Bitget 的保证金模式用 `--margin-mode`（默认 cross）传入，必须和交易所设置一致。
+
+依赖：`REDIS_URL`（默认 `redis://127.0.0.1:6379/`）；API Key 走 `BINANCE_API_KEY`/`BINANCE_API_SECRET`、`GATE_API_KEY`/`GATE_API_SECRET`、`OKX_API_KEY`/`OKX_API_SECRET`/`OKX_API_PASSPHRASE`、`BITGET_API_KEY`/`BITGET_API_SECRET`/`BITGET_API_PASSPHRASE`。模拟盘启动时也要查持仓，同样需要 Key。
+
+### k* 表（`cross-funding-kstar`）
+
+每周校准一次。校准只拉公开 K 线（365 天 + 30 天窗口的 1h），不需要 Key；结果作为新版本写进 Redis，**不会自动生效**：
+
+```bash
+# 校准 CSV 里每一对（--pair 'binance:BTCUSDT|okx:BTC-USDT-SWAP' 可单独指定，可重复）
+cargo run -- cross-funding-kstar calibrate --csv cross_funding_pairs.csv
+# 查看版本 / 某版本完整表（不传 --version 为生效版本）
+cargo run -- cross-funding-kstar list
+cargo run -- cross-funding-kstar show --pair 'binance:BTCUSDT|okx:BTC-USDT-SWAP' --version <v>
+# 人工确认后生效
+cargo run -- cross-funding-kstar approve --pair 'binance:BTCUSDT|okx:BTC-USDT-SWAP' --version <v>
+```
+
+新版本任一档 k* 和生效版本相差 > 0.5 时，calibrate 会打告警；第一版没有可比对的生效版本，同样要人工确认。`--end 2026-10-20T23:00Z` 可复现某个时点的表，`--no-save` 只打印，`--out <dir>` 另存 JSON。Redis key 布局见 `src/strategy/kstar_store.rs`。
+
+策略启动时只读生效版本：没有生效版本的行打 error 并跳过；生效版本超过 8 天未更新打 warn，但照常使用。
+
+### 启动
+
+```bash
+# 模拟盘（默认）：照常决策，触发时按对手价模拟全部成交，不真实下单
+RUST_LOG=info cargo run -- cross-funding --csv cross_funding_pairs.csv
+# 实盘
+RUST_LOG=info cargo run -- cross-funding --csv cross_funding_pairs.csv --live
+```
+
+上线顺序：单元测试 → 回放 → 至少 7 天模拟盘 → 小额实盘（BTC：币安多 / OKX 空）。
+
+进程重启后，没有触发的行会在新的 t0 重新决策，之前的等待目标不会保留。启动时检查到已有持仓的行会被跳过。
+
+### Kill switch
+
+`kill_switch_file`（默认工作目录下的 `cross_funding.stop`）存在时，所有行暂停决策和触发，已经发出的订单照常跟踪；删掉文件即恢复（每秒检查一次）：
+
+```bash
+touch cross_funding.stop   # 暂停
+rm cross_funding.stop      # 恢复
+```
+
+彻底停止就 Ctrl-C 结束进程。任一行下单失败、超时或名义超限都只停止该行；所有已停止行的未对冲敞口之和超过 `max_unhedged_usdt` 时，全部行停止下单。停止后不会自动处理，需要人工去交易所核对和平掉单腿。
+
+### 日志和记录
+
+- 运行日志由 env_logger 输出到 **stderr**，级别用 `RUST_LOG` 控制。需要留存时自行重定向，如 `2>> logs/cross_funding.log`。启动时会打印已知局限、每行的表版本/分位/σ，以及每次决策、触发、成交、停止的详细信息。
+- 决策/结果记录写在 `record_file`（JSON Lines，按需自动建目录）。每次 t0 写一行 `event=decision`；结束时写一行 `event=result`，包括 `outcome`（`filled`、`skipped: 不开仓原因` 或 `halted: 原因`）、触发方式（immediate/target/expiry）、两腿成交均价、滑点、实际价差 `actual_bp`、节省 `savings_bp = baseline_bp − actual_bp`。`baseline_bp` 是 t0 时的可成交价差。
+
+### 复盘（`cross-funding-review`）
+
+```bash
+cargo run -- cross-funding-review                      # 默认读 config.toml 里的 record_file，只看 live
+cargo run -- cross-funding-review --mode paper --min-orders 30
+cargo run -- cross-funding-review --records logs/cross_funding_orders.jsonl --pair 'binance:BTCUSDT|okx:BTC-USDT-SWAP'
+```
+
+用已成交（`outcome=filled`）的结果比较平均节省和平均期望 B：
+
+- 节省 ≤ 0：建议停用；
+- 节省 ≥ 期望的一半：继续；
+- 介于两者之间：拆解成交率偏差（等待单实际在目标价成交的比例，对比校准的期望成交率）和两腿滑点。
+
+不足 `--min-orders`（默认 30）单时照常打印数字，但会注明样本不足。
+
+已知局限（启动日志和复盘报告都会打印，见 `KNOWN_LIMITATIONS`）：一期全部吃单，手续费两边抵消，没有计入资金费；节省以 t0 可成交价差为基线，期望 B 以中间价为基准，两者大约差半个买卖价差；等待期间分位数和 σ 不刷新；不开仓的行要重启才会重新判断；校准时没有剔除 σ 告警时段；模拟盘按对手价全部成交，不模拟滑点。
+
 ## 资金费追踪（`accounting` 子命令）
 
 独立常驻进程：定期轮询交易所资金费流水，通过 `PositionManager::apply_adjustment`（`AdjustmentReason::Funding`）累加进对应仓位的 `realized_pnl`。跟踪对象是 `PositionManager`（Redis 支撑）里每次轮询时读到的**当前非零仓位**，而不是启动时固定的一份列表，所以 `open`/`close` 开平的期货仓位不需要重启这个进程就能被自动跟踪/停止跟踪。如果 `monitor` 已经在跑且没加 `--no-portfolio`，通常不需要单独起本命令；只需要资金费追踪、不想启动价差扫描和行情连接时单独使用。

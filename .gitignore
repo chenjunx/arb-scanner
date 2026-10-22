@@ -2,3 +2,5 @@
 config.local.toml
 *.log
 .claude/
+cross_funding_pairs.csv
+research/

@@ -16,7 +16,9 @@ use crate::net::connect_tcp;
 use crate::topic::{Topic, TopicBus};
 use crate::types::{Quote, Symbol, Venue};
 
-use super::{Kline, KlineInterval, KlineProvider, MarketDataSource, closed_klines, now_ms};
+use super::{
+    Kline, KlineInterval, KlineProvider, MarketDataSource, RANGE_MAX_PAGES, closed_klines, closed_klines_in_range, now_ms,
+};
 
 const WS_HOST: &str = "fx-ws.gateio.ws";
 const WS_PORT: u16 = 443;
@@ -27,6 +29,13 @@ const MIN_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 /// `/futures/usdt/candlesticks` 单次最多返回 2000 根。
 const CANDLESTICK_LIMIT_MAX: usize = 2000;
+
+fn candlestick_interval(interval: KlineInterval) -> &'static str {
+    match interval {
+        KlineInterval::M5 => "5m",
+        KlineInterval::H1 => "1h",
+    }
+}
 
 /// Gate 永续合约名是 `BASE_QUOTE`(如 `PEPE_USDT`)。
 fn gate_contract(symbol: &Symbol) -> String {
@@ -221,17 +230,47 @@ impl KlineProvider for GateFuturesKlineClient {
     /// `GET /futures/usdt/candlesticks` 按时间升序返回，`t` 是开盘时间(秒)，最后
     /// 一根是当前未收盘的，所以多要 1 根再剔除。
     async fn klines(&self, symbol: &Symbol, interval: KlineInterval, limit: usize) -> anyhow::Result<Vec<Kline>> {
-        let interval_param = match interval {
-            KlineInterval::M5 => "5m",
-            KlineInterval::H1 => "1h",
-        };
         let query = [
             ("contract", gate_contract(symbol)),
-            ("interval", interval_param.to_string()),
+            ("interval", candlestick_interval(interval).to_string()),
             ("limit", (limit + 1).min(CANDLESTICK_LIMIT_MAX).to_string()),
         ];
         let text = self.public_get("/futures/usdt/candlesticks", &query).await?;
         Ok(closed_klines(parse_candlesticks(&text)?, interval, now_ms(), limit))
+    }
+
+    /// 同一个接口改用 `from`/`to`(秒，两端都含；和 `limit` 互斥)，单次区间不能
+    /// 超过 2000 根，按 `CANDLESTICK_LIMIT_MAX − 1` 根一段从 `start_ms` 往后切。
+    async fn klines_range(
+        &self,
+        symbol: &Symbol,
+        interval: KlineInterval,
+        start_ms: u64,
+        end_ms: u64,
+    ) -> anyhow::Result<Vec<Kline>> {
+        let step_ms = interval.millis();
+        let chunk_ms = (CANDLESTICK_LIMIT_MAX as u64 - 1) * step_ms;
+        let mut klines: Vec<Kline> = Vec::new();
+        let mut from = start_ms;
+        for _ in 0..RANGE_MAX_PAGES {
+            if from > end_ms {
+                break;
+            }
+            let to = (from + chunk_ms).min(end_ms);
+            // `to` 恰好落在某根的开盘时间时，Gate 把这一根截到 `to` 为止，返回一根
+            // v=0、价格等于上一根收盘的空 K 线(历史区间也一样)。所以 `to` 取最后
+            // 一根结束前 1 秒，让它完整返回。
+            let query = [
+                ("contract", gate_contract(symbol)),
+                ("interval", candlestick_interval(interval).to_string()),
+                ("from", (from / 1000).to_string()),
+                ("to", ((to + step_ms) / 1000 - 1).to_string()),
+            ];
+            let text = self.public_get("/futures/usdt/candlesticks", &query).await?;
+            klines.extend(parse_candlesticks(&text)?);
+            from = to + step_ms;
+        }
+        Ok(closed_klines_in_range(klines, interval, now_ms(), start_ms, end_ms))
     }
 
     /// `GET /futures/usdt/tickers?contract=X` 返回只含一个元素的数组。
@@ -253,6 +292,8 @@ struct CandlestickEntry {
     /// Gate 文档里标的是 double，按 f64 读再取整。
     t: f64,
     c: Decimal,
+    /// 成交张数(整数)。
+    v: Decimal,
 }
 
 fn parse_candlesticks(text: &str) -> anyhow::Result<Vec<Kline>> {
@@ -263,7 +304,7 @@ fn parse_candlesticks(text: &str) -> anyhow::Result<Vec<Kline>> {
         serde_json::from_str(text).with_context(|| format!("failed to parse gate candlesticks, raw body: {text}"))?;
     Ok(entries
         .into_iter()
-        .map(|e| Kline { open_time_ms: e.t as u64 * 1000, close: e.c })
+        .map(|e| Kline { open_time_ms: e.t as u64 * 1000, close: e.c, volume: e.v })
         .collect())
 }
 
@@ -352,7 +393,10 @@ mod tests {
             {"o":"0.000004","v":15494,"t":1791439200,"c":"0.000004050","l":"0.000004","h":"0.000005","sum":"1"}
         ]"#;
         let klines = parse_candlesticks(text).expect("should parse");
-        assert_eq!(klines[0], Kline { open_time_ms: 1791435600000, close: "0.000004036".parse().unwrap() });
+        assert_eq!(
+            klines[0],
+            Kline { open_time_ms: 1791435600000, close: "0.000004036".parse().unwrap(), volume: Decimal::from(15494) }
+        );
         assert_eq!(klines[1].open_time_ms, 1791439200000);
     }
 

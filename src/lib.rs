@@ -17,4 +17,5 @@ pub mod scan;
 pub mod strategy;
 pub mod topic;
 pub mod types;
+pub mod utc;
 pub mod wallet;

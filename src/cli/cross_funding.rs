@@ -1,9 +1,11 @@
 //! `cross-funding` 子命令：读 CSV 里的跨所永续合约对，常驻运行
-//! [`CrossFundingStrategy`]，价差达到 EWMA 均值 + k·σ 时两边市价开仓。
+//! [`CrossFundingStrategy`]("开仓等价差"一期：t0 按 k* 表决定立即开还是等到
+//! 目标价差/24 小时到期，两腿市价)。风控参数读 `config.toml` 的 `[cross_funding]`
+//! 段，k* 表读 Redis 里人工确认过的生效版本(见 `cross-funding-kstar`)。
 //!
-//! 默认 dry run：只打日志、不连 Redis、不建订单流水线(启动检查仍然要查持仓，
-//! 所以 API Key 照样需要)。`--live` 才真的下单，并默认带上两个后台服务：每 5 分钟
-//! 打印一次组合盈亏/仓位/订单报告(`--report-interval-secs`)，每 30 分钟把四家的
+//! 默认模拟盘：照常决策，按对手价模拟成交，不建订单流水线(要读 Redis 里的 k* 表；
+//! 启动检查仍然要查持仓，所以 API Key 照样需要)。`--live` 才真的下单，并默认带上
+//! 两个后台服务：每 5 分钟打印一次组合盈亏/仓位/订单报告(`--report-interval-secs`)，每 30 分钟把四家的
 //! 资金费流水累加进仓位盈亏(`--funding-interval-secs`，按交易所抢 Redis 租约，
 //! 和 `accounting`/`monitor` 同时跑也不会重复记账)。
 
@@ -17,6 +19,7 @@ use log::info;
 use rust_decimal::Decimal;
 
 use crate::accounting::FundingFeeProvider;
+use crate::config::CrossFundingConfig;
 use crate::engine::ArbitrageEngine;
 use crate::exchange_info::binance::BinanceExchangeInfoProvider;
 use crate::exchange_info::bitget::BitgetExchangeInfoProvider;
@@ -36,8 +39,10 @@ use crate::order::okx_futures::{OkxFuturesOrderProvider, OkxFuturesPrivateOrderS
 use crate::order::types::MarginMode;
 use crate::order_manager::OrderStreamSource;
 use crate::strategy::cross_funding::{
-    CrossFundingParams, CrossFundingStrategy, KLINE_INTERVAL, PairRow, PerpExchange, VenueClients, parse_pairs_csv,
+    CrossFundingParams, CrossFundingStrategy, PairRow, PerpExchange, VenueClients, parse_pairs_csv,
 };
+use crate::strategy::kstar_store::KStarStore;
+use crate::strategy::spread_wait::{DecisionParams, KStarTable};
 use crate::topic::TopicBus;
 use crate::types::{Symbol, Venue};
 
@@ -51,7 +56,11 @@ pub struct CrossFundingArgs {
     #[arg(long)]
     pub csv: String,
 
-    /// 真实下单。不传则为 dry run，触发时只打日志
+    /// 风控/执行参数所在的配置文件，读其中的 `[cross_funding]` 段
+    #[arg(long, default_value = "config.toml")]
+    pub config: String,
+
+    /// 真实下单。不传则为模拟盘，触发时按对手价模拟成交
     #[arg(long)]
     pub live: bool,
 
@@ -59,38 +68,13 @@ pub struct CrossFundingArgs {
     #[arg(long)]
     pub testnet: bool,
 
-    /// 启动/每 5 分钟刷新时拉多少小时的 5m K 线
-    #[arg(long, default_value_t = 24)]
-    pub kline_hours: usize,
-
-    /// 两边对齐后至少要覆盖多少小时(按 5m 根数折算)
-    #[arg(long, default_value_t = 16)]
-    pub min_hours: usize,
-
-    /// EWMA 半衰期(小时，按 5m 根数折算)。要明显短于 --kline-hours：EWMA 以窗口
-    /// 第一根为初值，它的残留权重是 0.5^(窗口/半衰期)，24h/6h 时约 6%
-    #[arg(long, default_value_t = 6.0)]
-    pub half_life_hours: f64,
-
-    /// 触发阈值 = μ + sigma_k·σ
-    #[arg(long, default_value_t = 1.0)]
-    pub sigma_k: f64,
-
-    /// 启动时两边每币价格相差超过多少百分比就跳过这一行
-    #[arg(long, default_value_t = Decimal::from(5))]
-    pub max_price_diff_pct: Decimal,
-
-    /// 下单后多少秒两腿还没全部成交就停止这一行
-    #[arg(long, default_value_t = 30)]
-    pub fill_timeout_secs: u64,
-
     /// OKX/Bitget 下单带的保证金模式，必须和交易所里该合约的设置一致
     /// (币安/Gate 不需要，沿用账户设置)
     #[arg(long, value_enum, default_value_t = MarginModeArg::Cross)]
     pub margin_mode: MarginModeArg,
 
     /// --live 时定期打印组合盈亏/仓位/订单报告的间隔(秒)，0 表示不打印；
-    /// dry run 不连 Redis，不打印报告
+    /// 模拟盘不打印报告
     #[arg(long, default_value_t = 300)]
     pub report_interval_secs: u64,
 
@@ -130,29 +114,52 @@ impl From<MarginModeArg> for MarginMode {
     }
 }
 
-impl CrossFundingArgs {
-    fn params(&self) -> anyhow::Result<CrossFundingParams> {
-        if self.kline_hours == 0 || self.min_hours == 0 || self.min_hours > self.kline_hours {
-            anyhow::bail!("--min-hours({}) 必须在 1..=--kline-hours({}) 之间", self.min_hours, self.kline_hours);
-        }
-        if !(self.half_life_hours.is_finite() && self.half_life_hours > 0.0) {
-            anyhow::bail!("--half-life-hours 必须为正数");
-        }
-        let bars_per_hour = (HOUR_MS / KLINE_INTERVAL.millis()) as usize;
-        if !self.sigma_k.is_finite() {
-            anyhow::bail!("--sigma-k 必须是有限数");
-        }
-        Ok(CrossFundingParams {
-            kline_bars: self.kline_hours * bars_per_hour,
-            min_samples: self.min_hours * bars_per_hour,
-            half_life: self.half_life_hours * bars_per_hour as f64,
-            sigma_k: self.sigma_k,
-            max_price_diff_pct: self.max_price_diff_pct,
-            fill_timeout_ms: self.fill_timeout_secs * 1000,
-            live: self.live,
-            ..CrossFundingParams::default()
-        })
+/// 配置段 + `--live` → 策略参数，顺带校验取值。
+fn build_params(config: &CrossFundingConfig, live: bool) -> anyhow::Result<CrossFundingParams> {
+    if config.max_notional_usdt <= Decimal::ZERO || config.max_unhedged_usdt < Decimal::ZERO {
+        anyhow::bail!("max_notional_usdt 必须为正、max_unhedged_usdt 不能为负");
     }
+    if !(config.max_slippage_bp.is_finite() && config.max_slippage_bp >= 0.0) {
+        anyhow::bail!("max_slippage_bp 必须是非负数");
+    }
+    if !(config.max_sigma_ratio.is_finite() && config.max_sigma_ratio > 0.0) {
+        anyhow::bail!("max_sigma_ratio 必须为正数");
+    }
+    if config.fill_timeout_secs == 0 || config.quote_max_age_ms == 0 || config.max_bar_age_hours == 0 {
+        anyhow::bail!("fill_timeout_secs / quote_max_age_ms / max_bar_age_hours 必须为正");
+    }
+    Ok(CrossFundingParams {
+        max_price_diff_pct: config.max_price_diff_pct,
+        fill_timeout_ms: config.fill_timeout_secs * 1000,
+        quote_max_age_ms: config.quote_max_age_ms,
+        live,
+        decision: DecisionParams {
+            max_bar_age_ms: config.max_bar_age_hours * HOUR_MS,
+            max_sigma_ratio: config.max_sigma_ratio,
+        },
+        max_notional_usdt: config.max_notional_usdt,
+        max_unhedged_usdt: config.max_unhedged_usdt,
+        max_slippage_bp: config.max_slippage_bp,
+        kill_switch_file: config.kill_switch_file.clone().into(),
+        record_file: config.record_file.clone().into(),
+    })
+}
+
+/// 从 Redis 读各行的生效 k* 表。没有生效版本的行不报错(策略启动时打 error 跳过)，
+/// Redis 读失败或数据损坏才报错。
+fn load_tables(store: &KStarStore, rows: &[PairRow]) -> anyhow::Result<HashMap<String, KStarTable>> {
+    let mut tables = HashMap::new();
+    for row in rows {
+        let key = row.key();
+        if tables.contains_key(&key) {
+            continue;
+        }
+        if let Some(table) = store.active(&key)? {
+            info!("cross_funding: {key} 使用 k* 表 v{}", table.version);
+            tables.insert(key, table);
+        }
+    }
+    Ok(tables)
 }
 
 /// 每个用到的交易所各自的 symbol 列表(去重)。
@@ -171,12 +178,17 @@ fn symbols_by_exchange(rows: &[PairRow]) -> HashMap<PerpExchange, Vec<Symbol>> {
 }
 
 pub async fn run(args: CrossFundingArgs) -> anyhow::Result<()> {
-    let params = args.params()?;
+    let config = CrossFundingConfig::load(&args.config)?;
+    let params = build_params(&config, args.live)?;
     let text = std::fs::read_to_string(&args.csv).with_context(|| format!("failed to read csv {}", args.csv))?;
     let rows = parse_pairs_csv(&text).with_context(|| format!("failed to parse csv {}", args.csv))?;
     if rows.is_empty() {
         anyhow::bail!("csv {} 里没有任何合约对", args.csv);
     }
+    let redis_url = wiring::redis_url();
+    let store = KStarStore::new(&redis_url)?;
+    let tables = load_tables(&store, &rows)?;
+    drop(store);
     let symbols = symbols_by_exchange(&rows);
     let all_symbols: Vec<Symbol> = symbols.values().flatten().cloned().collect();
 
@@ -302,7 +314,7 @@ pub async fn run(args: CrossFundingArgs) -> anyhow::Result<()> {
             }),
         };
         let pipeline = wiring::build_manual_pipeline(
-            &wiring::redis_url(),
+            &redis_url,
             bus.clone(),
             &all_symbols,
             legs,
@@ -312,13 +324,13 @@ pub async fn run(args: CrossFundingArgs) -> anyhow::Result<()> {
         .await?;
         (Some(pipeline.order_manager), pipeline.stream_handles)
     } else {
-        info!("cross_funding: dry run 模式，不连 Redis、不下单；加 --live 才会真实下单");
+        info!("cross_funding: 模拟盘模式，不下单；加 --live 才会真实下单");
         (None, Vec::new())
     };
 
     let source_handles: Vec<_> = sources.into_iter().map(|s| s.spawn(bus.clone())).collect();
 
-    let strategy = CrossFundingStrategy::new(bus.clone(), rows, clients, params, order_manager);
+    let strategy = CrossFundingStrategy::new(bus.clone(), rows, tables, clients, params, order_manager);
     let result = ArbitrageEngine::new(vec![Box::new(strategy)]).run(bus).await;
 
     for handle in stream_handles.into_iter().chain(source_handles) {
@@ -338,17 +350,7 @@ mod tests {
         let cli = Cli::try_parse_from(["arb-scanner", "cross-funding", "--csv", "pairs.csv"]).unwrap();
         let Some(Command::CrossFunding(args)) = cli.command else { panic!("expected cross-funding") };
         assert!(!args.live);
-        let params = args.params().unwrap();
-        assert_eq!(params.kline_bars, 288);
-        assert_eq!(params.min_samples, 192);
-        assert_eq!(params.half_life, 72.0);
-        let defaults = CrossFundingParams::default();
-        assert_eq!(
-            (params.kline_bars, params.min_samples, params.half_life),
-            (defaults.kline_bars, defaults.min_samples, defaults.half_life)
-        );
-        assert_eq!(params.fill_timeout_ms, 30_000);
-        assert_eq!(params.max_price_diff_pct, Decimal::from(5));
+        assert_eq!(args.config, "config.toml");
         assert_eq!(args.margin_mode, MarginModeArg::Cross);
         assert_eq!(args.report_interval_secs, 300);
         assert_eq!(args.funding_interval_secs, 1800);
@@ -358,20 +360,22 @@ mod tests {
             Cli::try_parse_from(["arb-scanner", "cross-funding", "--csv", "pairs.csv", "--margin-mode", "isolated"]).unwrap();
         let Some(Command::CrossFunding(args)) = cli.command else { panic!("expected cross-funding") };
         assert_eq!(MarginMode::from(args.margin_mode), MarginMode::Isolated);
+    }
 
-        let cli = Cli::try_parse_from([
-            "arb-scanner",
-            "cross-funding",
-            "--csv",
-            "pairs.csv",
-            "--kline-hours",
-            "24",
-            "--min-hours",
-            "48",
-        ])
-        .unwrap();
-        let Some(Command::CrossFunding(args)) = cli.command else { panic!("expected cross-funding") };
-        assert!(args.params().is_err());
+    #[test]
+    fn builds_params_from_repo_config() {
+        let config = CrossFundingConfig::load(concat!(env!("CARGO_MANIFEST_DIR"), "/config.toml")).unwrap();
+        let params = build_params(&config, true).unwrap();
+        assert!(params.live);
+        assert_eq!(params.fill_timeout_ms, config.fill_timeout_secs * 1000);
+        assert_eq!(params.decision.max_bar_age_ms, config.max_bar_age_hours * HOUR_MS);
+        assert_eq!(params.decision.max_sigma_ratio, config.max_sigma_ratio);
+        assert_eq!(params.max_notional_usdt, config.max_notional_usdt);
+
+        let bad = CrossFundingConfig { max_notional_usdt: Decimal::ZERO, ..config.clone() };
+        assert!(build_params(&bad, false).is_err());
+        let bad = CrossFundingConfig { max_sigma_ratio: f64::NAN, ..config };
+        assert!(build_params(&bad, false).is_err());
     }
 
     #[test]

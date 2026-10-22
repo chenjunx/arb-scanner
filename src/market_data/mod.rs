@@ -56,12 +56,14 @@ impl KlineInterval {
     }
 }
 
-/// 一根 K 线里策略用到的字段：开盘时间(毫秒)和收盘价(交易所原始报价，
-/// 没有按合约乘数换算)。
+/// 一根 K 线里策略用到的字段：开盘时间(毫秒)、收盘价(交易所原始报价，
+/// 没有按合约乘数换算)和成交量。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Kline {
     pub open_time_ms: u64,
     pub close: Decimal,
+    /// 成交量，单位因交易所而异(币数或张数)，只用来判断这根 K 线有没有成交。
+    pub volume: Decimal,
 }
 
 /// 历史 K 线 / 24h 成交额的 REST 查询扩展点。和 [`MarketDataSource`] 不同，
@@ -73,6 +75,17 @@ pub trait KlineProvider: Send + Sync {
     /// 最近 `limit` 根**已收盘**的 `interval` 周期 K 线，按开盘时间升序。交易所
     /// 返回的最后一根通常是当前还没走完的那根，由实现负责剔除(见 [`closed_klines`])。
     async fn klines(&self, symbol: &Symbol, interval: KlineInterval, limit: usize) -> anyhow::Result<Vec<Kline>>;
+
+    /// 开盘时间落在 `[start_ms, end_ms]` 内的**已收盘** K 线，按开盘时间升序、
+    /// 去重。用于拉一年这种远超单次请求上限的历史，实现负责翻页(见
+    /// [`closed_klines_in_range`])。
+    async fn klines_range(
+        &self,
+        symbol: &Symbol,
+        interval: KlineInterval,
+        start_ms: u64,
+        end_ms: u64,
+    ) -> anyhow::Result<Vec<Kline>>;
 
     /// 最近 24h 的计价币(USDT)成交额。
     async fn quote_volume_24h(&self, symbol: &Symbol) -> anyhow::Result<Decimal>;
@@ -89,12 +102,31 @@ pub(crate) fn closed_klines(mut klines: Vec<Kline>, interval: KlineInterval, now
     klines.split_off(skip)
 }
 
+/// [`KlineProvider::klines_range`] 的收尾：按开盘时间升序去重，只保留
+/// `[start_ms, end_ms]` 内且 `open_time + 周期 <= now` 的已收盘 K 线。
+pub(crate) fn closed_klines_in_range(
+    mut klines: Vec<Kline>,
+    interval: KlineInterval,
+    now_ms: u64,
+    start_ms: u64,
+    end_ms: u64,
+) -> Vec<Kline> {
+    klines.sort_by_key(|k| k.open_time_ms);
+    klines.dedup_by_key(|k| k.open_time_ms);
+    klines.retain(|k| k.open_time_ms >= start_ms && k.open_time_ms <= end_ms && k.open_time_ms + interval.millis() <= now_ms);
+    klines
+}
+
+/// 翻页拉区间 K 线时的页数上限，防止交易所一直返回满页时死循环。按最小的
+/// 单页 100 根(OKX history-candles)算，400 页 = 40000 根 1h，够 4 年多。
+pub(crate) const RANGE_MAX_PAGES: usize = 400;
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn kline(open_time_ms: u64) -> Kline {
-        Kline { open_time_ms, close: Decimal::ONE }
+        Kline { open_time_ms, close: Decimal::ONE, volume: Decimal::ONE }
     }
 
     #[test]
@@ -116,5 +148,12 @@ mod tests {
         let m5 = KlineInterval::M5.millis();
         let closed = closed_klines(vec![kline(0), kline(m5), kline(2 * m5)], KlineInterval::M5, 2 * m5 + 1, 10);
         assert_eq!(closed, vec![kline(0), kline(m5)]);
+    }
+
+    #[test]
+    fn closed_klines_in_range_filters_both_ends_and_open_bar() {
+        let klines = vec![kline(3 * HOUR_MS), kline(0), kline(HOUR_MS), kline(2 * HOUR_MS), kline(HOUR_MS), kline(4 * HOUR_MS)];
+        let closed = closed_klines_in_range(klines, KlineInterval::H1, 4 * HOUR_MS + 1, HOUR_MS, 10 * HOUR_MS);
+        assert_eq!(closed, vec![kline(HOUR_MS), kline(2 * HOUR_MS), kline(3 * HOUR_MS)]);
     }
 }

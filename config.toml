@@ -65,3 +65,17 @@ enabled = true
 live = true
 kraken_venue = "kraken"
 binance_venue = "binance"
+
+# cross-funding 子命令("开仓等价差"一期)的风控/执行参数。缺这一段时
+# cross-funding 直接报错退出。k* 表不在这里，在 Redis(cross-funding-kstar 管理)。
+[cross_funding]
+max_notional_usdt = "200"      # 单行名义上限(USDT，币数 × 多腿每币价)：启动时超过跳过该行，触发时超过停止该行
+max_unhedged_usdt = "50"       # 已结束各行未对冲敞口(|多腿币数−空腿币数|×价格)之和上限，超过则所有行停止下单
+max_slippage_bp = 10.0         # 单腿成交价相对触发时对手价的滑点超过此值(bp)打 warn
+max_price_diff_pct = "5"       # 启动时两腿每币价格相差超过此百分比跳过该行(多半配错合约/乘数)
+fill_timeout_secs = 30         # 下单后多少秒两腿仍未全部成交就停止该行
+quote_max_age_ms = 5000        # 报价超过多久未更新不参与决策/触发
+max_bar_age_hours = 2          # t0 时最新小时 K 线已收盘超过多少小时 → 数据不新鲜，该行不开仓
+max_sigma_ratio = 3.0          # σ ÷ 365 天 σ 中位数超过此值 → 波动异常，该行不开仓
+kill_switch_file = "cross_funding.stop"              # 该文件存在时暂停决策和下单，删除即恢复
+record_file = "logs/cross_funding_orders.jsonl"      # 决策/结果记录，cross-funding-review 读它

@@ -7,6 +7,8 @@ pub mod accounting;
 pub mod args;
 pub mod close;
 pub mod cross_funding;
+pub mod cross_funding_kstar;
+pub mod cross_funding_review;
 pub mod engine_command;
 pub mod monitor;
 pub mod open;
@@ -67,9 +69,15 @@ pub enum Command {
     /// 用交易所后台的真实持仓覆盖写 Redis 里的仓位记录
     #[command(name = "set-position")]
     SetPosition(set_position::SetPositionArgs),
-    /// 跨所永续价差开仓：价差达到 EWMA 均值 + k·σ 时两边市价开仓
+    /// 跨所永续价差开仓：按 k* 表等价差到目标(最多 24h)后两边市价开仓
     #[command(name = "cross-funding")]
     CrossFunding(cross_funding::CrossFundingArgs),
+    /// 开仓等价差规则的 k* 表：校准、人工确认生效、查看
+    #[command(name = "cross-funding-kstar")]
+    CrossFundingKStar(cross_funding_kstar::CrossFundingKStarArgs),
+    /// 复盘开仓等价差的成交记录：实际节省 vs 期望 B，给出继续/排查/停用结论
+    #[command(name = "cross-funding-review")]
+    CrossFundingReview(cross_funding_review::CrossFundingReviewArgs),
 }
 
 /// 解析命令行并执行。参数非法时 clap 会自己打印用法并退出进程。
@@ -90,6 +98,8 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         Some(Command::ReconcileOrder(args)) => reconcile_order::run(args).await,
         Some(Command::SetPosition(args)) => set_position::run(args).await,
         Some(Command::CrossFunding(args)) => cross_funding::run(args).await,
+        Some(Command::CrossFundingKStar(args)) => cross_funding_kstar::run(args).await,
+        Some(Command::CrossFundingReview(args)) => cross_funding_review::run(args),
         None => engine_command::run(cli.config.as_deref().unwrap_or(DEFAULT_CONFIG_PATH)).await,
     }
 }

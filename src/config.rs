@@ -224,3 +224,118 @@ impl ScanConfig {
         }
     }
 }
+
+/// `cross-funding` 子命令的风控/执行参数(`config.toml` 的 `[cross_funding]` 段)。
+/// 名义上限和敞口上限没有默认值，必须显式配置。
+#[derive(Debug, Deserialize, Clone, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct CrossFundingConfig {
+    /// 单行名义金额上限(USDT，币数 × 多腿每币价)，启动时和触发时各查一次。
+    pub max_notional_usdt: Decimal,
+    /// 已结束(开完/停止)各行未对冲敞口之和的上限(USDT)，超过就停掉所有行。
+    pub max_unhedged_usdt: Decimal,
+    /// 单腿成交滑点(相对触发时对手价)告警阈值，bp。
+    #[serde(default = "default_cf_max_slippage_bp")]
+    pub max_slippage_bp: f64,
+    /// 启动时两边每币价格相差超过这个百分比就跳过这一行。
+    #[serde(default = "default_cf_max_price_diff_pct")]
+    pub max_price_diff_pct: Decimal,
+    /// 下单后多少秒两腿还没全部成交就停止这一行。
+    #[serde(default = "default_cf_fill_timeout_secs")]
+    pub fill_timeout_secs: u64,
+    /// 报价超过多少毫秒没更新就不参与决策/触发。
+    #[serde(default = "default_cf_quote_max_age_ms")]
+    pub quote_max_age_ms: u64,
+    /// t0 时最新小时 K 线已收盘超过多少小时就不开仓。
+    #[serde(default = "default_cf_max_bar_age_hours")]
+    pub max_bar_age_hours: u64,
+    /// σ ÷ 365 天 σ 中位数超过这个值就不开仓。
+    #[serde(default = "default_cf_max_sigma_ratio")]
+    pub max_sigma_ratio: f64,
+    /// 这个文件存在时不决策、不下单，删掉恢复。
+    #[serde(default = "default_cf_kill_switch_file")]
+    pub kill_switch_file: String,
+    /// 决策/结果记录(JSON Lines)。
+    #[serde(default = "default_cf_record_file")]
+    pub record_file: String,
+}
+
+fn default_cf_max_slippage_bp() -> f64 {
+    10.0
+}
+
+fn default_cf_max_price_diff_pct() -> Decimal {
+    Decimal::from(5)
+}
+
+fn default_cf_fill_timeout_secs() -> u64 {
+    30
+}
+
+fn default_cf_quote_max_age_ms() -> u64 {
+    5_000
+}
+
+fn default_cf_max_bar_age_hours() -> u64 {
+    2
+}
+
+fn default_cf_max_sigma_ratio() -> f64 {
+    3.0
+}
+
+fn default_cf_kill_switch_file() -> String {
+    "cross_funding.stop".to_string()
+}
+
+fn default_cf_record_file() -> String {
+    "logs/cross_funding_orders.jsonl".to_string()
+}
+
+/// 只关心 `[cross_funding]` 段的宽松包装。
+#[derive(Debug, Deserialize)]
+struct CrossFundingConfigFile {
+    cross_funding: Option<CrossFundingConfig>,
+}
+
+impl CrossFundingConfig {
+    /// 读取 `path` 里的 `[cross_funding]` 段。和黑名单不同，这里是真金白银的风控
+    /// 上限：文件不存在、解析失败、缺这一段都直接报错，不回退默认值。
+    pub fn load(path: impl AsRef<Path>) -> anyhow::Result<Self> {
+        let path = path.as_ref();
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read config file: {}", path.display()))?;
+        Self::parse(&text).with_context(|| format!("invalid [cross_funding] in {}", path.display()))
+    }
+
+    fn parse(text: &str) -> anyhow::Result<Self> {
+        let file: CrossFundingConfigFile = toml::from_str(text).context("failed to parse config toml")?;
+        file.cross_funding.ok_or_else(|| anyhow::anyhow!("missing [cross_funding] section"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cross_funding_config_requires_section_and_limits() {
+        let config = CrossFundingConfig::parse(
+            "[scan]\nblacklist = []\n[cross_funding]\nmax_notional_usdt = 200\nmax_unhedged_usdt = \"50\"\n",
+        )
+        .unwrap();
+        assert_eq!(config.max_notional_usdt, Decimal::from(200));
+        assert_eq!(config.max_unhedged_usdt, Decimal::from(50));
+        assert_eq!(config.max_slippage_bp, 10.0);
+        assert_eq!(config.fill_timeout_secs, 30);
+        assert_eq!(config.max_bar_age_hours, 2);
+        assert_eq!(config.max_sigma_ratio, 3.0);
+        assert_eq!(config.record_file, "logs/cross_funding_orders.jsonl");
+
+        assert!(CrossFundingConfig::parse("[scan]\nblacklist = []\n").is_err());
+        assert!(CrossFundingConfig::parse("[cross_funding]\nmax_notional_usdt = 200\n").is_err());
+        assert!(
+            CrossFundingConfig::parse("[cross_funding]\nmax_notional_usdt = 1\nmax_unhedged_usdt = 1\ntypo = 1\n").is_err()
+        );
+    }
+}

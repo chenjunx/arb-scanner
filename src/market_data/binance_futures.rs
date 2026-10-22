@@ -16,7 +16,9 @@ use crate::net::connect_tcp;
 use crate::topic::{Topic, TopicBus};
 use crate::types::{Quote, Symbol, Venue};
 
-use super::{Kline, KlineInterval, KlineProvider, MarketDataSource, closed_klines, now_ms};
+use super::{
+    Kline, KlineInterval, KlineProvider, MarketDataSource, RANGE_MAX_PAGES, closed_klines, closed_klines_in_range, now_ms,
+};
 
 const MAINNET_WS_HOST: &str = "fstream.binance.com";
 const MAINNET_WS_PORT: u16 = 443;
@@ -225,17 +227,49 @@ impl KlineProvider for BinanceFuturesKlineClient {
     /// `GET /fapi/v1/klines` 按开盘时间升序返回，最后一根是当前未收盘的，
     /// 所以多要 1 根再剔除。
     async fn klines(&self, symbol: &Symbol, interval: KlineInterval, limit: usize) -> anyhow::Result<Vec<Kline>> {
-        let interval_param = match interval {
-            KlineInterval::M5 => "5m",
-            KlineInterval::H1 => "1h",
-        };
         let query = [
             ("symbol", BinanceFuturesSource::binance_symbol(symbol)),
-            ("interval", interval_param.to_string()),
-            ("limit", (limit + 1).min(1500).to_string()),
+            ("interval", kline_interval_param(interval).to_string()),
+            ("limit", (limit + 1).min(KLINES_LIMIT_MAX).to_string()),
         ];
         let text = self.public_get("/fapi/v1/klines", &query).await?;
         Ok(closed_klines(parse_klines(&text)?, interval, now_ms(), limit))
+    }
+
+    /// 同一个接口带 `startTime`/`endTime`，单次最多 1500 根，从 `start_ms` 往后翻页。
+    async fn klines_range(
+        &self,
+        symbol: &Symbol,
+        interval: KlineInterval,
+        start_ms: u64,
+        end_ms: u64,
+    ) -> anyhow::Result<Vec<Kline>> {
+        let mut klines: Vec<Kline> = Vec::new();
+        let mut from = start_ms;
+        for _ in 0..RANGE_MAX_PAGES {
+            if from > end_ms {
+                break;
+            }
+            let query = [
+                ("symbol", BinanceFuturesSource::binance_symbol(symbol)),
+                ("interval", kline_interval_param(interval).to_string()),
+                ("startTime", from.to_string()),
+                ("endTime", end_ms.to_string()),
+                ("limit", KLINES_LIMIT_MAX.to_string()),
+            ];
+            let text = self.public_get("/fapi/v1/klines", &query).await?;
+            let page = parse_klines(&text)?;
+            let Some(last) = page.iter().map(|k| k.open_time_ms).max() else {
+                break;
+            };
+            let full = page.len() >= KLINES_LIMIT_MAX;
+            klines.extend(page);
+            if !full {
+                break;
+            }
+            from = last + interval.millis();
+        }
+        Ok(closed_klines_in_range(klines, interval, now_ms(), start_ms, end_ms))
     }
 
     async fn quote_volume_24h(&self, symbol: &Symbol) -> anyhow::Result<Decimal> {
@@ -249,6 +283,16 @@ impl KlineProvider for BinanceFuturesKlineClient {
 struct RestErrorResponse {
     code: i64,
     msg: String,
+}
+
+/// `GET /fapi/v1/klines` 单次最多 1500 根。
+const KLINES_LIMIT_MAX: usize = 1500;
+
+fn kline_interval_param(interval: KlineInterval) -> &'static str {
+    match interval {
+        KlineInterval::M5 => "5m",
+        KlineInterval::H1 => "1h",
+    }
 }
 
 /// 每根 K 线是数组 `[openTimeMs, "open", "high", "low", "close", "volume", closeTimeMs, ...]`。
@@ -266,7 +310,12 @@ fn parse_klines(text: &str) -> anyhow::Result<Vec<Kline>> {
                 .and_then(|v| v.as_str())
                 .and_then(|s| s.parse::<Decimal>().ok())
                 .context("kline missing close price")?;
-            Ok(Kline { open_time_ms, close })
+            let volume = row
+                .get(5)
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.parse::<Decimal>().ok())
+                .context("kline missing volume")?;
+            Ok(Kline { open_time_ms, close, volume })
         })
         .collect()
 }
@@ -368,7 +417,10 @@ mod tests {
         ]"#;
         let klines = parse_klines(text).expect("should parse");
         assert_eq!(klines.len(), 2);
-        assert_eq!(klines[0], Kline { open_time_ms: 1791435600000, close: "0.004036".parse().unwrap() });
+        assert_eq!(
+            klines[0],
+            Kline { open_time_ms: 1791435600000, close: "0.004036".parse().unwrap(), volume: Decimal::from(123) }
+        );
         assert_eq!(klines[1].open_time_ms, 1791439200000);
     }
 

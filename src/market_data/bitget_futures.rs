@@ -17,7 +17,9 @@ use crate::net::connect_tcp;
 use crate::topic::{Topic, TopicBus};
 use crate::types::{Quote, Symbol, Venue};
 
-use super::{Kline, KlineInterval, KlineProvider, MarketDataSource, closed_klines, now_ms};
+use super::{
+    Kline, KlineInterval, KlineProvider, MarketDataSource, RANGE_MAX_PAGES, closed_klines, closed_klines_in_range, now_ms,
+};
 
 const WS_HOST: &str = "ws.bitget.com";
 const WS_PORT: u16 = 443;
@@ -29,6 +31,15 @@ const MAX_BACKOFF: Duration = Duration::from_secs(30);
 const WS_PING_INTERVAL: Duration = Duration::from_secs(20);
 /// `/api/v2/mix/market/candles` 单次最多 1000 根。
 const CANDLES_LIMIT_MAX: usize = 1000;
+/// `/api/v2/mix/market/history-candles` 单次最多 200 根。
+const HISTORY_CANDLES_LIMIT_MAX: usize = 200;
+
+fn candle_granularity(interval: KlineInterval) -> &'static str {
+    match interval {
+        KlineInterval::M5 => "5m",
+        KlineInterval::H1 => "1H",
+    }
+}
 
 /// Bitget USDT 本位永续一档盘口行情源：订阅公开频道 `books1`。发布的报价是
 /// 交易所原始报价(一个 base 单位的价格)，挂单量单位是 base 币。
@@ -239,18 +250,51 @@ impl KlineProvider for BitgetFuturesKlineClient {
     /// `GET /api/v2/mix/market/candles`，最后一根是当前未收盘的，所以多要 1 根
     /// 再交给 [`closed_klines`] 剔除。
     async fn klines(&self, symbol: &Symbol, interval: KlineInterval, limit: usize) -> anyhow::Result<Vec<Kline>> {
-        let granularity = match interval {
-            KlineInterval::M5 => "5m",
-            KlineInterval::H1 => "1H",
-        };
         let query = [
             ("symbol", bitget_symbol(symbol)),
             ("productType", BITGET_USDT_FUTURES.to_string()),
-            ("granularity", granularity.to_string()),
+            ("granularity", candle_granularity(interval).to_string()),
             ("limit", (limit + 1).min(CANDLES_LIMIT_MAX).to_string()),
         ];
         let text = self.public_get("/api/v2/mix/market/candles", &query).await?;
         Ok(closed_klines(parse_candles(&text)?, interval, now_ms(), limit))
+    }
+
+    /// `GET /api/v2/mix/market/history-candles`，单次最多 200 根，只带 `endTime`
+    /// 从 `end_ms` 往前翻页到 `start_ms`(同时带 `startTime` 时交易所对超长区间
+    /// 返回哪一段没有文档保证，所以不带)。
+    async fn klines_range(
+        &self,
+        symbol: &Symbol,
+        interval: KlineInterval,
+        start_ms: u64,
+        end_ms: u64,
+    ) -> anyhow::Result<Vec<Kline>> {
+        // `endTime` 按 K 线**收盘时间**过滤(收盘 ≤ endTime 的才返回)，所以要拿到
+        // 开盘时间 = t 的那根得传 t + 周期；下一页从本页最老一根的开盘时间(即前一根
+        // 的收盘时间)接着往前。
+        let mut klines: Vec<Kline> = Vec::new();
+        let mut end = end_ms + interval.millis();
+        for _ in 0..RANGE_MAX_PAGES {
+            let query = [
+                ("symbol", bitget_symbol(symbol)),
+                ("productType", BITGET_USDT_FUTURES.to_string()),
+                ("granularity", candle_granularity(interval).to_string()),
+                ("endTime", end.to_string()),
+                ("limit", HISTORY_CANDLES_LIMIT_MAX.to_string()),
+            ];
+            let text = self.public_get("/api/v2/mix/market/history-candles", &query).await?;
+            let page = parse_candles(&text)?;
+            let Some(oldest) = page.iter().map(|k| k.open_time_ms).min() else {
+                break;
+            };
+            klines.extend(page);
+            if oldest <= start_ms || oldest >= end {
+                break;
+            }
+            end = oldest;
+        }
+        Ok(closed_klines_in_range(klines, interval, now_ms(), start_ms, end_ms))
     }
 
     /// `GET /api/v2/mix/market/ticker` 返回只含一个元素的数组，取 `quoteVolume`。
@@ -268,7 +312,9 @@ fn parse_candles(text: &str) -> anyhow::Result<Vec<Kline>> {
         .map(|row| {
             let open_time_ms: u64 = row.first().and_then(|t| t.parse().ok()).context("bitget candle has no valid ts")?;
             let close: Decimal = row.get(4).and_then(|c| c.parse().ok()).context("bitget candle has no valid close")?;
-            Ok(Kline { open_time_ms, close })
+            let volume: Decimal =
+                row.get(5).and_then(|v| v.parse().ok()).context("bitget candle has no valid baseVol")?;
+            Ok(Kline { open_time_ms, close, volume })
         })
         .collect()
 }
@@ -331,7 +377,10 @@ mod tests {
         ]}"#;
         let klines = parse_candles(text).unwrap();
         let closed = closed_klines(klines, KlineInterval::H1, 2 * HOUR_MS + 1, 10);
-        assert_eq!(closed, vec![Kline { open_time_ms: HOUR_MS, close: "26194.5".parse().unwrap() }]);
+        assert_eq!(
+            closed,
+            vec![Kline { open_time_ms: HOUR_MS, close: "26194.5".parse().unwrap(), volume: "26.26".parse().unwrap() }]
+        );
         assert!(parse_candles(r#"{"code":"40034","msg":"Parameter does not exist","data":null}"#).is_err());
     }
 
