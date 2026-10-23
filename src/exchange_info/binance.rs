@@ -442,6 +442,10 @@ fn parse_spot_market_precisions(text: &str) -> anyhow::Result<Vec<MarketPrecisio
         .collect())
 }
 
+/// 精度表同时收美股这类 `TRADIFI_PERPETUAL`(如 AGPUUSDT)：它和普通永续同一套
+/// 下单接口和 filters，只是 contractType 不同。精度表按配置里的 symbol 精确查，
+/// 多收不会误匹配；[`parse_usdt_perpetual_symbols`] 用来做跨所币对发现，美股
+/// ticker 可能和别家的同名加密币撞车，所以那边仍然只收 `PERPETUAL`。
 fn parse_perpetual_market_precisions(text: &str) -> anyhow::Result<Vec<MarketPrecision>> {
     if let Ok(err) = serde_json::from_str::<ErrorResponse>(text) {
         anyhow::bail!("binance futures error {}: {}", err.code, err.msg);
@@ -451,7 +455,11 @@ fn parse_perpetual_market_precisions(text: &str) -> anyhow::Result<Vec<MarketPre
     Ok(resp
         .symbols
         .into_iter()
-        .filter(|s| s.status == "TRADING" && s.contract_type == "PERPETUAL" && s.quote_asset.eq_ignore_ascii_case("USDT"))
+        .filter(|s| {
+            s.status == "TRADING"
+                && matches!(s.contract_type.as_str(), "PERPETUAL" | "TRADIFI_PERPETUAL")
+                && s.quote_asset.eq_ignore_ascii_case("USDT")
+        })
         .filter_map(|s| build_market_precision(Symbol::new(s.base_asset, s.quote_asset), &s.filters))
         .collect())
 }
@@ -790,6 +798,24 @@ mod tests {
         let precisions = parse_perpetual_market_precisions(text).expect("should parse");
         assert_eq!(precisions.len(), 1);
         assert_eq!(precisions[0].market.qty_step, "10".parse().unwrap());
+    }
+
+    #[test]
+    fn parse_perpetual_market_precisions_includes_tradfi_perpetuals_but_not_delivery() {
+        let filters = r#"[
+            {"filterType": "PRICE_FILTER", "tickSize": "0.01"},
+            {"filterType": "LOT_SIZE", "minQty": "0.1", "maxQty": "1000", "stepSize": "0.1"},
+            {"filterType": "MARKET_LOT_SIZE", "minQty": "0.1", "maxQty": "1000", "stepSize": "0.1"}
+        ]"#;
+        let text = format!(
+            r#"{{"symbols": [
+                {{"symbol":"AGPUUSDT","status":"TRADING","contractType":"TRADIFI_PERPETUAL","baseAsset":"AGPU","quoteAsset":"USDT","filters":{filters}}},
+                {{"symbol":"BTCUSDT_261225","status":"TRADING","contractType":"CURRENT_QUARTER","baseAsset":"BTC","quoteAsset":"USDT","filters":{filters}}}
+            ]}}"#
+        );
+        let precisions = parse_perpetual_market_precisions(&text).expect("should parse");
+        let symbols: Vec<_> = precisions.into_iter().map(|p| p.symbol).collect();
+        assert_eq!(symbols, vec![Symbol::new("AGPU", "USDT")]);
     }
 
     #[test]
