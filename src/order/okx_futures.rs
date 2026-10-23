@@ -356,6 +356,12 @@ struct OkxOrder {
     acc_fill_sz: String,
     #[serde(default)]
     avg_px: String,
+    /// WS 推送：本次推送对应成交的手续费，负数是扣费、正数是返佣。REST 查单里
+    /// 这个字段语义不同(文档注明两边不一致)，只在 [`Self::into_update`] 用。
+    #[serde(default)]
+    fill_fee: String,
+    #[serde(default)]
+    fill_fee_ccy: String,
 }
 
 impl OkxOrder {
@@ -377,8 +383,12 @@ impl OkxOrder {
         }
     }
 
-    /// 手续费字段(`fee` 累计、`fillFee` 单笔)暂不解析，fee 留空交给估算兜底。
+    /// 手续费取 `fillFee`(本次推送的单笔值)而不是累计的 `fee`，和
+    /// `ExchangeOrderUpdate::fee` 的增量语义一致；取反成"正数是成本"，返佣就是
+    /// 负成本。没有成交的推送(如撤单)即使带着上一笔的 `fillFee`，
+    /// `OrderManager` 也只在 fill_delta > 0 时记手续费，不会重复。
     fn into_update(self, venue: &Venue, ts_ms: u64) -> ExchangeOrderUpdate {
+        let fee = opt_decimal(&self.fill_fee).filter(|_| !self.fill_fee_ccy.is_empty());
         ExchangeOrderUpdate {
             venue: venue.clone(),
             symbol: parse_okx_swap_inst_id(&self.inst_id),
@@ -387,8 +397,8 @@ impl OkxOrder {
             status: self.status(),
             filled_qty: self.filled_qty(),
             avg_price: self.avg_price(),
-            fee: None,
-            fee_asset: None,
+            fee: fee.map(|f| -f),
+            fee_asset: fee.map(|_| self.fill_fee_ccy.clone()),
             ts_ms,
         }
     }
@@ -823,7 +833,7 @@ mod tests {
 
         let push = r#"{"arg":{"channel":"orders","instType":"SWAP","uid":"1"},"data":[
             {"instType":"SWAP","instId":"PEPE-USDT-SWAP","ordId":"312269865356374016","clOrdId":"cf170000000000012345",
-             "state":"partially_filled","accFillSz":"2","avgPx":"0.000004","fillSz":"2","fillFee":"-0.0001","fee":"-0.0001"}]}"#;
+             "state":"partially_filled","accFillSz":"2","avgPx":"0.000004","fillSz":"2","fillFee":"-0.0001","fillFeeCcy":"USDT","fee":"-0.0003"}]}"#;
         let PrivateMessage::Orders(updates) = parse_private_message(push, &venue) else {
             panic!("expected orders");
         };
@@ -834,7 +844,28 @@ mod tests {
         assert_eq!(update.exchange_order_id.as_deref(), Some("312269865356374016"));
         assert_eq!(update.status, OrderStatus::PartiallyFilled);
         assert_eq!(update.filled_qty, Decimal::from(2));
-        assert_eq!(update.fee, None);
+        // 取本次的 fillFee 而不是累计 fee，扣费取反成正数成本。
+        assert_eq!(update.fee, Some("0.0001".parse().unwrap()));
+        assert_eq!(update.fee_asset.as_deref(), Some("USDT"));
+    }
+
+    #[test]
+    fn ws_order_fee_handles_rebate_and_missing_fields() {
+        let venue = Venue::new("okx_futures");
+        let fee_of = |fields: &str| {
+            let push = format!(
+                r#"{{"arg":{{"channel":"orders","instType":"SWAP"}},"data":[{{"instId":"BTC-USDT-SWAP","ordId":"1","state":"filled","accFillSz":"1","avgPx":"100"{fields}}}]}}"#
+            );
+            let PrivateMessage::Orders(updates) = parse_private_message(&push, &venue) else {
+                panic!("expected orders");
+            };
+            (updates[0].fee, updates[0].fee_asset.clone())
+        };
+        // maker 返佣：正的 fillFee 记成负成本。
+        assert_eq!(fee_of(r#","fillFee":"0.02","fillFeeCcy":"USDT""#), (Some("-0.02".parse().unwrap()), Some("USDT".to_string())));
+        assert_eq!(fee_of(r#","fillFee":"","fillFeeCcy":"""#), (None, None));
+        assert_eq!(fee_of(r#","fillFee":"-0.02","fillFeeCcy":"""#), (None, None));
+        assert_eq!(fee_of(""), (None, None));
     }
 
     #[test]

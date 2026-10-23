@@ -585,6 +585,11 @@ struct WsOrder {
     acc_base_volume: String,
     #[serde(default)]
     price_avg: String,
+    /// 最近一笔成交的手续费，负数是扣费。`feeDetail` 是订单累计值，不用。
+    #[serde(default)]
+    fill_fee: String,
+    #[serde(default)]
+    fill_fee_coin: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -641,6 +646,10 @@ fn parse_private_message(text: &str, venue: &Venue) -> PrivateMessage {
         .into_iter()
         .map(|order| {
             let filled_qty = opt_decimal(&order.acc_base_volume).unwrap_or(Decimal::ZERO);
+            // 取最近一笔的 fillFee，和 `ExchangeOrderUpdate::fee` 的增量语义一致，
+            // 取反成"正数是成本"。没有新成交的推送(如撤单)带着旧的 fillFee 也没关系，
+            // `OrderManager` 只在 fill_delta > 0 时记手续费。
+            let fee = opt_decimal(&order.fill_fee).filter(|_| !order.fill_fee_coin.is_empty());
             ExchangeOrderUpdate {
                 venue: venue.clone(),
                 symbol: parse_inst_id(&order.inst_id),
@@ -649,9 +658,8 @@ fn parse_private_message(text: &str, venue: &Venue) -> PrivateMessage {
                 status: map_state(&order.status, filled_qty),
                 filled_qty,
                 avg_price: opt_decimal(&order.price_avg).filter(|p| *p > Decimal::ZERO),
-                // 推送里的 `fillFee`/`feeDetail` 暂不解析，fee 留空交给估算兜底。
-                fee: None,
-                fee_asset: None,
+                fee: fee.map(|f| -f),
+                fee_asset: fee.map(|_| order.fill_fee_coin),
                 ts_ms,
             }
         })
@@ -795,8 +803,10 @@ mod tests {
 
         let push = r#"{"action":"snapshot","arg":{"instType":"USDT-FUTURES","channel":"orders","instId":"default"},"data":[
             {"accBaseVolume":"0.01","clientOid":"cf170000000000012345","instId":"BTCUSDT","orderId":"13333333333333333333",
-             "priceAvg":"27000.5","status":"filled","size":"0.01","side":"buy","orderType":"market"},
-            {"accBaseVolume":"0","clientOid":"","instId":"1000BONKUSDT","orderId":"2","priceAvg":"","status":"live"}
+             "priceAvg":"27000.5","status":"filled","size":"0.01","side":"buy","orderType":"market",
+             "baseVolume":"0.004","fillFee":"-0.0648","fillFeeCoin":"USDT","feeDetail":[{"feeCoin":"USDT","fee":"-0.162"}]},
+            {"accBaseVolume":"0","clientOid":"","instId":"1000BONKUSDT","orderId":"2","priceAvg":"","status":"live",
+             "fillFee":"","fillFeeCoin":"","feeDetail":[{"feeCoin":"USDT","fee":"0"}]}
         ],"ts":1695716059516}"#;
         let PrivateMessage::Orders(updates) = parse_private_message(push, &venue) else {
             panic!("expected orders");
@@ -808,9 +818,14 @@ mod tests {
         assert_eq!(updates[0].status, OrderStatus::Filled);
         assert_eq!(updates[0].filled_qty, "0.01".parse().unwrap());
         assert_eq!(updates[0].avg_price, Some("27000.5".parse().unwrap()));
+        // 取最近一笔的 fillFee 而不是 feeDetail 累计值，扣费取反成正数成本。
+        assert_eq!(updates[0].fee, Some("0.0648".parse().unwrap()));
+        assert_eq!(updates[0].fee_asset.as_deref(), Some("USDT"));
         assert_eq!(updates[1].symbol, Some(Symbol::new("1000BONK", "USDT")));
         assert_eq!(updates[1].client_order_id, None);
         assert_eq!(updates[1].status, OrderStatus::New);
+        assert_eq!(updates[1].fee, None);
+        assert_eq!(updates[1].fee_asset, None);
     }
 
     #[test]
