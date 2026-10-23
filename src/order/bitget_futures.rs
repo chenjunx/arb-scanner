@@ -127,6 +127,9 @@ impl BitgetFuturesOrderProvider {
     /// Bitget 要求 `startTime`~`endTime` 不超过 30 天，起点早于 30 天前时截到 30 天内。
     /// 每页最多 100 条、按时间倒序，用 `idLessThan=<endId>` 往前翻页。`tran_id` 用
     /// 结算时间(毫秒)——同一合约每个结算时点只有一条资金费记录。
+    ///
+    /// 实盘观察到该接口不按 `symbol` 参数过滤，会返回账户下所有合约的资金费，必须按账单
+    /// 自带的 `symbol` 再筛一遍，否则别的合约的资金费会被记到当前合约头上。
     pub(crate) async fn funding_history(
         &self,
         symbol: &Symbol,
@@ -153,11 +156,10 @@ impl BitgetFuturesOrderProvider {
                 query.push(("idLessThan", id.as_str()));
             }
             let text = self.signed_request(reqwest::Method::GET, "/api/v2/mix/account/bill", &query, None).await?;
-            let (page, end_id) = parse_funding_bills(&text, symbol)?;
-            let full_page = page.len() >= FUNDING_PAGE_LIMIT.parse::<usize>().unwrap_or(100);
+            let (page, next_id) = parse_funding_bills(&text, symbol)?;
             records.extend(page);
-            match end_id {
-                Some(id) if full_page => id_less_than = Some(id),
+            match next_id {
+                Some(id) => id_less_than = Some(id),
                 _ => {
                     records.sort_by_key(|r: &FundingIncomeRecord| r.tran_id);
                     return Ok(records);
@@ -347,23 +349,31 @@ struct BillPage {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct BillEntry {
+    #[serde(default)]
+    symbol: String,
     amount: String,
     c_time: String,
 }
 
-/// 解析一页资金费账单，返回记录和翻页用的 `endId`。
+/// 解析一页资金费账单，只保留 `symbol` 对应合约的记录；返回记录和下一页的
+/// `idLessThan` 游标(原始页未满即为最后一页，返回 `None`)。翻页按过滤前的条数判断，
+/// 否则其他合约的账单被筛掉后会误判成最后一页。
 fn parse_funding_bills(text: &str, symbol: &Symbol) -> anyhow::Result<(Vec<FundingIncomeRecord>, Option<String>)> {
     let page: BillPage = parse_bitget_data(text, "bills")?;
+    let full_page = page.bills.len() >= FUNDING_PAGE_LIMIT.parse::<usize>().unwrap_or(100);
+    let native = bitget_symbol(symbol);
     let records = page
         .bills
         .into_iter()
+        .filter(|b| b.symbol.eq_ignore_ascii_case(&native))
         .map(|b| {
             let time_ms: u64 = b.c_time.parse().with_context(|| format!("invalid bitget bill cTime '{}'", b.c_time))?;
             let income = opt_decimal(&b.amount).with_context(|| format!("invalid bitget bill amount '{}'", b.amount))?;
             Ok(FundingIncomeRecord { symbol: symbol.clone(), income, time_ms, tran_id: time_ms as i64 })
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
-    Ok((records, page.end_id.filter(|id| !id.is_empty())))
+    let next_id = page.end_id.filter(|id| full_page && !id.is_empty());
+    Ok((records, next_id))
 }
 
 #[derive(Debug, Deserialize)]
@@ -657,13 +667,25 @@ mod tests {
     fn parses_funding_bills_page() {
         let text = r#"{"code":"00000","msg":"success","data":{"bills":[
             {"billId":"2","symbol":"BTCUSDT","amount":"-0.42","fee":"0","businessType":"contract_settle_fee","coin":"USDT","cTime":"1700028800000"},
+            {"billId":"3","symbol":"ETHUSDT","amount":"-0.7","fee":"0","businessType":"contract_settle_fee","coin":"USDT","cTime":"1700028800000"},
             {"billId":"1","symbol":"BTCUSDT","amount":"0.1","fee":"0","businessType":"contract_settle_fee","coin":"USDT","cTime":"1700000000000"}
         ],"endId":"1"}}"#;
-        let (records, end_id) = parse_funding_bills(text, &Symbol::new("BTC", "USDT")).unwrap();
-        assert_eq!(end_id.as_deref(), Some("1"));
+        // 其他合约(ETHUSDT)的账单要筛掉；原始页未满，不再翻页。
+        let (records, next_id) = parse_funding_bills(text, &Symbol::new("BTC", "USDT")).unwrap();
+        assert!(next_id.is_none());
         assert_eq!(records.len(), 2);
         assert_eq!(records[0].income, Decimal::new(-42, 2));
         assert_eq!(records[1].tran_id, 1_700_000_000_000);
+
+        // 满页时即使筛完一条不剩也要继续翻页。
+        let bill = r#"{"billId":"9","symbol":"ETHUSDT","amount":"-0.7","businessType":"contract_settle_fee","coin":"USDT","cTime":"1700028800000"}"#;
+        let full = format!(
+            r#"{{"code":"00000","msg":"success","data":{{"bills":[{}],"endId":"9"}}}}"#,
+            vec![bill; 100].join(",")
+        );
+        let (records, next_id) = parse_funding_bills(&full, &Symbol::new("BTC", "USDT")).unwrap();
+        assert!(records.is_empty());
+        assert_eq!(next_id.as_deref(), Some("9"));
 
         let (records, end_id) =
             parse_funding_bills(r#"{"code":"00000","msg":"success","data":{"bills":[],"endId":""}}"#, &Symbol::new("BTC", "USDT"))
