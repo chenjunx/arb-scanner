@@ -4,7 +4,7 @@ use std::time::Duration;
 use anyhow::Context;
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
-use log::{debug, warn};
+use log::{debug, error, warn};
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
 use serde::Deserialize;
@@ -19,6 +19,7 @@ use crate::order_manager::stream::{ExchangeOrderUpdate, OrderStreamSource};
 use crate::types::{Symbol, Venue};
 
 use super::OrderProvider;
+use super::contract_size::ContractSizeCache;
 use super::types::{MarketOrderRequest, OrderAmount, OrderResult, OrderSide, OrderStatus};
 
 const HOST: &str = "https://api.gateio.ws";
@@ -37,27 +38,35 @@ const CLIENT_ID_PREFIX: &str = "t-";
 /// `GATE_API_KEY`/`GATE_API_SECRET`。签名算法和 `order::gate` 完全相同，按既有
 /// 约定各文件独立一份。
 ///
-/// 下单量单位是**张**(1 张 = `quanto_multiplier` 个币，见
-/// `exchange_info::gate` 的 `perpetual_contract_spec`)，只支持整数张；
-/// 方向用 `size` 的正负表示(买正卖负)。要求账户是单向持仓模式，杠杆/保证金
-/// 模式由用户在交易所预先设置好，这里不修改。
+/// 对外(下单请求、成交结果、持仓)的数量单位是**币**，和系统其它部分一致；
+/// Gate 接口的单位是**张**(1 张 = `quanto_multiplier` 个币)，换算只在这一层
+/// 做，见 [`ContractSizeCache`]。下单量换算后必须是整数张；方向用 `size` 的
+/// 正负表示(买正卖负)。要求账户是单向持仓模式，杠杆/保证金模式由用户在交易所
+/// 预先设置好，这里不修改。
 pub struct GateFuturesOrderProvider {
     venue: Venue,
     api_key: String,
     api_secret: String,
     http: reqwest::Client,
+    contract_sizes: Arc<ContractSizeCache>,
 }
 
 impl GateFuturesOrderProvider {
-    pub fn new(venue: Venue, api_key: String, api_secret: String, proxy: Option<&str>) -> anyhow::Result<Self> {
+    pub fn new(
+        venue: Venue,
+        api_key: String,
+        api_secret: String,
+        contract_sizes: Arc<ContractSizeCache>,
+        proxy: Option<&str>,
+    ) -> anyhow::Result<Self> {
         let http = build_http_client(proxy)?;
-        Ok(Self { venue, api_key, api_secret, http })
+        Ok(Self { venue, api_key, api_secret, http, contract_sizes })
     }
 
-    pub fn from_env(venue: Venue, proxy: Option<&str>) -> anyhow::Result<Self> {
+    pub fn from_env(venue: Venue, contract_sizes: Arc<ContractSizeCache>, proxy: Option<&str>) -> anyhow::Result<Self> {
         let api_key = std::env::var("GATE_API_KEY").context("GATE_API_KEY not set")?;
         let api_secret = std::env::var("GATE_API_SECRET").context("GATE_API_SECRET not set")?;
-        Self::new(venue, api_key, api_secret, proxy)
+        Self::new(venue, api_key, api_secret, contract_sizes, proxy)
     }
 
     async fn signed_request(
@@ -129,24 +138,27 @@ impl OrderProvider for GateFuturesOrderProvider {
         let OrderAmount::Base(quantity) = req.amount else {
             anyhow::bail!("{} does not support quote-amount market orders", self.venue());
         };
-        let body = build_market_order_body(&req.symbol, req.side, quantity, req.client_order_id.as_deref())?;
+        let contracts = self.contract_sizes.to_contracts(&req.symbol, quantity).await?;
+        let body = build_market_order_body(&req.symbol, req.side, contracts, req.client_order_id.as_deref())
+            .with_context(|| format!("{quantity} {} 换算成 {contracts} 张", req.symbol.base))?;
         let text = self.signed_request(reqwest::Method::POST, "/futures/usdt/orders", "", Some(body)).await?;
-        parse_order_response(&text)
+        self.contract_sizes.convert_result(&req.symbol, parse_order_response(&text)?).await
     }
 
-    /// `GET /futures/usdt/orders/{id}`，合约订单号全局唯一，不需要 symbol。
-    async fn query_order(&self, _symbol: &Symbol, exchange_order_id: &str) -> anyhow::Result<OrderResult> {
+    /// `GET /futures/usdt/orders/{id}`，合约订单号全局唯一；symbol 只用来把张数换成币数。
+    async fn query_order(&self, symbol: &Symbol, exchange_order_id: &str) -> anyhow::Result<OrderResult> {
         let path = format!("/futures/usdt/orders/{exchange_order_id}");
         let text = self.signed_request(reqwest::Method::GET, &path, "", None).await?;
-        parse_order_response(&text)
+        self.contract_sizes.convert_result(symbol, parse_order_response(&text)?).await
     }
 
     /// `GET /futures/usdt/positions/{contract}`：单向持仓模式下 `size` 是净持仓
-    /// 张数(多正空负)；双向持仓模式下这个接口报错，正好当作前置条件检查。
+    /// 张数(多正空负)，换成币数返回；双向持仓模式下这个接口报错，正好当作前置
+    /// 条件检查。
     async fn perp_position(&self, symbol: &Symbol) -> anyhow::Result<Decimal> {
         let path = format!("/futures/usdt/positions/{}", gate_contract(symbol));
         let text = self.signed_request(reqwest::Method::GET, &path, "", None).await?;
-        parse_position(&text)
+        self.contract_sizes.from_contracts(symbol, parse_position(&text)?).await
     }
 }
 
@@ -399,25 +411,33 @@ fn parse_account_user_id(text: &str) -> anyhow::Result<String> {
 /// Gate.io USDT 本位永续私有订单流：订阅 `futures.orders`，payload 是
 /// `[user_id, "!all"]`(全部合约)，所以启动时先用 `GET /futures/usdt/accounts`
 /// 查出 user id。鉴权方式和现货 `spot.orders` 相同(内嵌在订阅请求的 `auth` 里)。
-/// 推送里的数量单位是张，和下单单位一致。
+/// 推送里的数量单位是张，交给 `OrderManager` 之前用和下单网关同一份
+/// [`ContractSizeCache`] 换成币数。
 pub struct GateFuturesPrivateOrderStream {
     venue: Venue,
     api_key: String,
     api_secret: String,
     proxy: Option<String>,
     http: reqwest::Client,
+    contract_sizes: Arc<ContractSizeCache>,
 }
 
 impl GateFuturesPrivateOrderStream {
-    pub fn new(venue: Venue, api_key: String, api_secret: String, proxy: Option<&str>) -> anyhow::Result<Self> {
+    pub fn new(
+        venue: Venue,
+        api_key: String,
+        api_secret: String,
+        contract_sizes: Arc<ContractSizeCache>,
+        proxy: Option<&str>,
+    ) -> anyhow::Result<Self> {
         let http = build_http_client(proxy)?;
-        Ok(Self { venue, api_key, api_secret, proxy: proxy.map(str::to_string), http })
+        Ok(Self { venue, api_key, api_secret, proxy: proxy.map(str::to_string), http, contract_sizes })
     }
 
-    pub fn from_env(venue: Venue, proxy: Option<&str>) -> anyhow::Result<Self> {
+    pub fn from_env(venue: Venue, contract_sizes: Arc<ContractSizeCache>, proxy: Option<&str>) -> anyhow::Result<Self> {
         let api_key = std::env::var("GATE_API_KEY").context("GATE_API_KEY not set")?;
         let api_secret = std::env::var("GATE_API_SECRET").context("GATE_API_SECRET not set")?;
-        Self::new(venue, api_key, api_secret, proxy)
+        Self::new(venue, api_key, api_secret, contract_sizes, proxy)
     }
 
     async fn fetch_user_id(&self) -> anyhow::Result<String> {
@@ -540,7 +560,14 @@ impl OrderStreamSource for GateFuturesPrivateOrderStream {
                                 continue;
                             };
                             for update in parse_futures_order_update(&text, &self.venue) {
-                                order_manager.handle_exchange_update(update).await;
+                                let order_ref = format!("{:?}/{:?}", update.client_order_id, update.exchange_order_id);
+                                match self.contract_sizes.convert_update(update).await {
+                                    Ok(update) => order_manager.handle_exchange_update(update).await,
+                                    Err(err) => error!(
+                                        "gate futures order update {order_ref} for venue={} dropped: 张数无法换算成币数 ({err:#})；若是本系统的订单，仓位需要用 set-position 人工修正",
+                                        self.venue
+                                    ),
+                                }
                             }
                         }
                     }
@@ -758,7 +785,11 @@ mod tests {
 
     #[test]
     fn subscribe_message_uses_user_id_and_all_contracts() {
-        let stream = GateFuturesPrivateOrderStream::new(Venue::new("gate_futures"), "k".into(), "s".into(), None).unwrap();
+        let contract_sizes =
+            Arc::new(ContractSizeCache::new(Arc::new(crate::order::contract_size::tests::FakeSpecs::new(&[]))));
+        let stream =
+            GateFuturesPrivateOrderStream::new(Venue::new("gate_futures"), "k".into(), "s".into(), contract_sizes, None)
+                .unwrap();
         let msg = stream.subscribe_message("1666");
         assert_eq!(msg["channel"], "futures.orders");
         assert_eq!(msg["payload"], serde_json::json!(["1666", "!all"]));

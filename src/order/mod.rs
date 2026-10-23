@@ -1,6 +1,7 @@
 pub mod binance;
 pub mod binance_futures;
 pub mod bitget_futures;
+pub mod contract_size;
 pub mod gate;
 pub mod gate_futures;
 pub mod kraken;
@@ -162,8 +163,8 @@ pub trait OrderProvider: Send + Sync {
     }
 
     /// 查询某个永续合约当前的净持仓(单向持仓模式)，多头为正、空头为负、
-    /// 无持仓为 0。单位是交易所自己的下单单位(币安是合约名对应的币数，
-    /// Gate 是张数)。账户不是单向持仓模式时报错——下单都不带持仓方向参数，
+    /// 无持仓为 0。单位是合约 base 单位(和交易所界面显示的持仓数量一致；
+    /// Gate/OKX 的张数由网关换算好)。账户不是单向持仓模式时报错——下单都不带持仓方向参数，
     /// 双向持仓下会被交易所拒单，调用方靠这里提前拦住。默认实现是报错，
     /// 现货交易所不需要实现。
     async fn perp_position(&self, symbol: &Symbol) -> anyhow::Result<Decimal> {

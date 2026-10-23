@@ -5,9 +5,8 @@
 //! 交易所上的真实持仓补录进来。只支持 [`VENUES`] 里列出的、真实下过单的
 //! venue，和 `reconcile-order` 一样默认只读、加 `--confirm` 才真正覆盖写入。
 //!
-//! `--qty` 的单位要和这个 venue 在 Redis 里已有记录的单位一致：仓位按交易所
-//! 回报的成交量直接累加，`gate_futures`/`okx_futures` 记的是**张数**，其余
-//! venue 记的是币数。
+//! `--qty` 填交易所界面显示的持仓数量(合约 base 单位)：所有 venue 都一样，
+//! `gate_futures`/`okx_futures` 也是币数而不是张数——张数只在下单网关里换算。
 
 use clap::Args;
 use log::info;
@@ -56,7 +55,7 @@ pub struct SetPositionArgs {
     pub symbol: Symbol,
 
     /// 交易所后台查到的真实净持仓量(正=多头/净持有，负=空头)；
-    /// gate_futures/okx_futures 填张数，其余填币数
+    /// 填交易所界面显示的数量(合约 base 单位，Gate/OKX 也填币数不填张数)
     #[arg(long)]
     pub qty: Decimal,
 

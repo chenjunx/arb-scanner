@@ -22,8 +22,10 @@
 //! 每次 t0 决策和每一行的最终结果都往 `record_file` 追加一行 JSON
 //! ([`OrderRecord`])，供 `cross-funding-review` 复盘。
 //!
-//! 数量/价格单位：CSV 里的 `quantity` 是实际币数；各所下单量 = 币数 /
-//! `PerpContractSpec::qty_unit`，每币价格 = 报价 / `PerpContractSpec::price_unit`。
+//! 数量/价格单位：CSV 里的 `quantity` 是实际币数；各腿下单量是合约 base 单位
+//! (= 币数 / `PerpContractSpec::price_unit`，只有币安 `1000PEPEUSDT` 这类带前缀
+//! 的合约才不是 1:1，张数换算在 Gate/OKX 下单网关里做)，每币价格 = 报价 /
+//! `PerpContractSpec::price_unit`。
 
 use std::collections::HashMap;
 use std::fmt;
@@ -536,22 +538,22 @@ struct LegState {
     venue: Venue,
     symbol: Symbol,
     spec: PerpContractSpec,
-    /// 交易所单位的下单量。
+    /// 下单量，合约 base 单位。
     order_qty: Decimal,
     quote: Option<Quote>,
     client_order_id: Option<String>,
-    /// `(filled_qty, avg_price)`，交易所单位。
+    /// `(filled_qty, avg_price)`，合约 base 单位和原始报价。
     filled: Option<(Decimal, Decimal)>,
 }
 
 impl LegState {
     fn filled_coins(&self) -> Decimal {
-        self.filled.map(|(qty, _)| qty * self.spec.qty_unit).unwrap_or(Decimal::ZERO)
+        self.filled.map(|(qty, _)| self.spec.base_to_coins(qty)).unwrap_or(Decimal::ZERO)
     }
 
     /// 成交币数和每币成交均价。
     fn fill(&self) -> Option<(Decimal, f64)> {
-        self.filled.map(|(qty, price)| (qty * self.spec.qty_unit, per_coin_f64(price, self.spec.price_unit)))
+        self.filled.map(|(qty, price)| (self.spec.base_to_coins(qty), per_coin_f64(price, self.spec.price_unit)))
     }
 
     /// 估值用的每币价格：有成交用成交均价，否则用最新报价中间价。
@@ -725,8 +727,8 @@ impl CrossFundingStrategy {
                 short_rule.coin_min.normalize(),
             );
         }
-        let long_qty = row.quantity / long_spec.qty_unit;
-        let short_qty = row.quantity / short_spec.qty_unit;
+        let long_qty = long_spec.coins_to_base(row.quantity);
+        let short_qty = short_spec.coins_to_base(row.quantity);
 
         // 2. 两边都不能已有持仓
         let long_pos = long_clients.orders.perp_position(&row.long.symbol).await?;
@@ -790,7 +792,7 @@ impl CrossFundingStrategy {
         };
         let sigma_ratio = hour.sigma_bp.map(|s| s / table.sigma_median_bp);
         info!(
-            "cross_funding {}: 通过检查 quantity={} 币(多腿 {} / 空腿 {} 交易所单位, ≈{} USDT) k*表 v{}(数据截止 {}) 最新小时 {} 价差={:.4}bp 百分位={} σ={} σ比={} 24h成交额 多={} 空={}",
+            "cross_funding {}: 通过检查 quantity={} 币(下单量 多腿 {} / 空腿 {}, ≈{} USDT) k*表 v{}(数据截止 {}) 最新小时 {} 价差={:.4}bp 百分位={} σ={} σ比={} 24h成交额 多={} 空={}",
             row.label(),
             row.quantity.normalize(),
             long_qty.normalize(),

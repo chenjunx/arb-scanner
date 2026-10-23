@@ -21,6 +21,7 @@ use rust_decimal::Decimal;
 use crate::accounting::FundingFeeProvider;
 use crate::config::CrossFundingConfig;
 use crate::engine::ArbitrageEngine;
+use crate::exchange_info::ExchangeInfoProvider;
 use crate::exchange_info::binance::BinanceExchangeInfoProvider;
 use crate::exchange_info::bitget::BitgetExchangeInfoProvider;
 use crate::exchange_info::gate::GateExchangeInfoProvider;
@@ -34,6 +35,7 @@ use crate::net;
 use crate::order::OrderProvider;
 use crate::order::binance_futures::{BinanceFuturesOrderProvider, BinanceFuturesUserDataStream};
 use crate::order::bitget_futures::{BitgetFuturesOrderProvider, BitgetFuturesPrivateOrderStream};
+use crate::order::contract_size::ContractSizeCache;
 use crate::order::gate_futures::{GateFuturesOrderProvider, GateFuturesPrivateOrderStream};
 use crate::order::okx_futures::{OkxFuturesOrderProvider, OkxFuturesPrivateOrderStream};
 use crate::order::types::MarginMode;
@@ -236,16 +238,22 @@ pub async fn run(args: CrossFundingArgs) -> anyhow::Result<()> {
                 )
             }
             PerpExchange::Gate => {
-                let (orders, funding) =
-                    order_and_funding(GateFuturesOrderProvider::from_env(venue.clone(), proxy.as_deref())?);
+                let exchange_info: Arc<dyn ExchangeInfoProvider> =
+                    Arc::new(GateExchangeInfoProvider::from_env(venue.clone(), proxy.as_deref())?);
+                let contract_sizes = Arc::new(ContractSizeCache::new(exchange_info.clone()));
+                let (orders, funding) = order_and_funding(GateFuturesOrderProvider::from_env(
+                    venue.clone(),
+                    contract_sizes.clone(),
+                    proxy.as_deref(),
+                )?);
                 (
                     VenueClients {
-                        exchange_info: Arc::new(GateExchangeInfoProvider::from_env(venue.clone(), proxy.as_deref())?),
+                        exchange_info,
                         klines: Arc::new(GateFuturesKlineClient::new(venue.clone(), proxy.as_deref())?),
                         orders,
                     },
                     Box::new(
-                        GateFuturesPrivateOrderStream::from_env(venue.clone(), proxy.as_deref())
+                        GateFuturesPrivateOrderStream::from_env(venue.clone(), contract_sizes, proxy.as_deref())
                             .context("failed to build gate futures order stream")?,
                     ),
                     Box::new(GateFuturesSource::new(venue.clone(), exchange_symbols.clone(), proxy.clone())),
@@ -253,19 +261,23 @@ pub async fn run(args: CrossFundingArgs) -> anyhow::Result<()> {
                 )
             }
             PerpExchange::Okx => {
+                let exchange_info: Arc<dyn ExchangeInfoProvider> =
+                    Arc::new(OkxExchangeInfoProvider::new(venue.clone(), proxy.as_deref())?);
+                let contract_sizes = Arc::new(ContractSizeCache::new(exchange_info.clone()));
                 let (orders, funding) = order_and_funding(OkxFuturesOrderProvider::from_env(
                     venue.clone(),
                     margin_mode,
+                    contract_sizes.clone(),
                     proxy.as_deref(),
                 )?);
                 (
                     VenueClients {
-                        exchange_info: Arc::new(OkxExchangeInfoProvider::new(venue.clone(), proxy.as_deref())?),
+                        exchange_info,
                         klines: Arc::new(OkxFuturesKlineClient::new(venue.clone(), proxy.as_deref())?),
                         orders,
                     },
                     Box::new(
-                        OkxFuturesPrivateOrderStream::from_env(venue.clone(), proxy.as_deref())
+                        OkxFuturesPrivateOrderStream::from_env(venue.clone(), contract_sizes, proxy.as_deref())
                             .context("failed to build okx order stream")?,
                     ),
                     Box::new(OkxFuturesSource::new(venue.clone(), exchange_symbols.clone(), proxy.clone())),

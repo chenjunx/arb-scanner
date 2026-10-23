@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as base64_engine;
 use futures_util::{SinkExt, StreamExt};
-use log::{debug, warn};
+use log::{debug, error, warn};
 use rust_decimal::Decimal;
 use serde::Deserialize;
 use tokio_tungstenite::tungstenite::Message;
@@ -21,6 +21,7 @@ use crate::order_manager::stream::{ExchangeOrderUpdate, OrderStreamSource};
 use crate::types::{Symbol, Venue};
 
 use super::OrderProvider;
+use super::contract_size::ContractSizeCache;
 use super::types::{MarginMode, MarketOrderRequest, OrderAmount, OrderResult, OrderSide, OrderStatus};
 
 const HOST: &str = "https://www.okx.com";
@@ -41,8 +42,9 @@ const CL_ORD_ID_MAX_LEN: usize = 32;
 /// OKX USDT 本位永续下单客户端(`instType=SWAP`)。凭证读 `OKX_API_KEY` /
 /// `OKX_API_SECRET` / `OKX_API_PASSPHRASE`。
 ///
-/// 下单量单位是**张**(1 张 = `ctVal` 个币，见 `exchange_info::okx` 的
-/// `perpetual_contract_spec`)。要求账户是单向持仓(`net`)模式；保证金模式
+/// 对外(下单请求、成交结果、持仓)的数量单位是**币**，和系统其它部分一致；
+/// OKX 接口的单位是**张**(1 张 = `ctVal` 个币)，换算只在这一层做，见
+/// [`ContractSizeCache`]。要求账户是单向持仓(`net`)模式；保证金模式
 /// `tdMode` 每笔必填，由构造参数给出，必须和用户在交易所设置的一致。杠杆、
 /// 持仓模式由用户预先设置，这里不修改。
 pub struct OkxFuturesOrderProvider {
@@ -50,6 +52,7 @@ pub struct OkxFuturesOrderProvider {
     credentials: OkxCredentials,
     margin_mode: MarginMode,
     http: reqwest::Client,
+    contract_sizes: Arc<ContractSizeCache>,
 }
 
 #[derive(Clone)]
@@ -76,15 +79,27 @@ impl OkxFuturesOrderProvider {
         api_secret: String,
         passphrase: String,
         margin_mode: MarginMode,
+        contract_sizes: Arc<ContractSizeCache>,
         proxy: Option<&str>,
     ) -> anyhow::Result<Self> {
         let http = build_http_client(proxy)?;
-        Ok(Self { venue, credentials: OkxCredentials { api_key, api_secret, passphrase }, margin_mode, http })
+        Ok(Self {
+            venue,
+            credentials: OkxCredentials { api_key, api_secret, passphrase },
+            margin_mode,
+            http,
+            contract_sizes,
+        })
     }
 
-    pub fn from_env(venue: Venue, margin_mode: MarginMode, proxy: Option<&str>) -> anyhow::Result<Self> {
+    pub fn from_env(
+        venue: Venue,
+        margin_mode: MarginMode,
+        contract_sizes: Arc<ContractSizeCache>,
+        proxy: Option<&str>,
+    ) -> anyhow::Result<Self> {
         let c = OkxCredentials::from_env()?;
-        Self::new(venue, c.api_key, c.api_secret, c.passphrase, margin_mode, proxy)
+        Self::new(venue, c.api_key, c.api_secret, c.passphrase, margin_mode, contract_sizes, proxy)
     }
 
     /// `query` 直接拼进 request path 参与签名，所以调用方传入的值不能含需要
@@ -175,10 +190,12 @@ impl OrderProvider for OkxFuturesOrderProvider {
         let OrderAmount::Base(quantity) = req.amount else {
             anyhow::bail!("{} does not support quote-amount market orders", self.venue());
         };
+        let contracts = self.contract_sizes.to_contracts(&req.symbol, quantity).await?;
         let body =
-            build_market_order_body(&req.symbol, req.side, quantity, self.margin_mode, req.client_order_id.as_deref())?;
+            build_market_order_body(&req.symbol, req.side, contracts, self.margin_mode, req.client_order_id.as_deref())
+                .with_context(|| format!("{quantity} {} 换算成 {contracts} 张", req.symbol.base))?;
         let text = self.signed_request(reqwest::Method::POST, "/api/v5/trade/order", &[], Some(body)).await?;
-        parse_place_order_response(&text)
+        self.contract_sizes.convert_result(&req.symbol, parse_place_order_response(&text)?).await
     }
 
     /// `GET /api/v5/trade/order?instId=&ordId=`。
@@ -186,19 +203,19 @@ impl OrderProvider for OkxFuturesOrderProvider {
         let inst_id = okx_swap_inst_id(symbol);
         let query = [("instId", inst_id.as_str()), ("ordId", exchange_order_id)];
         let text = self.signed_request(reqwest::Method::GET, "/api/v5/trade/order", &query, None).await?;
-        parse_query_order_response(&text)
+        self.contract_sizes.convert_result(symbol, parse_query_order_response(&text)?).await
     }
 
     /// 先 `GET /api/v5/account/config` 确认是单向持仓(`net_mode`，下单不带
     /// `posSide`，双向持仓下会被拒)，再 `GET /api/v5/account/positions`：没有
-    /// 持仓时返回空数组；`pos` 自带正负。单位是张。
+    /// 持仓时返回空数组；`pos` 自带正负，单位是张，换成币数返回。
     async fn perp_position(&self, symbol: &Symbol) -> anyhow::Result<Decimal> {
         let text = self.signed_request(reqwest::Method::GET, "/api/v5/account/config", &[], None).await?;
         ensure_net_mode(&text)?;
         let inst_id = okx_swap_inst_id(symbol);
         let query = [("instType", "SWAP"), ("instId", inst_id.as_str())];
         let text = self.signed_request(reqwest::Method::GET, "/api/v5/account/positions", &query, None).await?;
-        parse_positions(&text)
+        self.contract_sizes.from_contracts(symbol, parse_positions(&text)?).await
     }
 }
 
@@ -455,21 +472,35 @@ fn parse_positions(text: &str) -> anyhow::Result<Decimal> {
 
 /// OKX USDT 本位永续私有订单流：连上 `/ws/v5/private` 后先 `login`，成功后
 /// 订阅 `orders`(`instType=SWAP`，全部永续)，收到订阅确认才算 ready。推送
-/// 里的数量单位是张，和下单单位一致。
+/// 里的数量单位是张，交给 `OrderManager` 之前用和下单网关同一份
+/// [`ContractSizeCache`] 换成币数。
 pub struct OkxFuturesPrivateOrderStream {
     venue: Venue,
     credentials: OkxCredentials,
     proxy: Option<String>,
+    contract_sizes: Arc<ContractSizeCache>,
 }
 
 impl OkxFuturesPrivateOrderStream {
-    pub fn new(venue: Venue, api_key: String, api_secret: String, passphrase: String, proxy: Option<&str>) -> Self {
-        Self { venue, credentials: OkxCredentials { api_key, api_secret, passphrase }, proxy: proxy.map(str::to_string) }
+    pub fn new(
+        venue: Venue,
+        api_key: String,
+        api_secret: String,
+        passphrase: String,
+        contract_sizes: Arc<ContractSizeCache>,
+        proxy: Option<&str>,
+    ) -> Self {
+        Self {
+            venue,
+            credentials: OkxCredentials { api_key, api_secret, passphrase },
+            proxy: proxy.map(str::to_string),
+            contract_sizes,
+        }
     }
 
-    pub fn from_env(venue: Venue, proxy: Option<&str>) -> anyhow::Result<Self> {
+    pub fn from_env(venue: Venue, contract_sizes: Arc<ContractSizeCache>, proxy: Option<&str>) -> anyhow::Result<Self> {
         let c = OkxCredentials::from_env()?;
-        Ok(Self::new(venue, c.api_key, c.api_secret, c.passphrase, proxy))
+        Ok(Self::new(venue, c.api_key, c.api_secret, c.passphrase, contract_sizes, proxy))
     }
 
     fn login_message(&self, time_secs: u64) -> serde_json::Value {
@@ -576,7 +607,15 @@ impl OrderStreamSource for OkxFuturesPrivateOrderStream {
                                 }
                                 PrivateMessage::Orders(updates) => {
                                     for update in updates {
-                                        order_manager.handle_exchange_update(update).await;
+                                        let order_ref =
+                                            format!("{:?}/{:?}", update.client_order_id, update.exchange_order_id);
+                                        match self.contract_sizes.convert_update(update).await {
+                                            Ok(update) => order_manager.handle_exchange_update(update).await,
+                                            Err(err) => error!(
+                                                "okx order update {order_ref} for venue={} dropped: 张数无法换算成币数 ({err:#})；若是本系统的订单，仓位需要用 set-position 人工修正",
+                                                self.venue
+                                            ),
+                                        }
                                     }
                                 }
                                 PrivateMessage::Other => {}
@@ -800,7 +839,16 @@ mod tests {
 
     #[test]
     fn login_message_has_signature() {
-        let stream = OkxFuturesPrivateOrderStream::new(Venue::new("okx_futures"), "k".into(), "s".into(), "p".into(), None);
+        let contract_sizes =
+            Arc::new(ContractSizeCache::new(Arc::new(crate::order::contract_size::tests::FakeSpecs::new(&[]))));
+        let stream = OkxFuturesPrivateOrderStream::new(
+            Venue::new("okx_futures"),
+            "k".into(),
+            "s".into(),
+            "p".into(),
+            contract_sizes,
+            None,
+        );
         let msg = stream.login_message(1_538_054_050);
         assert_eq!(msg["op"], "login");
         assert_eq!(msg["args"][0]["timestamp"], "1538054050");

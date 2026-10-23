@@ -78,9 +78,32 @@ pub struct PredictedFundingRate {
 /// - Gate `PEPE_USDT`：报价是 1 个 PEPE 的价格(`price_unit=1`)，数量单位是
 ///   张，一张 = `quanto_multiplier` 个 PEPE(`qty_unit=10000000`)。
 ///
-/// 每币价格 = 报价 / `price_unit`；下单量 = 币数 / `qty_unit`。
+/// 每币价格 = 报价 / `price_unit`；交易所原生下单量 = 币数 / `qty_unit`。
+///
+/// 系统内部(订单请求、订单记录、成交回报、仓位)的数量统一用**合约 base 单位**
+/// ——也就是报价所对应的那个单位(Gate/OKX 是 1 个币，币安 `1000PEPEUSDT` 是
+/// 1000 个 PEPE)，和交易所界面显示的持仓数量一致，乘报价直接得到 USDT。
+/// 张数只存在于 Gate/OKX 的下单网关里，换算系数见 [`Self::contract_size`]。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PerpContractSpec {
     pub price_unit: Decimal,
     pub qty_unit: Decimal,
+}
+
+impl PerpContractSpec {
+    /// 1 个交易所原生下单单位(张)折合多少合约 base 单位：Gate `FUTUON_USDT`
+    /// 是 0.01，币安/Bitget 恒为 1。
+    pub fn contract_size(&self) -> Decimal {
+        self.qty_unit / self.price_unit
+    }
+
+    /// 真实币数 → 合约 base 单位(只有带 `1000` 之类前缀的合约才不是 1:1)。
+    pub fn coins_to_base(&self, coins: Decimal) -> Decimal {
+        coins / self.price_unit
+    }
+
+    /// 合约 base 单位 → 真实币数。
+    pub fn base_to_coins(&self, qty: Decimal) -> Decimal {
+        qty * self.price_unit
+    }
 }
