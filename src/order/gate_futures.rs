@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -269,6 +270,12 @@ struct FuturesOrder {
     finish_as: Option<String>,
     #[serde(default)]
     text: Option<String>,
+    /// 只有 WS 推送带：订单累计手续费(USDT)，正数是扣费、负数是 maker 返佣。
+    #[serde(default)]
+    fee: Option<Decimal>,
+    /// 只有 WS 推送带：点卡抵扣的累计手续费，暂不入账。
+    #[serde(default)]
+    point_fee: Option<Decimal>,
 }
 
 impl FuturesOrder {
@@ -486,6 +493,7 @@ impl OrderStreamSource for GateFuturesPrivateOrderStream {
             let mut backoff = MIN_BACKOFF;
             let mut ready_tx = Some(ready_tx);
             let mut user_id: Option<String> = None;
+            let mut last_fee_by_order: HashMap<String, Decimal> = HashMap::new();
 
             loop {
                 let uid = match &user_id {
@@ -559,7 +567,7 @@ impl OrderStreamSource for GateFuturesPrivateOrderStream {
                             let Message::Text(text) = msg else {
                                 continue;
                             };
-                            for update in parse_futures_order_update(&text, &self.venue) {
+                            for update in parse_futures_order_update(&text, &self.venue, &mut last_fee_by_order) {
                                 let order_ref = format!("{:?}/{:?}", update.client_order_id, update.exchange_order_id);
                                 match self.contract_sizes.convert_update(update).await {
                                     Ok(update) => order_manager.handle_exchange_update(update).await,
@@ -598,8 +606,17 @@ struct WsEnvelope {
 }
 
 /// 解析一条 `futures.orders` 推送。订阅确认里带 `error` 时(如鉴权失败)打
-/// warn，否则只处理 `event == "update"`。合约订单推送没有手续费字段，fee 留空。
-fn parse_futures_order_update(text: &str, venue: &Venue) -> Vec<ExchangeOrderUpdate> {
+/// warn，否则只处理 `event == "update"`。
+///
+/// 推送里的 `fee` 是订单累计手续费(已对照真实成交确认)，和 `order::gate` 现货
+/// 一样用 `last_fee_by_order` 记"上次看到的累计 fee"，做差得到
+/// `ExchangeOrderUpdate.fee` 要求的增量；订单进入终态后从 map 里移除。USDT 本位
+/// 合约手续费固定是 USDT。`point_fee`(点卡抵扣)暂不入账，只打 warn。
+fn parse_futures_order_update(
+    text: &str,
+    venue: &Venue,
+    last_fee_by_order: &mut HashMap<String, Decimal>,
+) -> Vec<ExchangeOrderUpdate> {
     let Ok(envelope) = serde_json::from_str::<WsEnvelope>(text) else {
         return Vec::new();
     };
@@ -630,16 +647,33 @@ fn parse_futures_order_update(text: &str, venue: &Venue) -> Vec<ExchangeOrderUpd
                 .as_deref()
                 .and_then(|c| c.split_once('_'))
                 .map(|(base, quote)| Symbol::new(base, quote));
+            let id = order.id_string();
+            let status = order.status();
+            if let Some(point_fee) = order.point_fee.filter(|f| !f.is_zero()) {
+                warn!(
+                    "gate futures order {id} ({:?}) point_fee={point_fee}: 点卡抵扣的手续费暂不入账",
+                    order.contract
+                );
+            }
+            let fee = order.fee.map(|cumulative_fee| {
+                let previous_fee = last_fee_by_order.get(&id).copied().unwrap_or(Decimal::ZERO);
+                cumulative_fee - previous_fee
+            });
+            if matches!(status, OrderStatus::Filled | OrderStatus::Expired | OrderStatus::Rejected) {
+                last_fee_by_order.remove(&id);
+            } else if let Some(cumulative_fee) = order.fee {
+                last_fee_by_order.insert(id.clone(), cumulative_fee);
+            }
             ExchangeOrderUpdate {
                 venue: venue.clone(),
                 symbol,
                 client_order_id: order.client_order_id(),
-                exchange_order_id: Some(order.id_string()),
-                status: order.status(),
+                exchange_order_id: Some(id),
+                status,
                 filled_qty: order.filled_qty(),
                 avg_price: order.avg_price(),
-                fee: None,
-                fee_asset: None,
+                fee,
+                fee_asset: fee.map(|_| "USDT".to_string()),
                 ts_ms,
             }
         })
@@ -649,6 +683,10 @@ fn parse_futures_order_update(text: &str, venue: &Venue) -> Vec<ExchangeOrderUpd
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn d(s: &str) -> Decimal {
+        s.parse().unwrap()
+    }
 
     #[test]
     fn builds_market_order_body_with_signed_size() {
@@ -754,7 +792,7 @@ mod tests {
                  "status": "open", "finish_as": "_new", "text": "web"}
             ]
         }"#;
-        let updates = parse_futures_order_update(text, &venue);
+        let updates = parse_futures_order_update(text, &venue, &mut HashMap::new());
         assert_eq!(updates.len(), 2);
         assert_eq!(updates[0].client_order_id.as_deref(), Some("cf-1700000000000-abcde"));
         assert_eq!(updates[0].exchange_order_id.as_deref(), Some("3369218"));
@@ -764,23 +802,60 @@ mod tests {
         assert_eq!(updates[1].client_order_id, None);
         assert_eq!(updates[1].status, OrderStatus::PartiallyFilled);
         assert_eq!(updates[1].filled_qty, Decimal::from(3));
+        assert_eq!(updates[0].fee, None);
+        assert_eq!(updates[0].fee_asset, None);
+    }
+
+    #[test]
+    fn futures_order_fee_is_cumulative_and_diffed_per_order() {
+        let venue = Venue::new("gate_futures");
+        let mut last_fee_by_order = HashMap::new();
+        let push = |left: i64, status: &str, fee: &str| {
+            format!(
+                r#"{{"time":1,"channel":"futures.orders","event":"update","result":[
+                    {{"id":449797012801531168,"contract":"AGPU_USDT","size":57,"left":{left},"fill_price":5.1,
+                      "status":"{status}","finish_as":"filled","text":"t-cf-1","fee":{fee},"point_fee":0}}]}}"#
+            )
+        };
+
+        let first = parse_futures_order_update(&push(54, "open", "0.00015418"), &venue, &mut last_fee_by_order);
+        assert_eq!(first[0].fee, Some(d("0.00015418")));
+        assert_eq!(first[0].fee_asset.as_deref(), Some("USDT"));
+        assert_eq!(last_fee_by_order.get("449797012801531168"), Some(&d("0.00015418")));
+
+        let second = parse_futures_order_update(&push(0, "finished", "0.02932418"), &venue, &mut last_fee_by_order);
+        assert_eq!(second[0].status, OrderStatus::Filled);
+        assert_eq!(second[0].fee, Some(d("0.02917")));
+        assert!(last_fee_by_order.is_empty());
+
+        // maker 返佣是负数，原样保留。
+        let rebate = parse_futures_order_update(&push(0, "finished", "-0.0001"), &venue, &mut last_fee_by_order);
+        assert_eq!(rebate[0].fee, Some(d("-0.0001")));
     }
 
     #[test]
     fn ignores_subscribe_ack_pong_and_other_channels() {
         let venue = Venue::new("gate_futures");
+        let mut fees = HashMap::new();
         assert!(parse_futures_order_update(
             r#"{"time":1,"channel":"futures.orders","event":"subscribe","error":null,"result":{"status":"success"}}"#,
-            &venue
+            &venue,
+            &mut fees
         )
         .is_empty());
         assert!(parse_futures_order_update(
             r#"{"time":1,"channel":"futures.orders","event":"subscribe","error":{"code":2,"message":"invalid key"},"result":null}"#,
-            &venue
+            &venue,
+            &mut fees
         )
         .is_empty());
-        assert!(parse_futures_order_update(r#"{"time":1,"channel":"futures.pong","event":"","result":null}"#, &venue).is_empty());
-        assert!(parse_futures_order_update("not json", &venue).is_empty());
+        assert!(parse_futures_order_update(
+            r#"{"time":1,"channel":"futures.pong","event":"","result":null}"#,
+            &venue,
+            &mut fees
+        )
+        .is_empty());
+        assert!(parse_futures_order_update("not json", &venue, &mut fees).is_empty());
     }
 
     #[test]

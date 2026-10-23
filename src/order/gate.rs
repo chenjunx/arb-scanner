@@ -582,13 +582,11 @@ fn map_ws_status(event: &str, finish_as: Option<&str>, has_fill: bool) -> OrderS
 /// event=="update"`(订阅确认、`spot.pong` 等消息直接忽略)。一条消息可能携带
 /// 多笔订单的更新，因此返回 `Vec`。
 ///
-/// `fee` 字段和 `filled_total`/`left` 放在一起，字段命名规律推断大概率是
-/// 订单级别累计值(而不是本次推送的增量)，但没有查到权威文档明确说明——用
-/// `last_fee_by_order` 记录"上次看到的累计 fee"，每次推送用
-/// `当前fee - 上次fee` 算出 `ExchangeOrderUpdate.fee` 要求的增量语义(见
-/// `order_manager::stream` 的字段注释)，这个假设标注为未经真实接口核对的
-/// best-effort，和 `exchange_info::kraken::kraken_perpetual_pair` 现有的
-/// 注释同一风格。订单进入终态后从 map 里移除，避免长期运行下 map 无限增长。
+/// `fee` 字段是订单级别累计值(而不是本次推送的增量，已对照真实成交确认，
+/// 合约 `futures.orders` 同理)——用 `last_fee_by_order` 记录"上次看到的累计
+/// fee"，每次推送用 `当前fee - 上次fee` 算出 `ExchangeOrderUpdate.fee` 要求的
+/// 增量语义(见 `order_manager::stream` 的字段注释)。订单进入终态后从 map 里
+/// 移除，避免长期运行下 map 无限增长。
 fn parse_gate_order_update(
     text: &str,
     venue: &Venue,
