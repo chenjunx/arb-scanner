@@ -86,7 +86,7 @@ pub async fn run(config_path: &str) -> anyhow::Result<()> {
                     symbols.clone(),
                     venue_config.testnet,
                     proxy.clone(),
-                ))
+                )?)
             }
             "kraken_spot" => {
                 info!("starting kraken spot market data source for venue={venue}");

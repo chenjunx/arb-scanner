@@ -9,6 +9,7 @@ pub mod kraken;
 pub mod link_health;
 pub mod mock;
 pub mod okx_futures;
+pub mod orderbook;
 
 use std::sync::Arc;
 

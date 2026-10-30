@@ -8,10 +8,12 @@ use futures_util::{SinkExt, StreamExt};
 use log::{debug, warn};
 use rust_decimal::Decimal;
 use serde::Deserialize;
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
+use crate::market_data::orderbook::LocalOrderBook;
 use crate::net::connect_tcp;
 use crate::topic::{Topic, TopicBus};
 use crate::types::{Quote, Symbol, Venue};
@@ -29,6 +31,12 @@ const MIN_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 /// `/futures/usdt/candlesticks` 单次最多返回 2000 根。
 const CANDLESTICK_LIMIT_MAX: usize = 2000;
+/// 增量深度续号断档/REST 快照拉取失败时整条连接重连重建；另外作为兜底，固定
+/// 周期无条件重连一次(参考 `binance.rs`/`kraken.rs` 同名常量)，防止断档检测
+/// 覆盖不到的错误状态一直带病运行。
+const ORDER_BOOK_RESYNC_INTERVAL: Duration = Duration::from_secs(20 * 60);
+/// `futures.order_book_update` 订阅深度档位(Gate 文档里非现货频道上限 100)。
+const ORDER_BOOK_DEPTH_LIMIT: &str = "100";
 
 fn candlestick_interval(interval: KlineInterval) -> &'static str {
     match interval {
@@ -42,25 +50,30 @@ fn gate_contract(symbol: &Symbol) -> String {
     format!("{}_{}", symbol.base, symbol.quote).to_ascii_uppercase()
 }
 
-/// Gate.io USDT 本位永续 book_ticker 行情源：和 [`super::gate::GateSpotSource`]
-/// 一样的订阅/重连方式，只是 host 换成合约域名、channel 换成 `futures.book_ticker`。
-/// 发布的报价是交易所原始报价(每币价格)，挂单量单位是张。
+/// Gate.io USDT 本位永续行情源：和 [`super::gate::GateSpotSource`] 一样的
+/// 订阅/重连方式，只是 host 换成合约域名。同时订阅 `futures.book_ticker`
+/// (最优一档,发布为 `Quote`) 和 `futures.order_book_update`(全量增量深度，
+/// 按官方"REST 快照(`with_id=true`) + `U`/`u` 续号校验"算法在本地合并成完整
+/// 订单簿,发布为 `OrderBookLevels`)。发布的报价是交易所原始报价(每币价格)，
+/// 挂单量单位是张。
 pub struct GateFuturesSource {
     venue: Venue,
     symbols: Vec<Symbol>,
     proxy: Option<String>,
+    http: reqwest::Client,
 }
 
 impl GateFuturesSource {
-    pub fn new(venue: Venue, symbols: Vec<Symbol>, proxy: Option<String>) -> Self {
-        Self { venue, symbols, proxy }
+    pub fn new(venue: Venue, symbols: Vec<Symbol>, proxy: Option<String>) -> anyhow::Result<Self> {
+        let http = build_http_client(proxy.as_deref())?;
+        Ok(Self { venue, symbols, proxy, http })
     }
 
     fn symbol_map(&self) -> HashMap<String, Symbol> {
         self.symbols.iter().map(|s| (gate_contract(s), s.clone())).collect()
     }
 
-    fn subscribe_message(&self) -> String {
+    fn book_ticker_subscribe_message(&self) -> String {
         let contracts: Vec<String> = self.symbols.iter().map(gate_contract).collect();
         let time_secs = now_ms() / 1000;
         serde_json::json!({
@@ -68,6 +81,21 @@ impl GateFuturesSource {
             "channel": "futures.book_ticker",
             "event": "subscribe",
             "payload": contracts,
+        })
+        .to_string()
+    }
+
+    /// `futures.order_book_update` 的订阅 payload 是单个合约(`[contract,
+    /// interval, limit]`)，不像 `book_ticker` 那样能把所有合约塞进一条消息，
+    /// 所以每个 symbol 要单独发一条订阅帧。
+    fn order_book_subscribe_message(symbol: &Symbol) -> String {
+        let contract = gate_contract(symbol);
+        let time_secs = now_ms() / 1000;
+        serde_json::json!({
+            "time": time_secs,
+            "channel": "futures.order_book_update",
+            "event": "subscribe",
+            "payload": [contract, "100ms", ORDER_BOOK_DEPTH_LIMIT],
         })
         .to_string()
     }
@@ -82,6 +110,14 @@ impl GateFuturesSource {
     }
 }
 
+fn build_http_client(proxy: Option<&str>) -> anyhow::Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(10));
+    if let Some(proxy) = proxy {
+        builder = builder.proxy(reqwest::Proxy::all(format!("http://{proxy}")).context("invalid proxy address")?);
+    }
+    builder.build().context("failed to build gate futures http client")
+}
+
 impl MarketDataSource for GateFuturesSource {
     fn venue(&self) -> Venue {
         self.venue.clone()
@@ -92,7 +128,7 @@ impl MarketDataSource for GateFuturesSource {
             let symbol_map = self.symbol_map();
             let mut backoff = MIN_BACKOFF;
 
-            loop {
+            'reconnect: loop {
                 let mut ws = match self.connect().await {
                     Ok(ws) => ws,
                     Err(err) => {
@@ -106,7 +142,7 @@ impl MarketDataSource for GateFuturesSource {
                     }
                 };
 
-                if let Err(err) = ws.send(Message::Text(self.subscribe_message())).await {
+                if let Err(err) = ws.send(Message::Text(self.book_ticker_subscribe_message())).await {
                     warn!(
                         "gate futures ws subscribe failed for venue={} err={err}, retrying in {:?}",
                         self.venue, backoff
@@ -116,22 +152,120 @@ impl MarketDataSource for GateFuturesSource {
                     continue;
                 }
 
+                for symbol in &self.symbols {
+                    let msg = Self::order_book_subscribe_message(symbol);
+                    if let Err(err) = ws.send(Message::Text(msg)).await {
+                        warn!(
+                            "gate futures ws order book subscribe failed for venue={} symbol={symbol} err={err}, retrying in {:?}",
+                            self.venue, backoff
+                        );
+                        tokio::time::sleep(backoff).await;
+                        backoff = (backoff * 2).min(MAX_BACKOFF);
+                        continue 'reconnect;
+                    }
+                }
+
                 debug!("gate futures ws connected for venue={}", self.venue);
                 backoff = MIN_BACKOFF;
 
-                while let Some(msg) = ws.next().await {
-                    let msg = match msg {
-                        Ok(msg) => msg,
-                        Err(err) => {
-                            warn!("gate futures ws error for venue={} err={err}", self.venue);
+                let mut books: HashMap<Symbol, LocalOrderBook> = HashMap::new();
+                let mut sync: HashMap<Symbol, DepthSync> =
+                    symbol_map.values().map(|s| (s.clone(), DepthSync::Buffering(Vec::new()))).collect();
+
+                // 每个 symbol 并发拉一次 REST 快照(`with_id=true`)，期间到达的增量
+                // 先缓冲在 `DepthSync::Buffering` 里，快照回来后按 `U`/`u` 续号
+                // 校验重放缓冲(算法和 `binance.rs` 的 `apply_snapshot` 完全一致)。
+                let (snapshot_tx, mut snapshot_rx) = mpsc::unbounded_channel();
+                for symbol in symbol_map.values().cloned().collect::<Vec<_>>() {
+                    let tx = snapshot_tx.clone();
+                    let http = self.http.clone();
+                    let contract = gate_contract(&symbol);
+                    tokio::spawn(async move {
+                        let result = fetch_order_book_snapshot(&http, &contract).await;
+                        let _ = tx.send((symbol, result));
+                    });
+                }
+                drop(snapshot_tx);
+
+                let mut resync_timer = tokio::time::interval(ORDER_BOOK_RESYNC_INTERVAL);
+                resync_timer.tick().await;
+
+                loop {
+                    tokio::select! {
+                        _ = resync_timer.tick() => {
+                            debug!("gate futures ws periodic orderbook resync for venue={}, reconnecting", self.venue);
                             break;
                         }
-                    };
-                    let Message::Text(text) = msg else {
-                        continue;
-                    };
-                    if let Some((symbol, quote)) = parse_book_ticker_message(&text, &symbol_map) {
-                        bus.publish(Topic::quote(self.venue.clone(), symbol), quote);
+                        snapshot = snapshot_rx.recv() => {
+                            let Some((symbol, result)) = snapshot else { continue; };
+                            match result {
+                                Ok(snap) => {
+                                    if !apply_snapshot(&symbol, snap, &mut books, &mut sync) {
+                                        warn!(
+                                            "gate futures order book snapshot/buffer gap for venue={} symbol={symbol}, reconnecting to resync",
+                                            self.venue
+                                        );
+                                        break;
+                                    }
+                                    if let Some(book) = books.get(&symbol) {
+                                        bus.publish(Topic::order_book(self.venue.clone(), symbol.clone()), book.snapshot(now_ms()));
+                                    }
+                                }
+                                Err(err) => {
+                                    warn!(
+                                        "gate futures order book snapshot fetch failed for venue={} symbol={symbol} err={err:#}, reconnecting to resync",
+                                        self.venue
+                                    );
+                                    break;
+                                }
+                            }
+                        }
+                        msg = ws.next() => {
+                            let msg = match msg {
+                                Some(Ok(msg)) => msg,
+                                Some(Err(err)) => {
+                                    warn!("gate futures ws error for venue={} err={err}", self.venue);
+                                    break;
+                                }
+                                None => break,
+                            };
+                            let Message::Text(text) = msg else {
+                                continue;
+                            };
+                            match classify_message(&text) {
+                                Some(GateChannel::BookTicker) => {
+                                    if let Some((symbol, quote)) = parse_book_ticker_message(&text, &symbol_map) {
+                                        bus.publish(Topic::quote(self.venue.clone(), symbol), quote);
+                                    }
+                                }
+                                Some(GateChannel::OrderBookUpdate) => {
+                                    let Some((symbol, update)) = parse_order_book_update(&text, &symbol_map) else {
+                                        continue;
+                                    };
+                                    match sync.get_mut(&symbol) {
+                                        Some(DepthSync::Buffering(buffer)) => buffer.push(update),
+                                        Some(DepthSync::Synced { last_u }) => {
+                                            if update.u <= *last_u {
+                                                continue;
+                                            }
+                                            if update.first_update_id != *last_u + 1 {
+                                                warn!(
+                                                    "gate futures order book update gap for venue={} symbol={symbol}, reconnecting to resync",
+                                                    self.venue
+                                                );
+                                                break;
+                                            }
+                                            let book = books.entry(symbol.clone()).or_default();
+                                            apply_levels(book, &update.b, &update.a);
+                                            *last_u = update.u;
+                                            bus.publish(Topic::order_book(self.venue.clone(), symbol), book.snapshot(now_ms()));
+                                        }
+                                        None => {}
+                                    }
+                                }
+                                None => {}
+                            }
+                        }
                     }
                 }
 
@@ -141,6 +275,7 @@ impl MarketDataSource for GateFuturesSource {
                 );
                 tokio::time::sleep(backoff).await;
                 backoff = (backoff * 2).min(MAX_BACKOFF);
+                continue 'reconnect;
             }
         })
     }
@@ -190,6 +325,179 @@ fn parse_book_ticker_message(text: &str, symbol_map: &HashMap<String, Symbol>) -
             ts_ms: now_ms(),
         },
     ))
+}
+
+/// 只看 `channel` 字段，判断一条推送是 `book_ticker` 还是 `order_book_update`，
+/// 再分流到各自的解析函数(两边 `result` 结构完全不同，不能像
+/// `parse_book_ticker_message` 那样直接无脑解析)。忽略订阅确认等其他事件。
+#[derive(Debug, Deserialize)]
+struct ChannelEvent<'a> {
+    channel: Option<&'a str>,
+    event: Option<&'a str>,
+}
+
+enum GateChannel {
+    BookTicker,
+    OrderBookUpdate,
+}
+
+fn classify_message(text: &str) -> Option<GateChannel> {
+    let envelope: ChannelEvent = serde_json::from_str(text).ok()?;
+    if envelope.event != Some("update") {
+        return None;
+    }
+    match envelope.channel {
+        Some("futures.book_ticker") => Some(GateChannel::BookTicker),
+        Some("futures.order_book_update") => Some(GateChannel::OrderBookUpdate),
+        _ => None,
+    }
+}
+
+/// 深度档位，REST 快照和 WS 增量推送共用同一个形状(`{"p": "price", "s": size}`)。
+#[derive(Debug, Deserialize)]
+struct BookLevel {
+    p: Decimal,
+    s: Decimal,
+}
+
+#[derive(Debug, Deserialize)]
+struct OrderBookUpdateResult {
+    s: String,
+    #[serde(rename = "U")]
+    first_update_id: u64,
+    u: u64,
+    #[serde(default)]
+    b: Vec<BookLevel>,
+    #[serde(default)]
+    a: Vec<BookLevel>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OrderBookUpdateEnvelope {
+    result: OrderBookUpdateResult,
+}
+
+/// 增量深度更新的本地同步状态：REST 快照返回之前，先把收到的增量缓冲起来；
+/// 快照应用成功后切到 `Synced`，记录上一条增量的 `u`，供下一条做续号校验
+/// (`U == last_u + 1`)。和 `binance.rs` 的 `DepthSync` 同构。
+enum DepthSync {
+    Buffering(Vec<DepthUpdate>),
+    Synced { last_u: u64 },
+}
+
+#[derive(Debug, Clone)]
+struct DepthUpdate {
+    first_update_id: u64,
+    u: u64,
+    b: Vec<(Decimal, Decimal)>,
+    a: Vec<(Decimal, Decimal)>,
+}
+
+/// 解析一条 `futures.order_book_update` update 消息，查表得到内部 Symbol。
+/// 纯函数，不依赖网络连接，便于单测。
+fn parse_order_book_update(text: &str, symbol_map: &HashMap<String, Symbol>) -> Option<(Symbol, DepthUpdate)> {
+    let envelope: OrderBookUpdateEnvelope = serde_json::from_str(text).ok()?;
+    let result = envelope.result;
+    let symbol = symbol_map.get(&result.s)?.clone();
+    Some((
+        symbol,
+        DepthUpdate {
+            first_update_id: result.first_update_id,
+            u: result.u,
+            b: result.b.into_iter().map(|l| (l.p, l.s)).collect(),
+            a: result.a.into_iter().map(|l| (l.p, l.s)).collect(),
+        },
+    ))
+}
+
+fn apply_levels(book: &mut LocalOrderBook, bids: &[(Decimal, Decimal)], asks: &[(Decimal, Decimal)]) {
+    for (price, qty) in bids {
+        book.apply_bid(*price, *qty);
+    }
+    for (price, qty) in asks {
+        book.apply_ask(*price, *qty);
+    }
+}
+
+#[derive(Debug)]
+struct OrderBookSnapshot {
+    id: u64,
+    bids: Vec<(Decimal, Decimal)>,
+    asks: Vec<(Decimal, Decimal)>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OrderBookSnapshotPayload {
+    id: u64,
+    #[serde(default)]
+    bids: Vec<BookLevel>,
+    #[serde(default)]
+    asks: Vec<BookLevel>,
+}
+
+/// 拉一次 `GET /futures/usdt/order_book` REST 快照(`with_id=true` 带上基准
+/// `id`，供增量续号校验用)。
+async fn fetch_order_book_snapshot(http: &reqwest::Client, contract: &str) -> anyhow::Result<OrderBookSnapshot> {
+    crate::ratelimit::throttle(REST_HOST).await;
+    let url =
+        format!("{REST_HOST}{API_PREFIX}/futures/usdt/order_book?contract={contract}&with_id=true&limit={ORDER_BOOK_DEPTH_LIMIT}");
+    let resp = http.get(&url).send().await.context("gate futures order book snapshot request failed")?;
+    let text = resp.text().await.context("failed to read gate futures order book snapshot response body")?;
+    parse_order_book_snapshot(&text)
+}
+
+fn parse_order_book_snapshot(text: &str) -> anyhow::Result<OrderBookSnapshot> {
+    if let Ok(err) = serde_json::from_str::<GateErrorResponse>(text) {
+        anyhow::bail!("gate error {}: {}", err.label, err.message);
+    }
+    let payload: OrderBookSnapshotPayload =
+        serde_json::from_str(text).with_context(|| format!("failed to parse gate futures order book snapshot, raw body: {text}"))?;
+    Ok(OrderBookSnapshot {
+        id: payload.id,
+        bids: payload.bids.into_iter().map(|l| (l.p, l.s)).collect(),
+        asks: payload.asks.into_iter().map(|l| (l.p, l.s)).collect(),
+    })
+}
+
+/// 按官方算法把 REST 快照应用到本地簿，再重放快照到达之前缓冲的增量：第一条
+/// 重放的增量要求 `U <= id+1 <= u`，之后每条要求 `U == 上一条.u + 1`。重放中途
+/// 断档返回 `false`，调用方据此整条连接重连重新来过(和 `binance.rs` 一样，
+/// 所有 resync 触发都统一走"断连重连")。
+fn apply_snapshot(
+    symbol: &Symbol,
+    snapshot: OrderBookSnapshot,
+    books: &mut HashMap<Symbol, LocalOrderBook>,
+    sync: &mut HashMap<Symbol, DepthSync>,
+) -> bool {
+    let buffered = match sync.remove(symbol) {
+        Some(DepthSync::Buffering(buffer)) => buffer,
+        _ => Vec::new(),
+    };
+
+    let book = books.entry(symbol.clone()).or_default();
+    book.clear();
+    apply_levels(book, &snapshot.bids, &snapshot.asks);
+
+    let mut last_u = snapshot.id;
+    let mut first = true;
+    for update in buffered {
+        if update.u <= snapshot.id {
+            continue;
+        }
+        if first {
+            if update.first_update_id > snapshot.id + 1 {
+                return false;
+            }
+            first = false;
+        } else if update.first_update_id != last_u + 1 {
+            return false;
+        }
+        apply_levels(book, &update.b, &update.a);
+        last_u = update.u;
+    }
+
+    sync.insert(symbol.clone(), DepthSync::Synced { last_u });
+    true
 }
 
 /// Gate USDT 本位永续的公开 K 线 / 24h 行情 REST 客户端，不需要签名。
@@ -379,11 +687,154 @@ mod tests {
 
     #[test]
     fn builds_subscribe_message() {
-        let source = GateFuturesSource::new(Venue::new("gate_futures"), vec![Symbol::new("PEPE", "USDT")], None);
-        let msg: serde_json::Value = serde_json::from_str(&source.subscribe_message()).unwrap();
+        let source = GateFuturesSource::new(Venue::new("gate_futures"), vec![Symbol::new("PEPE", "USDT")], None).unwrap();
+        let msg: serde_json::Value = serde_json::from_str(&source.book_ticker_subscribe_message()).unwrap();
         assert_eq!(msg["channel"], "futures.book_ticker");
         assert_eq!(msg["event"], "subscribe");
         assert_eq!(msg["payload"], serde_json::json!(["PEPE_USDT"]));
+    }
+
+    #[test]
+    fn builds_order_book_subscribe_message() {
+        let symbol = Symbol::new("PEPE", "USDT");
+        let msg: serde_json::Value =
+            serde_json::from_str(&GateFuturesSource::order_book_subscribe_message(&symbol)).unwrap();
+        assert_eq!(msg["channel"], "futures.order_book_update");
+        assert_eq!(msg["event"], "subscribe");
+        assert_eq!(msg["payload"], serde_json::json!(["PEPE_USDT", "100ms", "100"]));
+    }
+
+    #[test]
+    fn classifies_book_ticker_and_order_book_update_messages() {
+        assert!(matches!(
+            classify_message(r#"{"channel":"futures.book_ticker","event":"update","result":{}}"#),
+            Some(GateChannel::BookTicker)
+        ));
+        assert!(matches!(
+            classify_message(r#"{"channel":"futures.order_book_update","event":"update","result":{}}"#),
+            Some(GateChannel::OrderBookUpdate)
+        ));
+        assert!(classify_message(r#"{"channel":"futures.order_book_update","event":"subscribe"}"#).is_none());
+        assert!(classify_message("not json").is_none());
+    }
+
+    #[test]
+    fn parses_order_book_update_message() {
+        let symbol = Symbol::new("GMT", "USDT");
+        let map = map_with(symbol.clone());
+        let text = r#"{
+            "id": null,
+            "time": 1650188898,
+            "channel": "futures.order_book_update",
+            "event": "update",
+            "error": null,
+            "result": {
+                "t": 1650188898938,
+                "s": "GMT_USDT",
+                "U": 1577718307,
+                "u": 1577719254,
+                "b": [{"p": "2.5178", "s": 0}, {"p": "2.5179", "s": 100}],
+                "a": [{"p": "2.52", "s": 200}]
+            }
+        }"#;
+
+        let (parsed_symbol, update) = parse_order_book_update(text, &map).expect("should parse");
+        assert_eq!(parsed_symbol, symbol);
+        assert_eq!(update.first_update_id, 1577718307);
+        assert_eq!(update.u, 1577719254);
+        assert_eq!(
+            update.b,
+            vec![
+                ("2.5178".parse().unwrap(), Decimal::ZERO),
+                ("2.5179".parse().unwrap(), Decimal::from(100)),
+            ]
+        );
+        assert_eq!(update.a, vec![("2.52".parse().unwrap(), Decimal::from(200))]);
+    }
+
+    #[test]
+    fn parses_order_book_snapshot_response() {
+        let text = r#"{
+            "id": 6358770031,
+            "current": 1634350208.745,
+            "asks": [{"s": 24909, "p": "61264.8"}],
+            "bids": [{"s": 41844, "p": "61264.7"}],
+            "update": 1634350208.724
+        }"#;
+
+        let snapshot = parse_order_book_snapshot(text).expect("should parse");
+        assert_eq!(snapshot.id, 6358770031);
+        assert_eq!(snapshot.bids, vec![("61264.7".parse().unwrap(), Decimal::from(41844))]);
+        assert_eq!(snapshot.asks, vec![("61264.8".parse().unwrap(), Decimal::from(24909))]);
+    }
+
+    #[test]
+    fn order_book_snapshot_surfaces_error_response() {
+        let err = parse_order_book_snapshot(r#"{"label":"INVALID_PARAM_VALUE","message":"bad contract"}"#).unwrap_err();
+        assert!(err.to_string().contains("bad contract"));
+    }
+
+    #[test]
+    fn apply_snapshot_replays_buffered_updates_after_baseline_id() {
+        let symbol = Symbol::new("GMT", "USDT");
+        let mut books = HashMap::new();
+        let mut sync = HashMap::new();
+        sync.insert(
+            symbol.clone(),
+            DepthSync::Buffering(vec![
+                // u <= id(150)，应被丢弃，不计入续号校验。
+                DepthUpdate { first_update_id: 145, u: 150, b: vec![], a: vec![] },
+                DepthUpdate {
+                    first_update_id: 151,
+                    u: 155,
+                    b: vec![("99.0".parse().unwrap(), "2.0".parse().unwrap())],
+                    a: vec![],
+                },
+                DepthUpdate {
+                    first_update_id: 156,
+                    u: 160,
+                    b: vec![],
+                    a: vec![("101.0".parse().unwrap(), "1.0".parse().unwrap())],
+                },
+            ]),
+        );
+
+        let snapshot = OrderBookSnapshot {
+            id: 150,
+            bids: vec![("100.0".parse().unwrap(), "1.0".parse().unwrap())],
+            asks: vec![],
+        };
+
+        assert!(apply_snapshot(&symbol, snapshot, &mut books, &mut sync));
+        assert!(matches!(sync.get(&symbol), Some(DepthSync::Synced { last_u: 160 })));
+
+        let book = books.get(&symbol).unwrap().snapshot(0);
+        assert_eq!(
+            book.bids.as_ref(),
+            &vec![("100.0".parse().unwrap(), "1.0".parse().unwrap()), ("99.0".parse().unwrap(), "2.0".parse().unwrap())]
+        );
+        assert_eq!(book.asks.as_ref(), &vec![("101.0".parse().unwrap(), "1.0".parse().unwrap())]);
+    }
+
+    #[test]
+    fn apply_snapshot_detects_gap_in_buffered_updates() {
+        let symbol = Symbol::new("GMT", "USDT");
+        let mut books = HashMap::new();
+        let mut sync = HashMap::new();
+        sync.insert(
+            symbol.clone(),
+            DepthSync::Buffering(vec![DepthUpdate {
+                // U(200) > id(150)+1，续号对不上，中间缺了数据。
+                first_update_id: 200,
+                u: 205,
+                b: vec![],
+                a: vec![],
+            }]),
+        );
+
+        let snapshot = OrderBookSnapshot { id: 150, bids: vec![], asks: vec![] };
+
+        assert!(!apply_snapshot(&symbol, snapshot, &mut books, &mut sync));
     }
 
     #[test]

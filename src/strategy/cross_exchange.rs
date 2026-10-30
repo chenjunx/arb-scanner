@@ -10,6 +10,7 @@ use crate::exchange_info::PrecisionCache;
 use crate::exchange_info::types::PrecisionKind;
 use crate::market_data::link_health::LinkHealthMonitor;
 use crate::market_data::now_ms;
+use crate::market_data::orderbook::OrderBookLevels;
 use crate::order::types::{OrderAmount, OrderSide, OrderStatus};
 use crate::order_manager::OrderManager;
 use crate::order_manager::types::{OrderEvent, OrderId};
@@ -47,6 +48,8 @@ pub struct CrossExchangeStrategy {
     min_profit_bps: Decimal,
     health: Arc<LinkHealthMonitor>,
     latest: Mutex<HashMap<Symbol, HashMap<Venue, Quote>>>,
+    /// 各 venue 最新订单簿快照，`on_order_book` 维护，暂不接入价差/下单判断逻辑。
+    latest_order_books: Mutex<HashMap<Symbol, HashMap<Venue, OrderBookLevels>>>,
     bus: Arc<TopicBus>,
     execution: Option<Arc<CrossExecutionConfig>>,
     /// 已挂出、还在等终态的副交易所 GTC 挂单：key 是 client_order_id。
@@ -101,6 +104,7 @@ impl CrossExchangeStrategy {
             min_profit_bps,
             health,
             latest: Mutex::new(HashMap::new()),
+            latest_order_books: Mutex::new(HashMap::new()),
             bus,
             execution: None,
             pending_secondary_orders: Arc::new(Mutex::new(HashMap::new())),
@@ -171,11 +175,25 @@ impl Strategy for CrossExchangeStrategy {
                 .iter()
                 .map(move |symbol| Topic::quote(venue.clone(), symbol.clone()))
         }));
+        subscriber.subscribe_order_books(self.fees.keys().flat_map(|venue| {
+            self.symbols
+                .iter()
+                .map(move |symbol| Topic::order_book(venue.clone(), symbol.clone()))
+        }));
         Ok(())
     }
 
     fn bus(&self) -> &Arc<TopicBus> {
         &self.bus
+    }
+
+    fn on_order_book(&self, topic: &Topic, book: &OrderBookLevels) {
+        let (venue, symbol) = match topic {
+            Topic::OrderBook { venue, symbol } => (venue, symbol),
+            _ => return,
+        };
+        let mut latest = self.latest_order_books.lock().unwrap();
+        latest.entry(symbol.clone()).or_default().insert(venue.clone(), book.clone());
     }
 
     fn on_quote(&self, topic: &Topic, quote: &Quote) {
@@ -593,7 +611,34 @@ mod tests {
 
         let mut subscriber = StrategySubscriber::new(bus);
         strategy.init(&mut subscriber).await.expect("init should succeed");
-        assert_eq!(subscriber.topics(), &[Topic::quote(venue_a, watched)]);
+        assert_eq!(
+            subscriber.topics(),
+            &[Topic::quote(venue_a.clone(), watched.clone()), Topic::order_book(venue_a, watched)]
+        );
+    }
+
+    #[test]
+    fn on_order_book_records_latest_snapshot_per_venue() {
+        let symbol = Symbol::new("BTC", "USDT");
+        let venue_a = Venue::new("a");
+        let venue_b = Venue::new("b");
+        let strategy = CrossExchangeStrategy::new(
+            vec![symbol.clone()],
+            fees_for(&[&venue_a, &venue_b]),
+            Decimal::ZERO,
+            Arc::new(LinkHealthMonitor::always_healthy()),
+            Arc::new(TopicBus::new()),
+        );
+
+        let book_a = OrderBookLevels { bids: Arc::new(vec![("100".parse().unwrap(), "1".parse().unwrap())]), asks: Arc::new(vec![]), ts_ms: 1 };
+        let book_b = OrderBookLevels { bids: Arc::new(vec![]), asks: Arc::new(vec![("101".parse().unwrap(), "2".parse().unwrap())]), ts_ms: 2 };
+        strategy.on_order_book(&Topic::order_book(venue_a.clone(), symbol.clone()), &book_a);
+        strategy.on_order_book(&Topic::order_book(venue_b.clone(), symbol.clone()), &book_b);
+
+        let latest = strategy.latest_order_books.lock().unwrap();
+        let symbol_books = &latest[&symbol];
+        assert_eq!(symbol_books[&venue_a], book_a);
+        assert_eq!(symbol_books[&venue_b], book_b);
     }
 
     #[test]

@@ -243,7 +243,7 @@ pub async fn run(args: MonitorArgs) -> anyhow::Result<()> {
         with_probe(&binance_probe),
         testnet,
         proxy.clone(),
-    ));
+    )?);
     source_handles.push(binance_source.spawn(bus.clone()));
     let secondary_source = wiring::build_secondary_market_data_source(
         &secondary,

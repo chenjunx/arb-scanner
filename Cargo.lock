@@ -92,6 +92,7 @@ dependencies = [
  "async-trait",
  "base64",
  "clap",
+ "crc32fast",
  "dashmap",
  "env_logger",
  "flate2",

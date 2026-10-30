@@ -35,26 +35,32 @@ impl ArbitrageEngine {
                 .await
                 .with_context(|| format!("strategy {} init failed", strategy.name()))?;
             info!(
-                "strategy {}: init done, subscribed {} quote topics",
+                "strategy {}: init done, subscribed {} quote/orderbook topics",
                 strategy.name(),
                 subscriber.topics().len()
             );
-            prepared.push((strategy, subscriber.into_quote_stream(), order_events));
+            let (quotes, order_books) = subscriber.into_streams();
+            prepared.push((strategy, quotes, order_books, order_events));
         }
 
         let mut strategy_handles = Vec::new();
-        for (strategy, mut quotes, mut order_events) in prepared {
+        for (strategy, mut quotes, mut order_books, mut order_events) in prepared {
             strategy_handles.push(tokio::spawn(async move {
-                // 两条流各自结束后只停止轮询那一条，都结束才退出。`init` 里没订阅
-                // 任何行情的策略，行情流是 `select_all([])`，一开始就
-                // 结束，不能因此连订单事件也不收了。
+                // 三条流各自结束后只停止轮询那一条，都结束才退出。`init` 里没订阅
+                // 对应数据的策略，那条流是 `select_all([])`，一开始就结束，
+                // 不能因此连其余两条也不收了。
                 let mut quotes_done = false;
+                let mut order_books_done = false;
                 let mut order_events_done = false;
-                while !(quotes_done && order_events_done) {
+                while !(quotes_done && order_books_done && order_events_done) {
                     tokio::select! {
                         quote = quotes.next(), if !quotes_done => match quote {
                             Some((topic, quote)) => strategy.on_quote(&topic, &quote),
                             None => quotes_done = true,
+                        },
+                        book = order_books.next(), if !order_books_done => match book {
+                            Some((topic, book)) => strategy.on_order_book(&topic, &book),
+                            None => order_books_done = true,
                         },
                         event = order_events.next(), if !order_events_done => match event {
                             Some((_, event)) => strategy.on_order_event(&event),

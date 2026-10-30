@@ -256,7 +256,7 @@ pub async fn run(args: CrossFundingArgs) -> anyhow::Result<()> {
                         GateFuturesPrivateOrderStream::from_env(venue.clone(), contract_sizes, proxy.as_deref())
                             .context("failed to build gate futures order stream")?,
                     ),
-                    Box::new(GateFuturesSource::new(venue.clone(), exchange_symbols.clone(), proxy.clone())),
+                    Box::new(GateFuturesSource::new(venue.clone(), exchange_symbols.clone(), proxy.clone())?),
                     funding,
                 )
             }

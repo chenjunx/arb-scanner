@@ -13,6 +13,7 @@ use futures_util::stream::select_all;
 use rust_decimal::Decimal;
 
 use crate::market_data::now_ms;
+use crate::market_data::orderbook::OrderBookLevels;
 use crate::order::types::{OrderAmount, OrderSide};
 use crate::order_manager::types::{
     AnyOrderRequest, CancelRequest, OrderEvent, OrderKind, OrderRequest, TransferRequest,
@@ -95,11 +96,18 @@ pub struct StrategySubscriber {
     topics: Vec<Topic>,
     seen: HashSet<Topic>,
     quotes: Vec<BoxTopicStream<Quote>>,
+    order_books: Vec<BoxTopicStream<OrderBookLevels>>,
 }
 
 impl StrategySubscriber {
     pub fn new(bus: Arc<TopicBus>) -> Self {
-        Self { bus, topics: Vec::new(), seen: HashSet::new(), quotes: Vec::new() }
+        Self {
+            bus,
+            topics: Vec::new(),
+            seen: HashSet::new(),
+            quotes: Vec::new(),
+            order_books: Vec::new(),
+        }
     }
 
     pub fn subscribe_quote(&mut self, topic: Topic) {
@@ -116,14 +124,29 @@ impl StrategySubscriber {
         }
     }
 
+    pub fn subscribe_order_book(&mut self, topic: Topic) {
+        if !self.seen.insert(topic.clone()) {
+            return;
+        }
+        self.order_books.push(self.bus.subscribe(topic.clone()));
+        self.topics.push(topic);
+    }
+
+    pub fn subscribe_order_books(&mut self, topics: impl IntoIterator<Item = Topic>) {
+        for topic in topics {
+            self.subscribe_order_book(topic);
+        }
+    }
+
     /// 已订阅的行情 topic，按订阅顺序排列。
     pub fn topics(&self) -> &[Topic] {
         &self.topics
     }
 
-    /// 合并成一条行情流。一个都没订阅时是 `select_all([])`，立即结束。
-    pub fn into_quote_stream(self) -> BoxTopicStream<Quote> {
-        Box::pin(select_all(self.quotes))
+    /// 把已订阅的行情/订单簿分别合并成一条流。一侧一个都没订阅时是
+    /// `select_all([])`，立即结束，不影响另一侧继续工作。
+    pub fn into_streams(self) -> (BoxTopicStream<Quote>, BoxTopicStream<OrderBookLevels>) {
+        (Box::pin(select_all(self.quotes)), Box::pin(select_all(self.order_books)))
     }
 }
 
@@ -152,6 +175,13 @@ pub trait Strategy: Send + Sync {
 
     /// 行情回调：收到订阅的 topic 行情时被调用。策略内部维护状态，发现机会时打日志。
     fn on_quote(&self, topic: &Topic, quote: &Quote);
+
+    /// 订单簿回调：收到订阅的 `Topic::OrderBook` 快照时被调用。默认空实现——只有
+    /// 需要多档深度(比如下单前的滑点/流动性判断)的策略才需要覆盖它并在 `init`
+    /// 里通过 `subscriber.subscribe_order_book(s)` 订阅，其余策略不受影响。
+    fn on_order_book(&self, topic: &Topic, book: &OrderBookLevels) {
+        let _ = (topic, book);
+    }
 
     /// 订单事件回调：引擎为策略订阅了 `Topic::order_event(self.name())`，
     /// 收到该策略名下任意订单的状态变化时被调用。默认空实现——只有需要被动

@@ -9,6 +9,7 @@ use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 
 use crate::accounting::balance_stream::BalanceUpdate;
+use crate::market_data::orderbook::OrderBookLevels;
 use crate::order_manager::types::{AnyOrderRequest, CancelRequest, OrderEvent};
 use crate::types::{Quote, Symbol, Venue};
 
@@ -21,6 +22,8 @@ const CHANNEL_CAPACITY: usize = 1024;
 pub enum Topic {
     /// 行情数据：venue + symbol 级别，payload=`Quote`
     Quote { venue: Venue, symbol: Symbol },
+    /// 多档订单簿：venue + symbol 级别，payload=`OrderBookLevels`
+    OrderBook { venue: Venue, symbol: Symbol },
     /// 订单提交：策略 -> 风控层，全局单一 topic，payload=`OrderRequest`
     OrderSubmit,
     /// 订单执行：风控层 -> 执行层，全局单一 topic，payload=`OrderRequest`
@@ -37,6 +40,7 @@ impl fmt::Display for Topic {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Quote { venue, symbol } => write!(f, "quote.{}.{}", venue, symbol),
+            Self::OrderBook { venue, symbol } => write!(f, "orderbook.{}.{}", venue, symbol),
             Self::OrderSubmit => write!(f, "orders.submit"),
             Self::OrderExecute => write!(f, "orders.execute"),
             Self::OrderCancel => write!(f, "orders.cancel"),
@@ -49,6 +53,10 @@ impl fmt::Display for Topic {
 impl Topic {
     pub fn quote(venue: Venue, symbol: Symbol) -> Self {
         Self::Quote { venue, symbol }
+    }
+
+    pub fn order_book(venue: Venue, symbol: Symbol) -> Self {
+        Self::OrderBook { venue, symbol }
     }
 
     pub fn order_submit() -> Self {
@@ -105,6 +113,7 @@ where
 pub struct TopicBus {
     quote_channels: DashMap<Topic, broadcast::Sender<Quote>>,
     quote_latest: DashMap<Topic, Quote>,
+    order_book_channels: DashMap<Topic, broadcast::Sender<OrderBookLevels>>,
     order_submit_channel: broadcast::Sender<AnyOrderRequest>,
     order_execute_channel: broadcast::Sender<AnyOrderRequest>,
     order_cancel_channel: broadcast::Sender<CancelRequest>,
@@ -117,6 +126,7 @@ impl TopicBus {
         Self {
             quote_channels: DashMap::new(),
             quote_latest: DashMap::new(),
+            order_book_channels: DashMap::new(),
             order_submit_channel: broadcast::channel(CHANNEL_CAPACITY).0,
             order_execute_channel: broadcast::channel(CHANNEL_CAPACITY).0,
             order_cancel_channel: broadcast::channel(CHANNEL_CAPACITY).0,
@@ -156,6 +166,13 @@ impl TopicBus {
 
     fn quote_sender_for(&self, topic: &Topic) -> broadcast::Sender<Quote> {
         self.quote_channels
+            .entry(topic.clone())
+            .or_insert_with(|| broadcast::channel(CHANNEL_CAPACITY).0)
+            .clone()
+    }
+
+    fn order_book_sender_for(&self, topic: &Topic) -> broadcast::Sender<OrderBookLevels> {
+        self.order_book_channels
             .entry(topic.clone())
             .or_insert_with(|| broadcast::channel(CHANNEL_CAPACITY).0)
             .clone()
@@ -210,6 +227,26 @@ impl BusMessage for Quote {
             return Box::pin(futures_util::stream::empty());
         }
         let receiver = bus.quote_sender_for(&topic).subscribe();
+        Box::pin(lagged_filter_map(topic, receiver))
+    }
+}
+
+impl BusMessage for OrderBookLevels {
+    fn publish(bus: &TopicBus, topic: Topic, data: Self) {
+        if !matches!(topic, Topic::OrderBook { .. }) {
+            warn!("TopicBus::publish: topic {topic} does not carry OrderBookLevels data");
+            return;
+        }
+        let sender = bus.order_book_sender_for(&topic);
+        let _ = sender.send(data);
+    }
+
+    fn subscribe(bus: &TopicBus, topic: Topic) -> BoxTopicStream<Self> {
+        if !matches!(topic, Topic::OrderBook { .. }) {
+            warn!("TopicBus::subscribe: topic {topic} does not carry OrderBookLevels data");
+            return Box::pin(futures_util::stream::empty());
+        }
+        let receiver = bus.order_book_sender_for(&topic).subscribe();
         Box::pin(lagged_filter_map(topic, receiver))
     }
 }

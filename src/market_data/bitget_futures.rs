@@ -13,6 +13,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 use crate::exchange_info::bitget::{BITGET_USDT_FUTURES, bitget_symbol, parse_bitget_data};
+use crate::market_data::orderbook::{LocalOrderBook, OrderBookLevels};
 use crate::net::connect_tcp;
 use crate::topic::{Topic, TopicBus};
 use crate::types::{Quote, Symbol, Venue};
@@ -29,6 +30,9 @@ const MIN_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 /// Bitget 要求客户端每 30 秒发一次文本 `ping`(服务端回 `pong`)，2 分钟收不到就断开。
 const WS_PING_INTERVAL: Duration = Duration::from_secs(20);
+/// 定期强制重连重新订阅 `books`，兜底 checksum 覆盖不到的问题；不依赖任何
+/// 错误检测，纯定时触发。
+const ORDER_BOOK_RESYNC_INTERVAL: Duration = Duration::from_secs(20 * 60);
 /// `/api/v2/mix/market/candles` 单次最多 1000 根。
 const CANDLES_LIMIT_MAX: usize = 1000;
 /// `/api/v2/mix/market/history-candles` 单次最多 200 根。
@@ -43,8 +47,9 @@ fn candle_granularity(interval: KlineInterval) -> &'static str {
     }
 }
 
-/// Bitget USDT 本位永续一档盘口行情源：订阅公开频道 `books1`。发布的报价是
-/// 交易所原始报价(一个 base 单位的价格)，挂单量单位是 base 币。
+/// Bitget USDT 本位永续行情源：订阅公开频道 `books1` 发布 `Topic::Quote`，
+/// 同时订阅 `books`(多档增量簿)维护本地订单簿发布 `Topic::OrderBook`。发布的
+/// 报价/档位都是交易所原始报价(一个 base 单位的价格)，挂单量单位是 base 币。
 pub struct BitgetFuturesSource {
     venue: Venue,
     symbols: Vec<Symbol>,
@@ -60,11 +65,19 @@ impl BitgetFuturesSource {
         self.symbols.iter().map(|s| (bitget_symbol(s), s.clone())).collect()
     }
 
+    /// 每个 symbol 相邻地订阅 `books1` + `books` 两个频道，同一个 `args`
+    /// 数组、同一个 `op:"subscribe"` 请求。
     fn subscribe_message(&self) -> String {
         let args: Vec<serde_json::Value> = self
             .symbols
             .iter()
-            .map(|s| serde_json::json!({"instType": BITGET_USDT_FUTURES, "channel": "books1", "instId": bitget_symbol(s)}))
+            .flat_map(|s| {
+                let inst_id = bitget_symbol(s);
+                [
+                    serde_json::json!({"instType": BITGET_USDT_FUTURES, "channel": "books1", "instId": inst_id}),
+                    serde_json::json!({"instType": BITGET_USDT_FUTURES, "channel": "books", "instId": inst_id}),
+                ]
+            })
             .collect();
         serde_json::json!({"op": "subscribe", "args": args}).to_string()
     }
@@ -115,8 +128,12 @@ impl MarketDataSource for BitgetFuturesSource {
                 debug!("bitget futures ws connected for venue={}", self.venue);
                 backoff = MIN_BACKOFF;
 
+                let mut books: HashMap<Symbol, LocalOrderBook> = HashMap::new();
+
                 let mut ping = tokio::time::interval(WS_PING_INTERVAL);
                 ping.tick().await;
+                let mut resync = tokio::time::interval(ORDER_BOOK_RESYNC_INTERVAL);
+                resync.tick().await;
                 loop {
                     tokio::select! {
                         _ = ping.tick() => {
@@ -124,6 +141,10 @@ impl MarketDataSource for BitgetFuturesSource {
                                 warn!("bitget futures ws ping failed for venue={} err={err}", self.venue);
                                 break;
                             }
+                        }
+                        _ = resync.tick() => {
+                            debug!("bitget futures ws periodic orderbook resync for venue={}, reconnecting", self.venue);
+                            break;
                         }
                         msg = ws.next() => {
                             let msg = match msg {
@@ -139,6 +160,24 @@ impl MarketDataSource for BitgetFuturesSource {
                             };
                             if let Some((symbol, quote)) = parse_books1_message(&text, &symbol_map, &self.venue) {
                                 bus.publish(Topic::quote(self.venue.clone(), symbol), quote);
+                            }
+                            let mut needs_resync = false;
+                            for event in apply_book_message(&text, &symbol_map, &self.venue, &mut books) {
+                                match event {
+                                    BookEvent::Updated(symbol, levels) => {
+                                        bus.publish(Topic::order_book(self.venue.clone(), symbol), levels);
+                                    }
+                                    BookEvent::ChecksumMismatch(symbol) => {
+                                        warn!(
+                                            "bitget futures orderbook checksum mismatch for venue={} symbol={symbol}, reconnecting to resync",
+                                            self.venue
+                                        );
+                                        needs_resync = true;
+                                    }
+                                }
+                            }
+                            if needs_resync {
+                                break;
                             }
                         }
                     }
@@ -212,6 +251,129 @@ fn parse_books1_message(text: &str, symbol_map: &HashMap<String, Symbol>, venue:
     let (bid, bid_size) = top_level(&entry.bids)?;
     let (ask, ask_size) = top_level(&entry.asks)?;
     Some((symbol.clone(), Quote { bid, bid_size, ask, ask_size, ts_ms: now_ms() }))
+}
+
+fn parse_level_rows(rows: &[Vec<String>]) -> Vec<(Decimal, Decimal)> {
+    rows.iter()
+        .filter_map(|row| {
+            let price = row.first()?.parse().ok()?;
+            let qty = row.get(1)?.parse().ok()?;
+            Some((price, qty))
+        })
+        .collect()
+}
+
+#[derive(Debug, Deserialize)]
+struct BooksEntry {
+    #[serde(default)]
+    asks: Vec<Vec<String>>,
+    #[serde(default)]
+    bids: Vec<Vec<String>>,
+    #[serde(default)]
+    checksum: Option<i32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BooksPush {
+    #[serde(default)]
+    event: Option<String>,
+    #[serde(default)]
+    code: Option<serde_json::Value>,
+    #[serde(default)]
+    msg: Option<String>,
+    arg: Option<WsArg>,
+    #[serde(default)]
+    action: Option<String>,
+    #[serde(default)]
+    data: Vec<BooksEntry>,
+}
+
+#[derive(Debug, PartialEq)]
+enum BookEvent {
+    Updated(Symbol, OrderBookLevels),
+    ChecksumMismatch(Symbol),
+}
+
+/// Bitget `books` 频道的 checksum 算法(参考 ccxt 的实现)：按档位序号从 0
+/// 到 24，依次取 `bid[i].price:bid[i].qty`(没有该档就跳过)，再取
+/// `ask[i].price:ask[i].qty`，把整个数组用 `:` 拼接成一个字符串算 CRC32，
+/// 按有符号 32 位整数解读(和推送里可能是负数的 `checksum` 字段对齐)。
+/// price/qty 直接用 `Decimal::to_string()`，不像 Kraken 那样要去掉小数点/
+/// 前导零——因为 Bitget 这边价格/数量在 JSON 里本来就是字符串而不是裸数字，
+/// `rust_decimal` 从字符串反序列化不会丢失原始精度，`to_string()` 能还原
+/// 出和推送一致的文本。
+fn book_checksum(book: &LocalOrderBook) -> i32 {
+    let snapshot = book.snapshot(0);
+    let mut tokens: Vec<String> = Vec::new();
+    for i in 0..25 {
+        if let Some((price, qty)) = snapshot.bids.get(i) {
+            tokens.push(price.to_string());
+            tokens.push(qty.to_string());
+        }
+        if let Some((price, qty)) = snapshot.asks.get(i) {
+            tokens.push(price.to_string());
+            tokens.push(qty.to_string());
+        }
+    }
+    crc32fast::hash(tokens.join(":").as_bytes()) as i32
+}
+
+/// 解析一条 `books` 频道推送(snapshot/update 共用)，合并进 `books` 里对应
+/// symbol 的本地订单簿。`action:"snapshot"` 先清空本地簿再灌入全量档位，
+/// `action:"update"` 增量合并(qty=0 删除该档)。校验和不一致就清空本地簿、
+/// 等重连重新走一次 snapshot。忽略非 `books` 频道的消息，不打日志(除非是
+/// 该频道自己的订阅错误)。
+fn apply_book_message(
+    text: &str,
+    symbol_map: &HashMap<String, Symbol>,
+    venue: &Venue,
+    books: &mut HashMap<Symbol, LocalOrderBook>,
+) -> Vec<BookEvent> {
+    let push: BooksPush = match serde_json::from_str(text) {
+        Ok(push) => push,
+        Err(_) => return Vec::new(),
+    };
+    let is_books_channel = push.arg.as_ref().map(|a| a.channel.as_str()) == Some("books");
+    if push.event.as_deref() == Some("error") {
+        if is_books_channel {
+            warn!(
+                "bitget futures ws books subscribe error for venue={venue}: code={} msg={}",
+                push.code.map(|c| c.to_string()).unwrap_or_default(),
+                push.msg.unwrap_or_default()
+            );
+        }
+        return Vec::new();
+    }
+    if push.event.is_some() || !is_books_channel {
+        return Vec::new();
+    }
+    let Some(arg) = push.arg else { return Vec::new() };
+    let Some(symbol) = symbol_map.get(&arg.inst_id) else { return Vec::new() };
+    let is_snapshot = push.action.as_deref() == Some("snapshot");
+
+    let mut events = Vec::new();
+    for entry in &push.data {
+        let book = books.entry(symbol.clone()).or_default();
+        if is_snapshot {
+            book.clear();
+        }
+        for (price, qty) in parse_level_rows(&entry.bids) {
+            book.apply_bid(price, qty);
+        }
+        for (price, qty) in parse_level_rows(&entry.asks) {
+            book.apply_ask(price, qty);
+        }
+
+        if let Some(expected) = entry.checksum {
+            if book_checksum(book) != expected {
+                book.clear();
+                events.push(BookEvent::ChecksumMismatch(symbol.clone()));
+                continue;
+            }
+        }
+        events.push(BookEvent::Updated(symbol.clone(), book.snapshot(now_ms())));
+    }
+    events
 }
 
 /// Bitget USDT 本位永续的公开 K 线 / 24h 行情 REST 客户端，不需要签名。
@@ -401,5 +563,102 @@ mod tests {
             msg["args"][0],
             serde_json::json!({"instType": "USDT-FUTURES", "channel": "books1", "instId": "1000BONKUSDT"})
         );
+        assert_eq!(
+            msg["args"][1],
+            serde_json::json!({"instType": "USDT-FUTURES", "channel": "books", "instId": "1000BONKUSDT"})
+        );
+    }
+
+    #[test]
+    fn apply_book_message_builds_sorted_snapshot_from_snapshot_frame() {
+        let symbol = Symbol::new("BTC", "USDT");
+        let map = map_with(symbol.clone());
+        let venue = Venue::new("bitget_futures");
+        let mut books = HashMap::new();
+        let text = r#"{"action":"snapshot","arg":{"instType":"USDT-FUTURES","channel":"books","instId":"BTCUSDT"},
+            "data":[{"asks":[["101","1"],["102","2"]],"bids":[["100","1"],["99","2"]],"ts":"1"}]}"#;
+
+        let events = apply_book_message(text, &map, &venue, &mut books);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            BookEvent::Updated(s, levels) => {
+                assert_eq!(s, &symbol);
+                assert_eq!(levels.bids.as_ref(), &vec![("100".parse().unwrap(), "1".parse().unwrap()), ("99".parse().unwrap(), "2".parse().unwrap())]);
+                assert_eq!(levels.asks.as_ref(), &vec![("101".parse().unwrap(), "1".parse().unwrap()), ("102".parse().unwrap(), "2".parse().unwrap())]);
+            }
+            BookEvent::ChecksumMismatch(_) => panic!("expected Updated event"),
+        }
+    }
+
+    #[test]
+    fn apply_book_message_update_frame_merges_into_existing_book() {
+        let symbol = Symbol::new("BTC", "USDT");
+        let map = map_with(symbol.clone());
+        let venue = Venue::new("bitget_futures");
+        let mut books = HashMap::new();
+        let snapshot = r#"{"action":"snapshot","arg":{"instType":"USDT-FUTURES","channel":"books","instId":"BTCUSDT"},
+            "data":[{"asks":[["101","1"]],"bids":[["100","1"]]}]}"#;
+        apply_book_message(snapshot, &map, &venue, &mut books);
+
+        let update = r#"{"action":"update","arg":{"instType":"USDT-FUTURES","channel":"books","instId":"BTCUSDT"},
+            "data":[{"asks":[],"bids":[["100","0"],["99.5","3"]]}]}"#;
+        let events = apply_book_message(update, &map, &venue, &mut books);
+
+        match &events[0] {
+            BookEvent::Updated(_, levels) => {
+                assert_eq!(levels.bids.as_ref(), &vec![("99.5".parse().unwrap(), "3".parse().unwrap())]);
+                assert_eq!(levels.asks.as_ref(), &vec![("101".parse().unwrap(), "1".parse().unwrap())]);
+            }
+            BookEvent::ChecksumMismatch(_) => panic!("expected Updated event"),
+        }
+    }
+
+    #[test]
+    fn apply_book_message_detects_checksum_mismatch_and_clears_book() {
+        let symbol = Symbol::new("BTC", "USDT");
+        let map = map_with(symbol.clone());
+        let venue = Venue::new("bitget_futures");
+        let mut books = HashMap::new();
+        let text = r#"{"action":"update","arg":{"instType":"USDT-FUTURES","channel":"books","instId":"BTCUSDT"},
+            "data":[{"asks":[["101","1"]],"bids":[["100","1"]],"checksum":1}]}"#;
+
+        let events = apply_book_message(text, &map, &venue, &mut books);
+        assert_eq!(events, vec![BookEvent::ChecksumMismatch(symbol.clone())]);
+        assert!(books.get(&symbol).unwrap().is_empty());
+    }
+
+    #[test]
+    fn apply_book_message_accepts_matching_checksum() {
+        let symbol = Symbol::new("BTC", "USDT");
+        let map = map_with(symbol.clone());
+        let venue = Venue::new("bitget_futures");
+
+        let mut reference = LocalOrderBook::new();
+        reference.apply_bid("100".parse().unwrap(), "1".parse().unwrap());
+        reference.apply_ask("101".parse().unwrap(), "1".parse().unwrap());
+        let expected_checksum = book_checksum(&reference);
+
+        let mut books = HashMap::new();
+        let text = format!(
+            r#"{{"action":"update","arg":{{"instType":"USDT-FUTURES","channel":"books","instId":"BTCUSDT"}},
+            "data":[{{"asks":[["101","1"]],"bids":[["100","1"]],"checksum":{expected_checksum}}}]}}"#
+        );
+
+        let events = apply_book_message(&text, &map, &venue, &mut books);
+        assert!(matches!(events.as_slice(), [BookEvent::Updated(s, _)] if s == &symbol));
+    }
+
+    #[test]
+    fn apply_book_message_ignores_non_books_channel_and_malformed() {
+        let map = map_with(Symbol::new("BTC", "USDT"));
+        let venue = Venue::new("bitget_futures");
+        let mut books = HashMap::new();
+        let books1 = r#"{"action":"snapshot","arg":{"instType":"USDT-FUTURES","channel":"books1","instId":"BTCUSDT"},"data":[{"asks":[["1","1"]],"bids":[["1","1"]]}]}"#;
+        assert!(apply_book_message(books1, &map, &venue, &mut books).is_empty());
+        assert!(apply_book_message("not json", &map, &venue, &mut books).is_empty());
+        assert!(apply_book_message(
+            r#"{"event":"error","code":30001,"msg":"bad","arg":{"instType":"USDT-FUTURES","channel":"books","instId":"BTCUSDT"}}"#,
+            &map, &venue, &mut books
+        ).is_empty());
     }
 }

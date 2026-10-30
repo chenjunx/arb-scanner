@@ -42,6 +42,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::exchange_info::types::{PerpContractSpec, PrecisionKind};
 use crate::exchange_info::{ExchangeInfoProvider, PrecisionCache};
+use crate::market_data::orderbook::OrderBookLevels;
 use crate::market_data::{HOUR_MS, KlineInterval, KlineProvider, now_ms};
 use crate::order::OrderProvider;
 use crate::order::types::{OrderAmount, OrderSide, OrderStatus};
@@ -646,6 +647,9 @@ pub struct CrossFundingStrategy {
     /// live 模式才有；收到拒单事件时用它查订单的权威状态。
     order_manager: Option<Arc<OrderManager>>,
     state: Mutex<State>,
+    /// 各 leg (venue, symbol) 最新订单簿快照，`on_order_book` 维护，独立于
+    /// `state` 里的触发逻辑，暂不接入价差/下单判断。
+    latest_order_books: Mutex<HashMap<(Venue, Symbol), OrderBookLevels>>,
     /// 未对冲敞口超限后置位，所有行不再下单。
     halted: AtomicBool,
     kill_switch: Mutex<KillSwitch>,
@@ -668,6 +672,7 @@ impl CrossFundingStrategy {
             clients,
             order_manager,
             state: Mutex::new(State::default()),
+            latest_order_books: Mutex::new(HashMap::new()),
             halted: AtomicBool::new(false),
             kill_switch: Mutex::new(KillSwitch::default()),
         }
@@ -1324,10 +1329,19 @@ impl Strategy for CrossFundingStrategy {
             for (role, leg) in [(LegRole::Long, &row.long), (LegRole::Short, &row.short)] {
                 state.quote_index.entry((leg.venue.clone(), leg.symbol.clone())).or_default().push((idx, role));
                 subscriber.subscribe_quote(Topic::quote(leg.venue.clone(), leg.symbol.clone()));
+                subscriber.subscribe_order_book(Topic::order_book(leg.venue.clone(), leg.symbol.clone()));
             }
             state.rows.push(row);
         }
         Ok(())
+    }
+
+    fn on_order_book(&self, topic: &Topic, book: &OrderBookLevels) {
+        let Topic::OrderBook { venue, symbol } = topic else {
+            return;
+        };
+        let mut latest = self.latest_order_books.lock().unwrap();
+        latest.insert((venue.clone(), symbol.clone()), book.clone());
     }
 
     fn on_quote(&self, topic: &Topic, quote: &Quote) {
@@ -1722,6 +1736,20 @@ mod tests {
         let records = text.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
         let _ = std::fs::remove_file(&strategy.params.record_file);
         records
+    }
+
+    #[test]
+    fn on_order_book_records_latest_snapshot_per_leg() {
+        let s = strategy(params("order_book"), BinAction::Wait { k_star: 2.0, note: None }, 1.0);
+
+        let book_long = OrderBookLevels { bids: Arc::new(vec![(d("100"), d("1"))]), asks: Arc::new(vec![]), ts_ms: 1 };
+        let book_short = OrderBookLevels { bids: Arc::new(vec![]), asks: Arc::new(vec![(d("101"), d("2"))]), ts_ms: 2 };
+        s.on_order_book(&Topic::order_book(long_venue(), btc()), &book_long);
+        s.on_order_book(&Topic::order_book(short_venue(), btc()), &book_short);
+
+        let latest = s.latest_order_books.lock().unwrap();
+        assert_eq!(latest[&(long_venue(), btc())], book_long);
+        assert_eq!(latest[&(short_venue(), btc())], book_short);
     }
 
     #[test]
