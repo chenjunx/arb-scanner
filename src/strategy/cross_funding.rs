@@ -42,7 +42,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::exchange_info::types::{PerpContractSpec, PrecisionKind};
 use crate::exchange_info::{ExchangeInfoProvider, PrecisionCache};
-use crate::market_data::orderbook::OrderBookLevels;
+use crate::market_data::orderbook::{
+    ORDER_BOOK_LOG_DEPTH, ORDER_BOOK_LOG_INTERVAL_MS, OrderBookLevels, OrderBookLogThrottle, describe_order_book,
+};
 use crate::market_data::{HOUR_MS, KlineInterval, KlineProvider, now_ms};
 use crate::order::OrderProvider;
 use crate::order::types::{OrderAmount, OrderSide, OrderStatus};
@@ -650,6 +652,7 @@ pub struct CrossFundingStrategy {
     /// 各 leg (venue, symbol) 最新订单簿快照，`on_order_book` 维护，独立于
     /// `state` 里的触发逻辑，暂不接入价差/下单判断。
     latest_order_books: Mutex<HashMap<(Venue, Symbol), OrderBookLevels>>,
+    order_book_log: OrderBookLogThrottle,
     /// 未对冲敞口超限后置位，所有行不再下单。
     halted: AtomicBool,
     kill_switch: Mutex<KillSwitch>,
@@ -673,6 +676,7 @@ impl CrossFundingStrategy {
             order_manager,
             state: Mutex::new(State::default()),
             latest_order_books: Mutex::new(HashMap::new()),
+            order_book_log: OrderBookLogThrottle::new(ORDER_BOOK_LOG_INTERVAL_MS),
             halted: AtomicBool::new(false),
             kill_switch: Mutex::new(KillSwitch::default()),
         }
@@ -1340,8 +1344,25 @@ impl Strategy for CrossFundingStrategy {
         let Topic::OrderBook { venue, symbol } = topic else {
             return;
         };
-        let mut latest = self.latest_order_books.lock().unwrap();
-        latest.insert((venue.clone(), symbol.clone()), book.clone());
+        self.latest_order_books.lock().unwrap().insert((venue.clone(), symbol.clone()), book.clone());
+
+        if self.order_book_log.should_log(venue, symbol, now_ms()) {
+            let quote = {
+                let state = self.state.lock().unwrap();
+                state.quote_index.get(&(venue.clone(), symbol.clone())).and_then(|targets| {
+                    let &(idx, role) = targets.first()?;
+                    let row = &state.rows[idx];
+                    match role {
+                        LegRole::Long => row.long.quote,
+                        LegRole::Short => row.short.quote,
+                    }
+                })
+            };
+            info!(
+                "cross_funding orderbook {venue} {symbol} {}",
+                describe_order_book(book, quote.as_ref(), ORDER_BOOK_LOG_DEPTH)
+            );
+        }
     }
 
     fn on_quote(&self, topic: &Topic, quote: &Quote) {

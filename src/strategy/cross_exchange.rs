@@ -10,7 +10,9 @@ use crate::exchange_info::PrecisionCache;
 use crate::exchange_info::types::PrecisionKind;
 use crate::market_data::link_health::LinkHealthMonitor;
 use crate::market_data::now_ms;
-use crate::market_data::orderbook::OrderBookLevels;
+use crate::market_data::orderbook::{
+    ORDER_BOOK_LOG_DEPTH, ORDER_BOOK_LOG_INTERVAL_MS, OrderBookLevels, OrderBookLogThrottle, describe_order_book,
+};
 use crate::order::types::{OrderAmount, OrderSide, OrderStatus};
 use crate::order_manager::OrderManager;
 use crate::order_manager::types::{OrderEvent, OrderId};
@@ -50,6 +52,7 @@ pub struct CrossExchangeStrategy {
     latest: Mutex<HashMap<Symbol, HashMap<Venue, Quote>>>,
     /// 各 venue 最新订单簿快照，`on_order_book` 维护，暂不接入价差/下单判断逻辑。
     latest_order_books: Mutex<HashMap<Symbol, HashMap<Venue, OrderBookLevels>>>,
+    order_book_log: OrderBookLogThrottle,
     bus: Arc<TopicBus>,
     execution: Option<Arc<CrossExecutionConfig>>,
     /// 已挂出、还在等终态的副交易所 GTC 挂单：key 是 client_order_id。
@@ -105,6 +108,7 @@ impl CrossExchangeStrategy {
             health,
             latest: Mutex::new(HashMap::new()),
             latest_order_books: Mutex::new(HashMap::new()),
+            order_book_log: OrderBookLogThrottle::new(ORDER_BOOK_LOG_INTERVAL_MS),
             bus,
             execution: None,
             pending_secondary_orders: Arc::new(Mutex::new(HashMap::new())),
@@ -192,8 +196,20 @@ impl Strategy for CrossExchangeStrategy {
             Topic::OrderBook { venue, symbol } => (venue, symbol),
             _ => return,
         };
-        let mut latest = self.latest_order_books.lock().unwrap();
-        latest.entry(symbol.clone()).or_default().insert(venue.clone(), book.clone());
+        self.latest_order_books
+            .lock()
+            .unwrap()
+            .entry(symbol.clone())
+            .or_default()
+            .insert(venue.clone(), book.clone());
+
+        if self.order_book_log.should_log(venue, symbol, now_ms()) {
+            let quote = self.latest.lock().unwrap().get(symbol).and_then(|q| q.get(venue)).copied();
+            info!(
+                "[cross_exchange] orderbook {venue} {symbol} {}",
+                describe_order_book(book, quote.as_ref(), ORDER_BOOK_LOG_DEPTH)
+            );
+        }
     }
 
     fn on_quote(&self, topic: &Topic, quote: &Quote) {

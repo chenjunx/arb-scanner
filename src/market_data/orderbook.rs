@@ -1,7 +1,72 @@
-use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::collections::{BTreeMap, HashMap};
+use std::fmt::Write;
+use std::sync::{Arc, Mutex};
 
 use rust_decimal::Decimal;
+
+use crate::types::{Quote, Symbol, Venue};
+
+/// 订单簿观测日志里每侧打印的档位数。
+pub const ORDER_BOOK_LOG_DEPTH: usize = 5;
+/// 同一个 (venue, symbol) 两次订单簿观测日志之间的最小间隔。
+pub const ORDER_BOOK_LOG_INTERVAL_MS: u64 = 30_000;
+
+/// 按 (venue, symbol) 节流：每个 key 在 `interval_ms` 内最多放行一次。
+pub struct OrderBookLogThrottle {
+    interval_ms: u64,
+    last_ms: Mutex<HashMap<(Venue, Symbol), u64>>,
+}
+
+impl OrderBookLogThrottle {
+    pub fn new(interval_ms: u64) -> Self {
+        Self { interval_ms, last_ms: Mutex::new(HashMap::new()) }
+    }
+
+    pub fn should_log(&self, venue: &Venue, symbol: &Symbol, now_ms: u64) -> bool {
+        let mut last_ms = self.last_ms.lock().unwrap();
+        match last_ms.get(&(venue.clone(), symbol.clone())) {
+            Some(&last) if now_ms.saturating_sub(last) < self.interval_ms => false,
+            _ => {
+                last_ms.insert((venue.clone(), symbol.clone()), now_ms);
+                true
+            }
+        }
+    }
+}
+
+/// 一行订单簿观测日志：前 `depth` 档 + 同一 (venue, symbol) 最新 `Quote`，
+/// 以及两条解析路径的买一/卖一是否一致(两条流推送时刻不同，偶发不一致属正常)。
+pub fn describe_order_book(book: &OrderBookLevels, quote: Option<&Quote>, depth: usize) -> String {
+    let mut out = String::new();
+    let levels = |out: &mut String, side: &[(Decimal, Decimal)]| {
+        out.push('[');
+        for (i, (price, qty)) in side.iter().take(depth).enumerate() {
+            if i > 0 {
+                out.push_str(", ");
+            }
+            let _ = write!(out, "{price}x{qty}");
+        }
+        out.push(']');
+    };
+    let _ = write!(out, "levels={}/{} bids=", book.bids.len(), book.asks.len());
+    levels(&mut out, &book.bids);
+    out.push_str(" asks=");
+    levels(&mut out, &book.asks);
+    let _ = write!(out, " book_ts={}", book.ts_ms);
+    match quote {
+        Some(quote) => {
+            let top_match = book.bids.first().map(|l| l.0) == Some(quote.bid)
+                && book.asks.first().map(|l| l.0) == Some(quote.ask);
+            let _ = write!(
+                out,
+                " | quote bid={} ask={} quote_ts={} top_match={top_match}",
+                quote.bid, quote.ask, quote.ts_ms
+            );
+        }
+        None => out.push_str(" | quote=none"),
+    }
+    out
+}
 
 /// 某个 (venue, symbol) 上的多档订单簿快照：bids 按价格降序、asks 按价格升序。
 /// 用 `Arc<Vec<_>>` 包装档位数据，让 bus 的多订阅者 `Clone` 时只增加引用计数，
@@ -112,6 +177,33 @@ mod tests {
             vec![d("99"), d("100"), d("101")]
         );
         assert_eq!(snap.ts_ms, 123);
+    }
+
+    #[test]
+    fn throttle_allows_once_per_interval_per_key() {
+        let throttle = OrderBookLogThrottle::new(1000);
+        let (a, b, btc) = (Venue::new("a"), Venue::new("b"), Symbol::new("BTC", "USDT"));
+        assert!(throttle.should_log(&a, &btc, 10_000));
+        assert!(!throttle.should_log(&a, &btc, 10_999));
+        assert!(throttle.should_log(&b, &btc, 10_999));
+        assert!(throttle.should_log(&a, &btc, 11_000));
+    }
+
+    #[test]
+    fn describes_top_levels_and_compares_with_quote() {
+        let book = OrderBookLevels {
+            bids: Arc::new(vec![(d("100"), d("1")), (d("99"), d("2")), (d("98"), d("3"))]),
+            asks: Arc::new(vec![(d("101"), d("4"))]),
+            ts_ms: 7,
+        };
+        let quote = Quote { bid: d("100"), bid_size: d("1"), ask: d("101"), ask_size: d("4"), ts_ms: 8 };
+        assert_eq!(
+            describe_order_book(&book, Some(&quote), 2),
+            "levels=3/1 bids=[100x1, 99x2] asks=[101x4] book_ts=7 | quote bid=100 ask=101 quote_ts=8 top_match=true"
+        );
+        let stale = Quote { bid: d("99.5"), ..quote };
+        assert!(describe_order_book(&book, Some(&stale), 2).ends_with("top_match=false"));
+        assert!(describe_order_book(&book, None, 2).ends_with("quote=none"));
     }
 
     #[test]
