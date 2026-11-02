@@ -13,6 +13,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 use crate::net::connect_tcp;
+use crate::market_data::orderbook::OrderBookLevels;
 use crate::topic::{Topic, TopicBus};
 use crate::types::{Quote, Symbol, Venue};
 
@@ -29,8 +30,8 @@ const TESTNET_REST_HOST: &str = "https://testnet.binancefuture.com";
 const MIN_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 
-/// 币安 U 本位永续合约 bookTicker 行情源：通过 combined stream WebSocket 订阅一批
-/// 交易对的最优买卖一档,断线后自动按指数退避重连。支持通过 HTTP CONNECT 代理出网。
+/// 币安 U 本位永续合约行情源：通过 combined stream WebSocket 订阅 bookTicker 和
+/// 20 档深度快照,断线后自动按指数退避重连。支持通过 HTTP CONNECT 代理出网。
 /// 消息格式和订阅方式与 [`super::binance::BinanceSpotSource`] 完全一致,只是 host 换成
 /// 期货域名(mainnet `fstream.binance.com`,testnet `stream.binancefuture.com`)。
 pub struct BinanceFuturesSource {
@@ -72,7 +73,10 @@ impl BinanceFuturesSource {
         let streams = self
             .symbols
             .iter()
-            .map(|s| format!("{}@bookTicker", Self::binance_symbol(s).to_ascii_lowercase()))
+            .flat_map(|s| {
+                let symbol = Self::binance_symbol(s).to_ascii_lowercase();
+                [format!("{symbol}@bookTicker"), format!("{symbol}@depth20@100ms")]
+            })
             .collect::<Vec<_>>()
             .join("/");
         format!("wss://{}:{}/stream?streams={}", self.ws_host, self.ws_port, streams)
@@ -126,10 +130,20 @@ impl MarketDataSource for BinanceFuturesSource {
                     let Message::Text(text) = msg else {
                         continue;
                     };
-                    let Some((symbol, quote)) = parse_book_ticker(&text, &symbol_map) else {
+                    let Ok(stream) = serde_json::from_str::<StreamName>(&text) else {
                         continue;
                     };
-                    bus.publish(Topic::quote(self.venue.clone(), symbol), quote);
+                    if stream.stream.ends_with("@bookTicker") {
+                        let Some((symbol, quote)) = parse_book_ticker(&text, &symbol_map) else {
+                            continue;
+                        };
+                        bus.publish(Topic::quote(self.venue.clone(), symbol), quote);
+                    } else if stream.stream.ends_with("@depth20@100ms") {
+                        let Some((symbol, book)) = parse_partial_depth(&text, &symbol_map) else {
+                            continue;
+                        };
+                        bus.publish(Topic::order_book(self.venue.clone(), symbol), book);
+                    }
                 }
 
                 warn!(
@@ -159,6 +173,23 @@ struct CombinedStreamEnvelope {
     data: BookTickerPayload,
 }
 
+#[derive(Debug, Deserialize)]
+struct StreamName {
+    stream: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct PartialDepthPayload {
+    s: String,
+    b: Vec<Vec<String>>,
+    a: Vec<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CombinedDepthEnvelope {
+    data: PartialDepthPayload,
+}
+
 /// 解析一条 combined stream 消息,查表得到内部 Symbol。纯函数,不依赖网络连接,
 /// 便于脱离真实 WebSocket 连接做单元测试。
 fn parse_book_ticker(text: &str, symbol_map: &HashMap<String, Symbol>) -> Option<(Symbol, Quote)> {
@@ -185,6 +216,33 @@ fn parse_book_ticker(text: &str, symbol_map: &HashMap<String, Symbol>) -> Option
             ts_ms: now_ms(),
         },
     ))
+}
+
+fn parse_partial_depth(text: &str, symbol_map: &HashMap<String, Symbol>) -> Option<(Symbol, OrderBookLevels)> {
+    let envelope: CombinedDepthEnvelope = match serde_json::from_str(text) {
+        Ok(envelope) => envelope,
+        Err(err) => {
+            warn!("failed to parse binance futures partial depth message: {err}");
+            return None;
+        }
+    };
+    let payload = envelope.data;
+    let symbol = symbol_map.get(&payload.s)?.clone();
+    let parse_levels = |rows: Vec<Vec<String>>| {
+        rows.into_iter()
+            .filter_map(|row| {
+                let price = row.first()?.parse::<Decimal>().ok()?;
+                let qty = row.get(1)?.parse::<Decimal>().ok()?;
+                (price > Decimal::ZERO && qty > Decimal::ZERO).then_some((price, qty))
+            })
+            .collect::<Vec<_>>()
+    };
+    let bids = parse_levels(payload.b);
+    let asks = parse_levels(payload.a);
+    if bids.is_empty() || asks.is_empty() {
+        return None;
+    }
+    Some((symbol, OrderBookLevels { bids: Arc::new(bids), asks: Arc::new(asks), ts_ms: now_ms() }))
 }
 
 /// 币安 U 本位永续的公开 K 线 / 24h 行情 REST 客户端，不需要签名。
@@ -405,8 +463,29 @@ mod tests {
 
         assert_eq!(
             source.stream_url(),
-            "wss://fstream.binance.com:443/stream?streams=btcusdt@bookTicker/ethbtc@bookTicker"
+            "wss://fstream.binance.com:443/stream?streams=btcusdt@bookTicker/btcusdt@depth20@100ms/ethbtc@bookTicker/ethbtc@depth20@100ms"
         );
+    }
+
+    #[test]
+    fn parses_combined_stream_partial_depth() {
+        let symbol = Symbol::new("BTC", "USDT");
+        let map = map_with(symbol.clone());
+        let text = r#"{
+            "stream": "btcusdt@depth20@100ms",
+            "data": {
+                "lastUpdateId": 160,
+                "E": 123456789,
+                "T": 123456780,
+                "s": "BTCUSDT",
+                "b": [["100", "2"], ["99", "3"]],
+                "a": [["101", "4"], ["102", "5"]]
+            }
+        }"#;
+        let (parsed_symbol, book) = parse_partial_depth(text, &map).expect("should parse");
+        assert_eq!(parsed_symbol, symbol);
+        assert_eq!(book.bids.as_ref(), &vec![(Decimal::from(100), Decimal::from(2)), (Decimal::from(99), Decimal::from(3))]);
+        assert_eq!(book.asks.as_ref(), &vec![(Decimal::from(101), Decimal::from(4)), (Decimal::from(102), Decimal::from(5))]);
     }
 
     #[test]

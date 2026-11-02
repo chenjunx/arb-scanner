@@ -243,7 +243,7 @@ pub struct CrossFundingConfig {
     /// 下单后多少秒两腿还没全部成交就停止这一行。
     #[serde(default = "default_cf_fill_timeout_secs")]
     pub fill_timeout_secs: u64,
-    /// 报价超过多少毫秒没更新就不参与决策/触发。
+    /// 订单簿超过多少毫秒没更新就不参与决策/触发。
     #[serde(default = "default_cf_quote_max_age_ms")]
     pub quote_max_age_ms: u64,
     /// t0 时最新小时 K 线已收盘超过多少小时就不开仓。

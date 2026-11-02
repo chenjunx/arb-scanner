@@ -5,11 +5,11 @@
 //!
 //! 启动时每行拉最近 [`HISTORY_HOURS`] 小时的小时 K 线，算出最新一根的 30 天
 //! 百分位和 σ，配合 Redis 里人工确认过的 k* 表([`KStarTable`])。t0 = 启动后两腿
-//! 第一次都有新鲜报价的时刻，按 [`decide`] 判断：
+//! 第一次都有新鲜订单簿的时刻，按 [`decide`] 判断：
 //! - 立即开(百分位/σ 缺失 / 当前档直接开)：两腿马上市价；
 //! - 不开仓(最新小时 K 线不新鲜 / σ 告警)：warn 打出原因，这一行停在 `Skipped`；
-//! - 等待：目标 = t0 实时中间价价差 − k*·σ，24 小时内固定。可成交价差(多腿 ask、
-//!   空腿 bid)≤ 目标就两腿市价；到期还没等到也两腿市价。
+//! - 等待：目标 = t0 盘口中间价价差 − k*·σ，24 小时内固定。扫完整个下单量后的
+//!   VWAP 价差≤目标就两腿市价；到期还没等到也等有足够盘口深度时两腿市价。
 //!
 //! 每一行只开一次仓；任意一腿被拒/超时未成交都只打 error 日志并把这一行停在
 //! `Halted`，等人工处理，不做自动补救，也不平仓。持仓模式(单向)、保证金模式、杠杆
@@ -17,7 +17,7 @@
 //!
 //! 风控：单行名义上限(启动和触发时各查一次)；已结束各行的未对冲敞口之和上限(超过
 //! 就停掉所有行)；单腿成交滑点告警；kill switch 文件(存在时不决策、不下单，删掉
-//! 恢复)。dry run 即模拟盘：照常决策，按触发时的对手价模拟全量成交。
+//! 恢复)。dry run 即模拟盘：照常决策，按触发时扫盘口的 VWAP 模拟全量成交。
 //!
 //! 每次 t0 决策和每一行的最终结果都往 `record_file` 追加一行 JSON
 //! ([`OrderRecord`])，供 `cross-funding-review` 复盘。
@@ -75,13 +75,13 @@ const KILL_SWITCH_POLL_MS: u64 = 1_000;
 /// 一期已知局限，启动日志和复盘报告都会原样打印。
 pub const KNOWN_LIMITATIONS: &str = "\
 1. 两腿都是市价单(taker)，没有限价/挂单优化；成交回报不带手续费，节省按\"等\"和\"直接开\"两边同为 taker 费相互抵消计算，资金费不计入。
-2. t0 = 启动后两腿第一次都有新鲜报价的时刻；进程重启会重新决策、重新计 24 小时，重启前还在等待的行只留下 decision 记录。K 线不新鲜、σ 告警而不开仓的行本进程内不再重新判断，要重启才会重新拉 K 线、重新决策。
-3. 目标/到期只在收到行情时判断，到期单在到期后第一笔两腿都新鲜的报价时下单。
+2. t0 = 启动后两腿第一次都有新鲜订单簿的时刻；进程重启会重新决策、重新计 24 小时，重启前还在等待的行只留下 decision 记录。K 线不新鲜、σ 告警而不开仓的行本进程内不再重新判断，要重启才会重新拉 K 线、重新决策。
+3. 目标/到期只在收到订单簿时判断，到期单在到期后第一笔两腿都新鲜且深度足够的订单簿时下单。
 4. 百分位/σ 用启动时拉的小时 K 线，等待期间不更新(按设计 24 小时内目标固定)。
 5. 校准不剔除 σ 告警时段(剔除开关待确认)。
 6. 节省 = t0 可成交价差 − 实际成交价差；研究里的期望 B 按收盘价(近似中间价)算，两者口径差约半个买卖价差。
 7. 不做平仓；任一腿失败只停这一行，需人工处理。
-8. 模拟盘按触发时的对手价全量成交，不模拟滑点和部分成交。";
+8. 模拟盘按触发时扫盘口的 VWAP 全量成交，不模拟真实滑点和部分成交。";
 
 /// 支持的永续交易所。CSV 里写 `binance`/`gate`/`okx`/`bitget`，内部 venue 是
 /// `binance_futures`/`gate_futures`/`okx_futures`/`bitget_futures`。
@@ -266,7 +266,7 @@ pub struct CrossFundingParams {
     pub max_price_diff_pct: Decimal,
     /// 下单后多久两腿还没全部成交就判定异常。
     pub fill_timeout_ms: u64,
-    /// 两边报价都必须是最近这么久以内的才参与决策/触发。
+    /// 两边订单簿都必须是最近这么久以内的才参与决策/触发。
     pub quote_max_age_ms: u64,
     /// false 时为模拟盘：照常决策，按对手价模拟成交，不下单。
     pub live: bool,
@@ -392,6 +392,84 @@ pub fn live_spreads(
     (exec_bp.is_finite() && mid_bp.is_finite()).then_some(LiveSpreads { exec_bp, mid_bp })
 }
 
+/// 按市价单方向扫盘口，返回覆盖完整下单量后的每币 VWAP。盘口数量以交易所原生单位
+/// 表示，先用合约面值换成内部合约 base 单位。
+fn market_vwap(levels: &[(Decimal, Decimal)], order_qty: Decimal, spec: &PerpContractSpec) -> Option<Decimal> {
+    let contract_size = spec.contract_size();
+    if order_qty <= Decimal::ZERO || contract_size <= Decimal::ZERO {
+        return None;
+    }
+
+    let mut remaining = order_qty;
+    let mut notional = Decimal::ZERO;
+    for (price, native_qty) in levels {
+        if *price <= Decimal::ZERO || *native_qty <= Decimal::ZERO {
+            continue;
+        }
+        let level_qty = *native_qty * contract_size;
+        let filled_qty = level_qty.min(remaining);
+        notional += per_coin(*price, spec) * filled_qty;
+        remaining -= filled_qty;
+        if remaining.is_zero() {
+            return Some(notional / order_qty);
+        }
+    }
+    None
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct BookExecution {
+    long_vwap_per_coin: Decimal,
+    short_vwap_per_coin: Decimal,
+    exec_bp: f64,
+}
+
+fn order_book_spreads(
+    long_book: &OrderBookLevels,
+    short_book: &OrderBookLevels,
+    long_spec: &PerpContractSpec,
+    short_spec: &PerpContractSpec,
+    now_ms: u64,
+    max_age_ms: u64,
+) -> Option<LiveSpreads> {
+    if now_ms.saturating_sub(long_book.ts_ms) > max_age_ms || now_ms.saturating_sub(short_book.ts_ms) > max_age_ms {
+        return None;
+    }
+    let long_bid = long_book.bids.first()?.0;
+    let long_ask = long_book.asks.first()?.0;
+    let short_bid = short_book.bids.first()?.0;
+    let short_ask = short_book.asks.first()?.0;
+    if [long_bid, long_ask, short_bid, short_ask].iter().any(|price| *price <= Decimal::ZERO) {
+        return None;
+    }
+    let mid = |bid: Decimal, ask: Decimal| (bid + ask) / Decimal::TWO;
+    let exec_bp = spread_bp(per_coin_f64(long_ask, long_spec.price_unit), per_coin_f64(short_bid, short_spec.price_unit));
+    let mid_bp = spread_bp(
+        per_coin_f64(mid(long_bid, long_ask), long_spec.price_unit),
+        per_coin_f64(mid(short_bid, short_ask), short_spec.price_unit),
+    );
+    (exec_bp.is_finite() && mid_bp.is_finite()).then_some(LiveSpreads { exec_bp, mid_bp })
+}
+
+fn order_book_execution(
+    long_book: &OrderBookLevels,
+    short_book: &OrderBookLevels,
+    long_qty: Decimal,
+    short_qty: Decimal,
+    long_spec: &PerpContractSpec,
+    short_spec: &PerpContractSpec,
+    now_ms: u64,
+    max_age_ms: u64,
+) -> Option<BookExecution> {
+    if now_ms.saturating_sub(long_book.ts_ms) > max_age_ms || now_ms.saturating_sub(short_book.ts_ms) > max_age_ms {
+        return None;
+    }
+    let long_vwap = market_vwap(&long_book.asks, long_qty, long_spec)?;
+    let short_vwap = market_vwap(&short_book.bids, short_qty, short_spec)?;
+    let exec_bp = spread_bp(long_vwap.to_f64()?, short_vwap.to_f64()?);
+    exec_bp.is_finite().then_some(BookExecution { long_vwap_per_coin: long_vwap, short_vwap_per_coin: short_vwap, exec_bp })
+}
+
 /// 成交价相对参考价的滑点(bp)，正数表示成交得更差：买单成交价高于参考价、
 /// 卖单成交价低于参考价。
 pub fn slippage_bp(side: OrderSide, reference: f64, fill: f64) -> f64 {
@@ -512,6 +590,8 @@ enum LegRole {
 enum Phase {
     /// 还没有两腿都新鲜的报价，没做 t0 决策。
     AwaitingT0,
+    /// t0 决策为立即开，等盘口具备可估算的完整成交量。
+    ImmediatePending,
     /// 等可成交价差 ≤ `target_bp`，最晚到 `deadline_ms`。
     Waiting { target_bp: f64, deadline_ms: u64 },
     Submitted { at_ms: u64 },
@@ -543,7 +623,6 @@ struct LegState {
     spec: PerpContractSpec,
     /// 下单量，合约 base 单位。
     order_qty: Decimal,
-    quote: Option<Quote>,
     client_order_id: Option<String>,
     /// `(filled_qty, avg_price)`，合约 base 单位和原始报价。
     filled: Option<(Decimal, Decimal)>,
@@ -559,14 +638,10 @@ impl LegState {
         self.filled.map(|(qty, price)| (self.spec.base_to_coins(qty), per_coin_f64(price, self.spec.price_unit)))
     }
 
-    /// 估值用的每币价格：有成交用成交均价，否则用最新报价中间价。
+    /// 估值用的每币价格：有成交时用成交均价。
     fn mark_per_coin(&self) -> Option<Decimal> {
-        let price = match (self.filled, self.quote) {
-            (Some((_, price)), _) if price > Decimal::ZERO => price,
-            (_, Some(q)) => (q.bid + q.ask) / Decimal::TWO,
-            _ => return None,
-        };
-        Some(per_coin(price, &self.spec))
+        let (_, price) = self.filled?;
+        (price > Decimal::ZERO).then(|| per_coin(price, &self.spec))
     }
 }
 
@@ -619,7 +694,7 @@ impl RowState {
 #[derive(Default)]
 struct State {
     rows: Vec<RowState>,
-    quote_index: HashMap<(Venue, Symbol), Vec<(usize, LegRole)>>,
+    book_index: HashMap<(Venue, Symbol), Vec<(usize, LegRole)>>,
     order_index: HashMap<String, (usize, LegRole)>,
 }
 
@@ -650,7 +725,7 @@ pub struct CrossFundingStrategy {
     order_manager: Option<Arc<OrderManager>>,
     state: Mutex<State>,
     /// 各 leg (venue, symbol) 最新订单簿快照，`on_order_book` 维护，独立于
-    /// `state` 里的触发逻辑，暂不接入价差/下单判断。
+    /// `state` 里的行状态。
     latest_order_books: Mutex<HashMap<(Venue, Symbol), OrderBookLevels>>,
     order_book_log: OrderBookLogThrottle,
     /// 未对冲敞口超限后置位，所有行不再下单。
@@ -823,7 +898,6 @@ impl CrossFundingStrategy {
             symbol: symbol.clone(),
             spec,
             order_qty,
-            quote: None,
             client_order_id: None,
             filled: None,
         };
@@ -1040,29 +1114,32 @@ impl CrossFundingStrategy {
         row: &mut RowState,
         kind: TriggerKind,
         spreads: LiveSpreads,
-        long_quote: Quote,
-        short_quote: Quote,
+        execution: BookExecution,
+        long_best_ask: Decimal,
+        short_best_bid: Decimal,
         now: u64,
         order_index: &mut HashMap<String, (usize, LegRole)>,
         submits: &mut Vec<PendingSubmit>,
     ) -> bool {
-        let long_ask = per_coin_f64(long_quote.ask, row.long.spec.price_unit);
-        let short_bid = per_coin_f64(short_quote.bid, row.short.spec.price_unit);
+        let long_ask = per_coin_f64(long_best_ask, row.long.spec.price_unit);
+        let short_bid = per_coin_f64(short_best_bid, row.short.spec.price_unit);
         row.trigger = Some(TriggerInfo { kind, at_ms: now, exec_bp: spreads.exec_bp, long_ask, short_bid });
         let target = match row.phase {
             Phase::Waiting { target_bp, .. } => format!("{target_bp:.4}bp"),
             _ => "-".to_string(),
         };
         info!(
-            "cross_funding {}: 触发({kind:?}) 可成交价差={:.4}bp 目标={target} 基准={:.4}bp，多腿 ask={} 空腿 bid={}",
+            "cross_funding {}: 触发({kind:?}) 扫单价差={:.4}bp 目标={target} 基准={:.4}bp，多腿 ask={} VWAP={} 空腿 bid={} VWAP={}",
             row.label,
             spreads.exec_bp,
             row.record.as_ref().map(|r| r.baseline_bp).unwrap_or(f64::NAN),
-            long_quote.ask,
-            short_quote.bid
+            long_best_ask,
+            execution.long_vwap_per_coin * row.long.spec.price_unit,
+            short_best_bid,
+            execution.short_vwap_per_coin * row.short.spec.price_unit,
         );
 
-        let notional = row.coins * per_coin(long_quote.ask, &row.long.spec);
+        let notional = row.coins * execution.long_vwap_per_coin;
         if notional > self.params.max_notional_usdt {
             error!(
                 "cross_funding {}: 触发时名义金额 ≈{} USDT 超过上限 max_notional_usdt={}，不下单，这一行停止",
@@ -1075,9 +1152,9 @@ impl CrossFundingStrategy {
         }
 
         if !self.params.live {
-            row.long.filled = Some((row.long.order_qty, long_quote.ask));
-            row.short.filled = Some((row.short.order_qty, short_quote.bid));
-            info!("cross_funding {}: [模拟盘] 按对手价模拟成交，不下单", row.label);
+            row.long.filled = Some((row.long.order_qty, execution.long_vwap_per_coin * row.long.spec.price_unit));
+            row.short.filled = Some((row.short.order_qty, execution.short_vwap_per_coin * row.short.spec.price_unit));
+            info!("cross_funding {}: [模拟盘] 按盘口 VWAP 模拟成交，不下单", row.label);
             self.complete(row, now);
             return true;
         }
@@ -1331,8 +1408,7 @@ impl Strategy for CrossFundingStrategy {
         let mut state = self.state.lock().unwrap();
         for (idx, row) in prepared.into_iter().enumerate() {
             for (role, leg) in [(LegRole::Long, &row.long), (LegRole::Short, &row.short)] {
-                state.quote_index.entry((leg.venue.clone(), leg.symbol.clone())).or_default().push((idx, role));
-                subscriber.subscribe_quote(Topic::quote(leg.venue.clone(), leg.symbol.clone()));
+                state.book_index.entry((leg.venue.clone(), leg.symbol.clone())).or_default().push((idx, role));
                 subscriber.subscribe_order_book(Topic::order_book(leg.venue.clone(), leg.symbol.clone()));
             }
             state.rows.push(row);
@@ -1347,36 +1423,17 @@ impl Strategy for CrossFundingStrategy {
         self.latest_order_books.lock().unwrap().insert((venue.clone(), symbol.clone()), book.clone());
 
         if self.order_book_log.should_log(venue, symbol, now_ms()) {
-            let quote = {
-                let state = self.state.lock().unwrap();
-                state.quote_index.get(&(venue.clone(), symbol.clone())).and_then(|targets| {
-                    let &(idx, role) = targets.first()?;
-                    let row = &state.rows[idx];
-                    match role {
-                        LegRole::Long => row.long.quote,
-                        LegRole::Short => row.short.quote,
-                    }
-                })
-            };
-            info!(
-                "cross_funding orderbook {venue} {symbol} {}",
-                describe_order_book(book, quote.as_ref(), ORDER_BOOK_LOG_DEPTH)
-            );
+            info!("cross_funding orderbook {venue} {symbol} {}", describe_order_book(book, None, ORDER_BOOK_LOG_DEPTH));
         }
-    }
 
-    fn on_quote(&self, topic: &Topic, quote: &Quote) {
-        let Topic::Quote { venue, symbol } = topic else {
-            return;
-        };
         let now = now_ms();
         let paused = self.kill_switch_active(now);
+        let books = self.latest_order_books.lock().unwrap().clone();
         let mut submits = Vec::new();
         {
             let mut guard = self.state.lock().unwrap();
-            let State { rows, quote_index, order_index } = &mut *guard;
+            let State { rows, book_index, order_index } = &mut *guard;
             let mut finished = false;
-
             for row in rows.iter_mut() {
                 if let Phase::Submitted { at_ms } = row.phase
                     && now.saturating_sub(at_ms) > self.params.fill_timeout_ms
@@ -1393,22 +1450,20 @@ impl Strategy for CrossFundingStrategy {
                 }
             }
 
-            if let Some(targets) = quote_index.get(&(venue.clone(), symbol.clone())) {
-                for &(idx, role) in targets {
+            if !paused && !self.halted.load(Ordering::SeqCst)
+                && let Some(targets) = book_index.get(&(venue.clone(), symbol.clone()))
+            {
+                for &(idx, _) in targets {
                     let row = &mut rows[idx];
-                    row.leg_mut(role).quote = Some(*quote);
-                    if paused || self.halted.load(Ordering::SeqCst) {
-                        continue;
-                    }
-                    if !matches!(row.phase, Phase::AwaitingT0 | Phase::Waiting { .. }) {
-                        continue;
-                    }
-                    let (Some(long_quote), Some(short_quote)) = (row.long.quote, row.short.quote) else {
+                    let (Some(long_book), Some(short_book)) = (
+                        books.get(&(row.long.venue.clone(), row.long.symbol.clone())),
+                        books.get(&(row.short.venue.clone(), row.short.symbol.clone())),
+                    ) else {
                         continue;
                     };
-                    let Some(spreads) = live_spreads(
-                        &long_quote,
-                        &short_quote,
+                    let Some(top_spreads) = order_book_spreads(
+                        long_book,
+                        short_book,
                         &row.long.spec,
                         &row.short.spec,
                         now,
@@ -1416,17 +1471,45 @@ impl Strategy for CrossFundingStrategy {
                     ) else {
                         continue;
                     };
-                    let kind = if row.phase == Phase::AwaitingT0 { self.decide_t0(row, spreads, now) } else { None };
-                    let Some(kind) = kind.or_else(|| waiting_trigger(row.phase, spreads.exec_bp, now)) else {
+
+                    if row.phase == Phase::AwaitingT0 && self.decide_t0(row, top_spreads, now).is_some() {
+                        row.phase = Phase::ImmediatePending;
+                    }
+                    if !matches!(row.phase, Phase::ImmediatePending | Phase::Waiting { .. }) {
+                        continue;
+                    }
+                    let Some(execution) = order_book_execution(
+                        long_book,
+                        short_book,
+                        row.long.order_qty,
+                        row.short.order_qty,
+                        &row.long.spec,
+                        &row.short.spec,
+                        now,
+                        self.params.quote_max_age_ms,
+                    ) else {
+                        debug!("cross_funding {}: 盘口深度不足，暂不触发", row.label);
                         continue;
                     };
+                    let spreads = LiveSpreads { exec_bp: execution.exec_bp, mid_bp: top_spreads.mid_bp };
+                    let kind = match row.phase {
+                        Phase::ImmediatePending => Some(TriggerKind::Immediate),
+                        phase @ Phase::Waiting { .. } => waiting_trigger(phase, execution.exec_bp, now),
+                        _ => None,
+                    };
+                    let Some(kind) = kind else {
+                        continue;
+                    };
+                    let long_best_ask = long_book.asks.first().unwrap().0;
+                    let short_best_bid = short_book.bids.first().unwrap().0;
                     finished |= self.trigger(
                         idx,
                         row,
                         kind,
                         spreads,
-                        long_quote,
-                        short_quote,
+                        execution,
+                        long_best_ask,
+                        short_best_bid,
                         now,
                         order_index,
                         &mut submits,
@@ -1454,6 +1537,8 @@ impl Strategy for CrossFundingStrategy {
             );
         }
     }
+
+    fn on_quote(&self, _topic: &Topic, _quote: &Quote) {}
 
     fn on_order_event(&self, event: &OrderEvent) {
         let Some(client_order_id) = event.client_order_id() else {
@@ -1613,6 +1698,18 @@ mod tests {
     }
 
     #[test]
+    fn market_vwap_sweeps_depth_and_converts_contract_size() {
+        let gate_spec = spec(1, 10);
+        let asks = vec![(d("100"), d("0.05")), (d("102"), d("0.1"))];
+        assert_eq!(market_vwap(&asks, Decimal::ONE, &gate_spec), Some(d("101")));
+        assert_eq!(market_vwap(&asks, d("1.6"), &gate_spec), None);
+
+        let prefixed_spec = spec(1000, 1000);
+        let prefixed_asks = vec![(d("100000"), d("1")), (d("102000"), d("1"))];
+        assert_eq!(market_vwap(&prefixed_asks, d("2"), &prefixed_spec), Some(d("101")));
+    }
+
+    #[test]
     fn waiting_triggers_on_target_or_expiry() {
         let phase = Phase::Waiting { target_bp: -2.0, deadline_ms: 1_000 };
         assert_eq!(waiting_trigger(phase, -1.9, 999), None);
@@ -1701,7 +1798,6 @@ mod tests {
             symbol: btc(),
             spec: spec(1, 1),
             order_qty: Decimal::ONE,
-            quote: None,
             client_order_id: None,
             filled: None,
         };
@@ -1724,8 +1820,8 @@ mod tests {
             trigger: None,
         };
         let mut state = strategy.state.lock().unwrap();
-        state.quote_index.insert((long_venue(), btc()), vec![(0, LegRole::Long)]);
-        state.quote_index.insert((short_venue(), btc()), vec![(0, LegRole::Short)]);
+        state.book_index.insert((long_venue(), btc()), vec![(0, LegRole::Long)]);
+        state.book_index.insert((short_venue(), btc()), vec![(0, LegRole::Short)]);
         state.rows.push(row);
         drop(state);
         strategy
@@ -1740,7 +1836,13 @@ mod tests {
     }
 
     fn feed(strategy: &CrossFundingStrategy, venue: Venue, bid: &str, ask: &str) {
-        strategy.on_quote(&Topic::quote(venue, btc()), &quote(bid, ask, now_ms()));
+        let quote = quote(bid, ask, now_ms());
+        let book = OrderBookLevels {
+            bids: Arc::new(vec![(quote.bid, Decimal::from(100))]),
+            asks: Arc::new(vec![(quote.ask, Decimal::from(100))]),
+            ts_ms: quote.ts_ms,
+        };
+        strategy.on_order_book(&Topic::order_book(venue, btc()), &book);
     }
 
     /// 立即开的档。
@@ -1807,6 +1909,25 @@ mod tests {
         assert_close(result.savings_bp.unwrap(), 4.0);
         assert_close(result.long_slippage_bp.unwrap(), 0.0);
         assert_eq!(result.residual_coins, Some(Decimal::ZERO));
+    }
+
+    #[test]
+    fn depth_slippage_prevents_waiting_trigger() {
+        let s = strategy(params("depth_slippage"), BinAction::Wait { k_star: 2.0, note: None }, 1.0);
+        feed(&s, long_venue(), "100", "100.01");
+        feed(&s, short_venue(), "100", "100.01");
+        assert!(matches!(phase(&s), Phase::Waiting { .. }));
+
+        let long_quote = quote("99.96", "99.97", now_ms());
+        let deep_long_book = OrderBookLevels {
+            bids: Arc::new(vec![(long_quote.bid, Decimal::from(10))]),
+            asks: Arc::new(vec![(d("99.97"), d("0.1")), (d("100.1"), d("10"))]),
+            ts_ms: long_quote.ts_ms,
+        };
+        s.on_order_book(&Topic::order_book(long_venue(), btc()), &deep_long_book);
+
+        assert!(matches!(phase(&s), Phase::Waiting { .. }));
+        assert_eq!(records(&s).len(), 1);
     }
 
     #[test]
