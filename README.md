@@ -236,7 +236,7 @@ cargo run -- close --symbol BTC/USDT --kraken-spot-qty 0.005 --live
 
 ### 配置
 
-CSV 表头为 `long_venue,long_symbol,short_venue,short_symbol,quantity`，venue 填 `binance`/`gate`/`okx`/`bitget`，symbol 填交易所原生合约名（如 `1000PEPEUSDT`、`PEPE_USDT`、`PEPE-USDT-SWAP`），quantity 是币数，例见 `cross_funding_pairs.csv`。
+CSV 表头为 `long_venue,long_symbol,short_venue,short_symbol,quantity`，venue 填 `binance`/`gate`/`okx`/`bitget`，symbol 填交易所原生合约名（如 `1000PEPEUSDT`、`PEPE_USDT`、`PEPE-USDT-SWAP`），quantity 是这一行的目标仓位（币数），例见 `cross_funding_pairs.csv`。同一合约可以被多行共用（如 ONE 分别在 okx/binance/bitget 做多、都在 gate 做空），但每行至少要有一条只属于自己的腿，且同一合约不能在不同行里方向相反。
 
 风控和执行参数在 `config.toml` 的 `[cross_funding]` 段（`--config` 指定文件，缺这一段会直接报错）：
 
@@ -286,7 +286,7 @@ RUST_LOG=info cargo run -- cross-funding --csv cross_funding_pairs.csv --live
 
 上线顺序：单元测试 → 回放 → 至少 7 天模拟盘 → 小额实盘（BTC：币安多 / OKX 空）。
 
-进程重启后，没有触发的行会在新的 t0 重新决策，之前的等待目标不会保留。启动时检查到已有持仓的行会被跳过。
+进程重启后，没有触发的行会在新的 t0 重新决策，之前的等待目标不会保留。启动时按交易所当前持仓推断每行状态：两腿都无持仓的行正常进入决策；持仓正好等于目标仓位的行视为已开仓、跳过；部分持仓、超过目标、方向相反、共享腿持仓和各行合计对不上、或者还有本策略未完成订单的行只打 warn 提示并跳过，不补差额也不减仓。共享腿的多行运行中不会同时下单，前一行两腿都成交后才允许下一行触发。注意：某行平仓后如果仍留在 CSV 里，重启会被当成无持仓再次开仓。
 
 ### Kill switch
 

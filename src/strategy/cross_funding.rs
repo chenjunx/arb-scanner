@@ -11,7 +11,8 @@
 //! - 等待：目标 = t0 盘口中间价价差 − k*·σ，24 小时内固定。扫完整个下单量后的
 //!   VWAP 价差≤目标就两腿市价；到期还没等到也等有足够盘口深度时两腿市价。
 //!
-//! 每一行只开一次仓；任意一腿被拒/超时未成交都只打 error 日志并把这一行停在
+//! 每一行只开一次仓(CSV 的 `quantity` 是目标仓位，启动时用 [`classify_rows`] 按
+//! 当前持仓推断哪些行已开过)；任意一腿被拒/超时未成交都只打 error 日志并把这一行停在
 //! `Halted`，等人工处理，不做自动补救，也不平仓。持仓模式(单向)、保证金模式、杠杆
 //! 由用户事先在交易所设置好，程序不修改。
 //!
@@ -27,7 +28,7 @@
 //! 的合约才不是 1:1，张数换算在 Gate/OKX 下单网关里做)，每币价格 = 报价 /
 //! `PerpContractSpec::price_unit`。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -81,7 +82,8 @@ pub const KNOWN_LIMITATIONS: &str = "\
 5. 校准不剔除 σ 告警时段(剔除开关待确认)。
 6. 节省 = t0 可成交价差 − 实际成交价差；研究里的期望 B 按收盘价(近似中间价)算，两者口径差约半个买卖价差。
 7. 不做平仓；任一腿失败只停这一行，需人工处理。
-8. 模拟盘按触发时扫盘口的 VWAP 全量成交，不模拟真实滑点和部分成交。";
+8. 模拟盘按触发时扫盘口的 VWAP 全量成交，不模拟真实滑点和部分成交。
+9. CSV 的 quantity 是目标仓位，启动时按交易所当前持仓推断各行是否已开；部分持仓只提示不补差。某行平仓后仍留在 CSV 里，重启会被当成无持仓再次开仓。共享腿的行同一时间只有一行下单，前一行停止(Halted)后共享腿一直占用，其他行本进程内不再触发。";
 
 /// 支持的永续交易所。CSV 里写 `binance`/`gate`/`okx`/`bitget`，内部 venue 是
 /// `binance_futures`/`gate_futures`/`okx_futures`/`bitget_futures`。
@@ -205,6 +207,153 @@ impl PairRow {
 pub fn pair_key(long: &LegSpec, short: &LegSpec) -> String {
     let leg = |l: &LegSpec| format!("{}:{}", l.exchange, l.native_symbol.trim().to_ascii_uppercase());
     format!("{}|{}", leg(long), leg(short))
+}
+
+/// 按交易所当前持仓推断的一行开仓状态。CSV 的 `quantity` 是目标仓位。
+#[derive(Debug, Clone, PartialEq)]
+pub enum RowPositionStatus {
+    /// 两腿都没有持仓，可以开仓。
+    Flat,
+    /// 两腿持仓正好等于目标仓位，已开过。
+    Opened,
+    /// 有持仓但不足目标仓位(含单腿)。`long`/`short` 为这一行的带符号币数。
+    Partial { long: Decimal, short: Decimal },
+    /// 持仓超过目标仓位。
+    Over { long: Decimal, short: Decimal },
+    /// 无法判断这一行归属的持仓(方向反了、共享腿对不上、查询失败等)。
+    Invalid(String),
+}
+
+impl fmt::Display for RowPositionStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Flat => write!(f, "无持仓"),
+            Self::Opened => write!(f, "已开仓"),
+            Self::Partial { long, short } => {
+                write!(f, "部分持仓(多腿 {} 币 / 空腿 {} 币)", long.normalize(), short.normalize())
+            }
+            Self::Over { long, short } => {
+                write!(f, "持仓超过目标(多腿 {} 币 / 空腿 {} 币)", long.normalize(), short.normalize())
+            }
+            Self::Invalid(reason) => write!(f, "持仓无法归属: {reason}"),
+        }
+    }
+}
+
+/// 用交易所当前持仓(`positions`：(venue, symbol) → 带符号实际币数，多为正、空为
+/// 负；查询失败的合约不放进去)推断每一行的开仓状态，结果和 `rows` 一一对应。
+///
+/// 只被一行用到的腿是独立腿，被多行用到的是共享腿(如 ONE 在 okx/binance/bitget
+/// 各做多、都在 gate 做空)。共享腿的持仓按"各行独立腿持仓之和的相反数"校验，
+/// 对得上时每行按自己的独立腿判断，对不上时用到这条共享腿的行全部 `Invalid`。
+/// 两腿都是共享腿、配对重复、同一合约在不同行方向相反的行无法唯一归属，也是 `Invalid`。
+pub fn classify_rows(rows: &[PairRow], positions: &HashMap<(Venue, Symbol), Decimal>) -> Vec<RowPositionStatus> {
+    type LegKey = (Venue, Symbol);
+    let leg_key = |leg: &LegSpec| -> LegKey { (leg.venue(), leg.symbol.clone()) };
+    let leg_name = |leg: &LegSpec| format!("{}:{}", leg.exchange, leg.native_symbol);
+
+    let mut usage: HashMap<LegKey, Vec<(usize, LegRole)>> = HashMap::new();
+    for (i, row) in rows.iter().enumerate() {
+        usage.entry(leg_key(&row.long)).or_default().push((i, LegRole::Long));
+        usage.entry(leg_key(&row.short)).or_default().push((i, LegRole::Short));
+    }
+    let shared = |key: &LegKey| usage.get(key).is_some_and(|u| u.len() > 1);
+
+    let mut invalid: Vec<Option<String>> = vec![None; rows.len()];
+    fn mark(invalid: &mut [Option<String>], i: usize, reason: String) {
+        if invalid[i].is_none() {
+            invalid[i] = Some(reason);
+        }
+    }
+
+    for i in 0..rows.len() {
+        for j in i + 1..rows.len() {
+            if rows[i].key() == rows[j].key() {
+                mark(&mut invalid, i, format!("和第 {} 行配对重复", rows[j].line));
+                mark(&mut invalid, j, format!("和第 {} 行配对重复", rows[i].line));
+            }
+        }
+    }
+    for users in usage.values() {
+        let has_long = users.iter().any(|&(_, role)| role == LegRole::Long);
+        let has_short = users.iter().any(|&(_, role)| role == LegRole::Short);
+        if has_long && has_short {
+            for &(i, role) in users {
+                let row = &rows[i];
+                let leg = if role == LegRole::Long { &row.long } else { &row.short };
+                mark(&mut invalid, i, format!("{} 在不同行里既做多又做空", leg_name(leg)));
+            }
+        }
+    }
+    for (i, row) in rows.iter().enumerate() {
+        if shared(&leg_key(&row.long)) && shared(&leg_key(&row.short)) {
+            mark(&mut invalid, i, "两腿都和其他行共用，无法拆分持仓".to_string());
+        }
+    }
+
+    // 共享腿：持仓应等于各行独立腿持仓之和的相反数。
+    for (key, users) in &usage {
+        if users.len() < 2 {
+            continue;
+        }
+        let first = &rows[users[0].0];
+        let name = leg_name(if users[0].1 == LegRole::Long { &first.long } else { &first.short });
+        let mut total = Some(Decimal::ZERO);
+        for &(i, role) in users {
+            let other = if role == LegRole::Long { &rows[i].short } else { &rows[i].long };
+            total = total.zip(positions.get(&leg_key(other)).copied()).map(|(a, b)| a + b);
+        }
+        let reason = match (positions.get(key), total) {
+            (Some(&pos), Some(total)) if pos == -total => continue,
+            (Some(pos), Some(total)) => format!(
+                "共享腿 {name} 持仓 {} 币和各行另一腿合计 {} 币对不上",
+                pos.normalize(),
+                total.normalize()
+            ),
+            _ => format!("共享腿 {name} 相关合约持仓查询失败"),
+        };
+        for &(i, _) in users {
+            mark(&mut invalid, i, reason.clone());
+        }
+    }
+
+    rows.iter()
+        .enumerate()
+        .map(|(i, row)| {
+            if let Some(reason) = invalid[i].take() {
+                return RowPositionStatus::Invalid(reason);
+            }
+            let (long_key, short_key) = (leg_key(&row.long), leg_key(&row.short));
+            let pos = |key: &LegKey, leg: &LegSpec| positions.get(key).copied().ok_or_else(|| leg_name(leg));
+            let legs = if shared(&long_key) {
+                pos(&short_key, &row.short).map(|s| (-s, s))
+            } else if shared(&short_key) {
+                pos(&long_key, &row.long).map(|l| (l, -l))
+            } else {
+                pos(&long_key, &row.long).and_then(|l| pos(&short_key, &row.short).map(|s| (l, s)))
+            };
+            let (long, short) = match legs {
+                Ok(legs) => legs,
+                Err(name) => return RowPositionStatus::Invalid(format!("{name} 持仓查询失败")),
+            };
+            let qty = row.quantity;
+            if long.is_zero() && short.is_zero() {
+                RowPositionStatus::Flat
+            } else if long == qty && short == -qty {
+                RowPositionStatus::Opened
+            } else if long < Decimal::ZERO || short > Decimal::ZERO {
+                RowPositionStatus::Invalid(format!(
+                    "持仓方向和配置相反(多腿 {} 币 / 空腿 {} 币)",
+                    long.normalize(),
+                    short.normalize()
+                ))
+            } else if long > qty || -short > qty {
+                RowPositionStatus::Over { long, short }
+            } else {
+                RowPositionStatus::Partial { long, short }
+            }
+        })
+        .collect()
 }
 
 /// 解析 CSV(不引第三方 crate，手动按逗号切)：第一行必须是表头
@@ -696,6 +845,9 @@ struct State {
     rows: Vec<RowState>,
     book_index: HashMap<(Venue, Symbol), Vec<(usize, LegRole)>>,
     order_index: HashMap<String, (usize, LegRole)>,
+    /// 已下单、还没两腿都成交的合约。共享腿(如多行都在 Gate 做空 ONE)同一时间只让
+    /// 一行下单，避免两行的成交混在同一个持仓里分不清。行停止(`Halted`)时不释放。
+    busy_legs: HashSet<(Venue, Symbol)>,
 }
 
 /// 一次下单动作，在锁外发布。
@@ -765,6 +917,51 @@ impl CrossFundingStrategy {
         self.clients.get(venue).ok_or_else(|| anyhow::anyhow!("no clients configured for venue {venue}"))
     }
 
+    /// 查询 CSV 里所有合约的当前持仓，换算成带符号实际币数。同一合约只查一次；
+    /// 查询失败的合约打 warn 并不放进结果，相关行会被 [`classify_rows`] 判为无法归属。
+    async fn current_positions(&self) -> HashMap<(Venue, Symbol), Decimal> {
+        let mut positions = HashMap::new();
+        let mut seen = HashSet::new();
+        for leg in self.rows.iter().flat_map(|r| [&r.long, &r.short]) {
+            let key = (leg.venue(), leg.symbol.clone());
+            if !seen.insert(key.clone()) {
+                continue;
+            }
+            let result = async {
+                let clients = self.clients(&key.0)?;
+                let spec = clients.exchange_info.perpetual_contract_spec(&leg.symbol).await?;
+                let base = clients.orders.perp_position(&leg.symbol).await?;
+                anyhow::Ok(spec.base_to_coins(base))
+            }
+            .await;
+            match result {
+                Ok(coins) => {
+                    if !coins.is_zero() {
+                        info!("cross_funding: {}:{} 当前持仓 {} 币", leg.exchange, leg.native_symbol, coins.normalize());
+                    }
+                    positions.insert(key, coins);
+                }
+                Err(err) => warn!("cross_funding: 查询 {}:{} 持仓失败: {err:#}", leg.exchange, leg.native_symbol),
+            }
+        }
+        positions
+    }
+
+    /// live 模式下本策略还没到终态(New/PartiallyFilled)的订单涉及的合约。
+    fn unfinished_order_legs(&self) -> HashSet<(Venue, Symbol)> {
+        let Some(om) = &self.order_manager else {
+            return HashSet::new();
+        };
+        om.all_orders()
+            .into_iter()
+            .filter(|o| matches!(o.status, OrderStatus::New | OrderStatus::PartiallyFilled))
+            .filter_map(|o| match o.request.as_trade() {
+                Some(r) if r.strategy_id == STRATEGY_NAME => Some((r.venue.clone(), r.symbol.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// 启动时对一行做完整检查，通过后返回运行时状态。任何一步失败都返回 Err，
     /// 由调用方打日志跳过这一行。
     async fn prepare_row(
@@ -814,18 +1011,7 @@ impl CrossFundingStrategy {
         let long_qty = long_spec.coins_to_base(row.quantity);
         let short_qty = short_spec.coins_to_base(row.quantity);
 
-        // 2. 两边都不能已有持仓
-        let long_pos = long_clients.orders.perp_position(&row.long.symbol).await?;
-        let short_pos = short_clients.orders.perp_position(&row.short.symbol).await?;
-        if !long_pos.is_zero() || !short_pos.is_zero() {
-            anyhow::bail!(
-                "已有持仓(多腿 {}={}, 空腿 {}={})，不重复开仓",
-                row.long.native_symbol,
-                long_pos.normalize(),
-                row.short.native_symbol,
-                short_pos.normalize()
-            );
-        }
+        // 2. 持仓已在 init 里按 classify_rows 统一检查，走到这里的行都是无持仓
 
         // 3. 小时 K 线 → 最新一根的价差/百分位/σ
         let end_ms = (now_ms() / HOUR_MS - 1) * HOUR_MS;
@@ -1312,7 +1498,7 @@ impl CrossFundingStrategy {
     fn record_fill(&self, client_order_id: &str, filled_qty: Decimal, avg_price: Decimal) {
         let now = now_ms();
         let mut guard = self.state.lock().unwrap();
-        let State { rows, order_index, .. } = &mut *guard;
+        let State { rows, order_index, busy_legs, .. } = &mut *guard;
         let Some(&(idx, role)) = order_index.get(client_order_id) else {
             return;
         };
@@ -1326,7 +1512,11 @@ impl CrossFundingStrategy {
             avg_price.normalize()
         );
         match row.phase {
-            Phase::Submitted { .. } if row.long.filled.is_some() && row.short.filled.is_some() => self.complete(row, now),
+            Phase::Submitted { .. } if row.long.filled.is_some() && row.short.filled.is_some() => {
+                self.complete(row, now);
+                busy_legs.remove(&(row.long.venue.clone(), row.long.symbol.clone()));
+                busy_legs.remove(&(row.short.venue.clone(), row.short.symbol.clone()));
+            }
             Phase::Halted => {
                 warn!("cross_funding {}: 这一行已停止，{:?} 腿仍然成交了，请人工核对两边持仓", row.label, role)
             }
@@ -1378,18 +1568,66 @@ impl Strategy for CrossFundingStrategy {
         }
 
         let now = now_ms();
+        let positions = self.current_positions().await;
+        let busy = self.unfinished_order_legs();
+        let mut statuses = classify_rows(&self.rows, &positions);
+        for (row, status) in self.rows.iter().zip(statuses.iter_mut()) {
+            for leg in [&row.long, &row.short] {
+                if busy.contains(&(leg.venue(), leg.symbol.clone())) && !matches!(status, RowPositionStatus::Invalid(_)) {
+                    *status = RowPositionStatus::Invalid(format!(
+                        "{}:{} 还有本策略未完成的订单",
+                        leg.exchange, leg.native_symbol
+                    ));
+                }
+            }
+        }
+
         let mut prepared = Vec::new();
-        for row in &self.rows {
+        let (mut opened, mut partial, mut over, mut invalid, mut failed) = (0, 0, 0, 0, 0);
+        for (row, status) in self.rows.iter().zip(&statuses) {
+            match status {
+                RowPositionStatus::Flat => {}
+                RowPositionStatus::Opened => {
+                    opened += 1;
+                    info!("cross_funding {}: 已按目标仓位 {} 币开过仓，跳过", row.label(), row.quantity.normalize());
+                    continue;
+                }
+                RowPositionStatus::Partial { .. } => {
+                    partial += 1;
+                    warn!(
+                        "cross_funding {}: {status}，目标 {} 币，不补差额，跳过；请人工核对",
+                        row.label(),
+                        row.quantity.normalize()
+                    );
+                    continue;
+                }
+                RowPositionStatus::Over { .. } => {
+                    over += 1;
+                    warn!(
+                        "cross_funding {}: {status}，目标 {} 币，不减仓，跳过；请人工核对",
+                        row.label(),
+                        row.quantity.normalize()
+                    );
+                    continue;
+                }
+                RowPositionStatus::Invalid(_) => {
+                    invalid += 1;
+                    warn!("cross_funding {}: {status}，跳过；请人工核对", row.label());
+                    continue;
+                }
+            }
             let key = row.key();
             let Some(table) = self.tables.get(&key) else {
                 error!(
                     "cross_funding {}: Redis 里没有生效的 k* 表({key})，跳过；先 cross-funding-kstar calibrate 再 approve",
                     row.label()
                 );
+                failed += 1;
                 continue;
             };
             if table.pair != key {
                 error!("cross_funding {}: k* 表属于 {}，和本行 {key} 不一致，跳过", row.label(), table.pair);
+                failed += 1;
                 continue;
             }
             let age_ms = now.saturating_sub(table.data_end_ms);
@@ -1404,14 +1642,20 @@ impl Strategy for CrossFundingStrategy {
             }
             match self.prepare_row(row, table, &precisions).await {
                 Ok(state) => prepared.push(state),
-                Err(err) => warn!("cross_funding {}: 跳过: {err:#}", row.label()),
+                Err(err) => {
+                    failed += 1;
+                    warn!("cross_funding {}: 跳过: {err:#}", row.label());
+                }
             }
         }
+        let summary = format!(
+            "已开仓 {opened} 行，部分持仓 {partial} 行，超过目标 {over} 行，持仓无法归属 {invalid} 行，无持仓但未通过检查 {failed} 行"
+        );
         if prepared.is_empty() {
-            anyhow::bail!("cross_funding: CSV 里 {} 行全部未通过启动检查，没有可交易的行", self.rows.len());
+            anyhow::bail!("cross_funding: CSV 里 {} 行没有可交易的行({summary})", self.rows.len());
         }
         info!(
-            "cross_funding: {}/{} 行通过检查，模式={}，记录写到 {}，kill switch 文件 {}",
+            "cross_funding: {}/{} 行通过检查({summary})，模式={}，记录写到 {}，kill switch 文件 {}",
             prepared.len(),
             self.rows.len(),
             self.mode(),
@@ -1447,7 +1691,7 @@ impl Strategy for CrossFundingStrategy {
         let mut submits = Vec::new();
         {
             let mut guard = self.state.lock().unwrap();
-            let State { rows, book_index, order_index } = &mut *guard;
+            let State { rows, book_index, order_index, busy_legs } = &mut *guard;
             let mut finished = false;
             for row in rows.iter_mut() {
                 if let Phase::Submitted { at_ms } = row.phase
@@ -1515,6 +1759,12 @@ impl Strategy for CrossFundingStrategy {
                     let Some(kind) = kind else {
                         continue;
                     };
+                    let long_key = (row.long.venue.clone(), row.long.symbol.clone());
+                    let short_key = (row.short.venue.clone(), row.short.symbol.clone());
+                    if busy_legs.contains(&long_key) || busy_legs.contains(&short_key) {
+                        debug!("cross_funding {}: 共用的合约有其他行正在下单，暂不触发", row.label);
+                        continue;
+                    }
                     let long_best_ask = long_book.asks.first().unwrap().0;
                     let short_best_bid = short_book.bids.first().unwrap().0;
                     finished |= self.trigger(
@@ -1531,6 +1781,10 @@ impl Strategy for CrossFundingStrategy {
                         order_index,
                         &mut submits,
                     );
+                    if matches!(row.phase, Phase::Submitted { .. }) {
+                        busy_legs.insert(long_key);
+                        busy_legs.insert(short_key);
+                    }
                 }
             }
             if finished {
@@ -2091,5 +2345,184 @@ mod tests {
         assert_eq!(records[1].mode, "live");
         assert_close(records[1].actual_bp.unwrap(), 1.0);
         assert_close(records[1].savings_bp.unwrap(), 0.0);
+    }
+
+    #[test]
+    fn shared_leg_rows_do_not_trigger_concurrently() {
+        let p = CrossFundingParams { live: true, ..params("busy_legs") };
+        let s = strategy(p, direct(), 1.0);
+        let third = Venue::new("bitget_futures");
+        {
+            let mut state = s.state.lock().unwrap();
+            let mut row = state.rows[0].clone();
+            row.label = "#3 test".to_string();
+            row.line = 3;
+            row.long.venue = third.clone();
+            state.rows.push(row);
+            state.book_index.insert((third.clone(), btc()), vec![(1, LegRole::Long)]);
+            state.book_index.get_mut(&(short_venue(), btc())).unwrap().push((1, LegRole::Short));
+        }
+        let phases = |s: &CrossFundingStrategy| {
+            let state = s.state.lock().unwrap();
+            (state.rows[0].phase, state.rows[1].phase)
+        };
+        feed(&s, long_venue(), "100", "100.01");
+        feed(&s, third.clone(), "100", "100.01");
+        feed(&s, short_venue(), "100", "100.01");
+        let (first, second) = phases(&s);
+        assert!(matches!(first, Phase::Submitted { .. }), "{first:?}");
+        assert_eq!(second, Phase::ImmediatePending);
+
+        let ids = {
+            let state = s.state.lock().unwrap();
+            [state.rows[0].long.client_order_id.clone().unwrap(), state.rows[0].short.client_order_id.clone().unwrap()]
+        };
+        for id in ids {
+            s.on_order_event(&OrderEvent::Filled {
+                order_id: OrderId::new(id.clone()),
+                client_order_id: Some(id),
+                filled_qty: Decimal::ONE,
+                avg_price: d("100"),
+            });
+        }
+        assert_eq!(phases(&s).0, Phase::Done);
+        assert!(s.state.lock().unwrap().busy_legs.is_empty());
+        feed(&s, short_venue(), "100", "100.01");
+        let (_, second) = phases(&s);
+        assert!(matches!(second, Phase::Submitted { .. }), "{second:?}");
+        let _ = records(&s);
+    }
+
+    fn rows(lines: &str) -> Vec<PairRow> {
+        parse_pairs_csv(&format!("long_venue,long_symbol,short_venue,short_symbol,quantity\n{lines}")).unwrap()
+    }
+
+    fn positions(entries: &[(&str, &str, &str, &str)]) -> HashMap<(Venue, Symbol), Decimal> {
+        entries
+            .iter()
+            .map(|(venue, native, base, coins)| {
+                let leg = LegSpec::new(venue, native).unwrap();
+                assert_eq!(leg.symbol.base.as_ref(), *base);
+                ((leg.venue(), leg.symbol), d(coins))
+            })
+            .collect()
+    }
+
+    const ONE_ROWS: &str = "okx,ONE-USDT-SWAP,gate,ONE_USDT,24400\n\
+                            binance,ONEUSDT,gate,ONE_USDT,23790\n\
+                            bitget,ONEUSDT,gate,ONE_USDT,23810\n";
+
+    #[test]
+    fn classify_shared_short_leg_opens_remaining_rows() {
+        let rows = rows(ONE_ROWS);
+        let pos = positions(&[
+            ("okx", "ONE-USDT-SWAP", "ONE", "24400"),
+            ("binance", "ONEUSDT", "ONE", "0"),
+            ("bitget", "ONEUSDT", "ONE", "0"),
+            ("gate", "ONE_USDT", "ONE", "-24400"),
+        ]);
+        assert_eq!(
+            classify_rows(&rows, &pos),
+            vec![RowPositionStatus::Opened, RowPositionStatus::Flat, RowPositionStatus::Flat]
+        );
+    }
+
+    #[test]
+    fn classify_shared_leg_partial_and_over() {
+        let rows = rows(ONE_ROWS);
+        let pos = positions(&[
+            ("okx", "ONE-USDT-SWAP", "ONE", "10000"),
+            ("binance", "ONEUSDT", "ONE", "30000"),
+            ("bitget", "ONEUSDT", "ONE", "23810"),
+            ("gate", "ONE_USDT", "ONE", "-63810"),
+        ]);
+        assert_eq!(
+            classify_rows(&rows, &pos),
+            vec![
+                RowPositionStatus::Partial { long: d("10000"), short: d("-10000") },
+                RowPositionStatus::Over { long: d("30000"), short: d("-30000") },
+                RowPositionStatus::Opened,
+            ]
+        );
+    }
+
+    #[test]
+    fn classify_shared_leg_mismatch_invalidates_all_users() {
+        let rows = rows(ONE_ROWS);
+        let pos = positions(&[
+            ("okx", "ONE-USDT-SWAP", "ONE", "24400"),
+            ("binance", "ONEUSDT", "ONE", "0"),
+            ("bitget", "ONEUSDT", "ONE", "0"),
+            ("gate", "ONE_USDT", "ONE", "-20000"),
+        ]);
+        let statuses = classify_rows(&rows, &pos);
+        assert!(statuses.iter().all(|s| matches!(s, RowPositionStatus::Invalid(r) if r.contains("共享腿"))), "{statuses:?}");
+
+        // 共享腿查询失败同样无法归属
+        let mut pos = pos;
+        pos.remove(&(Venue::new("gate_futures"), Symbol::new("ONE", "USDT")));
+        assert!(classify_rows(&rows, &pos).iter().all(|s| matches!(s, RowPositionStatus::Invalid(_))));
+    }
+
+    #[test]
+    fn classify_shared_long_leg_agpu() {
+        let rows = rows("gate,AGPU_USDT,bitget,AGPUUSDT,5.7\nbinance,AGPUUSDT,bitget,AGPUUSDT,5.7\n");
+        let pos = positions(&[
+            ("gate", "AGPU_USDT", "AGPU", "5.7"),
+            ("binance", "AGPUUSDT", "AGPU", "0"),
+            ("bitget", "AGPUUSDT", "AGPU", "-5.7"),
+        ]);
+        assert_eq!(classify_rows(&rows, &pos), vec![RowPositionStatus::Opened, RowPositionStatus::Flat]);
+    }
+
+    #[test]
+    fn classify_independent_rows() {
+        let rows = rows(
+            "bitget,FUTUUSDT,gate,FUTUON_USDT,0.49\n\
+             bitget,SIRENUSDT,gate,SIREN_USDT,1800\n\
+             binance,BTCUSDT,okx,BTC-USDT-SWAP,1\n\
+             binance,ETHUSDT,okx,ETH-USDT-SWAP,1\n",
+        );
+        let pos = positions(&[
+            ("bitget", "FUTUUSDT", "FUTU", "0"),
+            ("gate", "FUTUON_USDT", "FUTUON", "0"),
+            ("bitget", "SIRENUSDT", "SIREN", "1800"),
+            ("gate", "SIREN_USDT", "SIREN", "-1800"),
+            ("binance", "BTCUSDT", "BTC", "0"),
+            ("okx", "BTC-USDT-SWAP", "BTC", "-1"),
+            ("binance", "ETHUSDT", "ETH", "-1"),
+            ("okx", "ETH-USDT-SWAP", "ETH", "1"),
+        ]);
+        let statuses = classify_rows(&rows, &pos);
+        assert_eq!(statuses[0], RowPositionStatus::Flat);
+        assert_eq!(statuses[1], RowPositionStatus::Opened);
+        assert_eq!(statuses[2], RowPositionStatus::Partial { long: d("0"), short: d("-1") });
+        assert!(matches!(&statuses[3], RowPositionStatus::Invalid(r) if r.contains("方向")), "{:?}", statuses[3]);
+    }
+
+    #[test]
+    fn classify_rejects_ambiguous_structures() {
+        // 两腿都共享
+        let rows_a = rows(
+            "binance,BTCUSDT,okx,BTC-USDT-SWAP,1\n\
+             binance,BTCUSDT,gate,BTC_USDT,1\n\
+             bitget,BTCUSDT,okx,BTC-USDT-SWAP,1\n",
+        );
+        let pos = positions(&[
+            ("binance", "BTCUSDT", "BTC", "0"),
+            ("okx", "BTC-USDT-SWAP", "BTC", "0"),
+            ("gate", "BTC_USDT", "BTC", "0"),
+            ("bitget", "BTCUSDT", "BTC", "0"),
+        ]);
+        let statuses = classify_rows(&rows_a, &pos);
+        assert!(matches!(&statuses[0], RowPositionStatus::Invalid(r) if r.contains("两腿")), "{statuses:?}");
+
+        // 配对重复
+        let rows_b = rows("binance,BTCUSDT,okx,BTC-USDT-SWAP,1\nbinance,BTCUSDT,okx,BTC-USDT-SWAP,2\n");
+        assert!(classify_rows(&rows_b, &pos).iter().all(|s| matches!(s, RowPositionStatus::Invalid(_))));
+
+        // 同一合约在不同行方向相反
+        let rows_c = rows("binance,BTCUSDT,okx,BTC-USDT-SWAP,1\nokx,BTC-USDT-SWAP,gate,BTC_USDT,1\n");
+        assert!(classify_rows(&rows_c, &pos).iter().all(|s| matches!(s, RowPositionStatus::Invalid(r) if r.contains("既做多又做空"))));
     }
 }
