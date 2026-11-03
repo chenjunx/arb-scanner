@@ -1115,6 +1115,8 @@ impl CrossFundingStrategy {
         kind: TriggerKind,
         spreads: LiveSpreads,
         execution: BookExecution,
+        long_book: &OrderBookLevels,
+        short_book: &OrderBookLevels,
         long_best_ask: Decimal,
         short_best_bid: Decimal,
         now: u64,
@@ -1158,6 +1160,19 @@ impl CrossFundingStrategy {
             self.complete(row, now);
             return true;
         }
+
+        info!(
+            "cross_funding {}: 下单前盘口 long={} {} local_age={}ms {} | short={} {} local_age={}ms {}",
+            row.label,
+            row.long.venue,
+            row.long.symbol,
+            now.saturating_sub(long_book.ts_ms),
+            describe_order_book(long_book, None, long_book.bids.len().max(long_book.asks.len())),
+            row.short.venue,
+            row.short.symbol,
+            now.saturating_sub(short_book.ts_ms),
+            describe_order_book(short_book, None, short_book.bids.len().max(short_book.asks.len())),
+        );
 
         let long_id = new_client_order_id();
         let mut short_id = new_client_order_id();
@@ -1508,6 +1523,8 @@ impl Strategy for CrossFundingStrategy {
                         kind,
                         spreads,
                         execution,
+                        long_book,
+                        short_book,
                         long_best_ask,
                         short_best_bid,
                         now,
