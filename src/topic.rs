@@ -395,7 +395,7 @@ mod report_tests {
 
     fn snapshot(id: &str, body: &str) -> ReportEvent {
         ReportEvent::Snapshot {
-            strategy_id: id.to_string(),
+            source_id: id.to_string(),
             at_ms: 1,
             section: ReportSectionOutput { title: id.to_string(), body: body.to_string() },
         }
@@ -408,8 +408,8 @@ mod report_tests {
         bus.publish(Topic::report(), snapshot("s", "body"));
         let (topic, event) = stream.next().await.unwrap();
         assert_eq!(topic, Topic::Report);
-        let ReportEvent::Snapshot { strategy_id, section, .. } = event;
-        assert_eq!(strategy_id, "s");
+        let ReportEvent::Snapshot { source_id, section, .. } = event;
+        assert_eq!(source_id, "s");
         assert_eq!(section.body, "body");
     }
 

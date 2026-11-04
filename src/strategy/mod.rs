@@ -18,7 +18,7 @@ use crate::order::types::{OrderAmount, OrderSide};
 use crate::order_manager::types::{
     AnyOrderRequest, CancelRequest, OrderEvent, OrderKind, OrderRequest, TransferRequest,
 };
-use crate::report::{ReportEvent, ReportSectionOutput};
+use crate::report::ReportEvent;
 use crate::topic::{BoxTopicStream, Topic, TopicBus};
 use crate::types::{Quote, Symbol, Venue};
 
@@ -340,11 +340,7 @@ pub trait Strategy: Send + Sync {
     /// 最新一份，下次出报告时作为一节输出(标题用 `self.name()`)。没有订阅者时
     /// 消息直接丢弃，不影响策略。
     fn publish_report_snapshot(&self, body: String) {
-        let section = ReportSectionOutput { title: self.name().to_string(), body };
-        self.bus().publish(
-            Topic::report(),
-            ReportEvent::Snapshot { strategy_id: self.name().to_string(), at_ms: now_ms(), section },
-        );
+        self.bus().publish(Topic::report(), ReportEvent::snapshot(self.name(), self.name(), body));
     }
 
     /// 生成 client_order_id，带随机后缀避免同一策略在同一毫秒内提交多笔订单时

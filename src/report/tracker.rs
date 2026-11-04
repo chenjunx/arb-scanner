@@ -20,7 +20,7 @@ use super::types::{Report, ReportSectionOutput};
 /// 警告并继续尝试其它 channel，不影响下一轮报告生成。
 ///
 /// 调用 [`Self::with_bus`] 后还会订阅 `Topic::report()`：各策略发布的状态快照
-/// 按 `strategy_id` 只保留最新一份，每次出报告时跟在各 section 后面输出。
+/// 按 `source_id` 只保留最新一份，每次出报告时跟在各 section 后面输出。
 pub struct ReportTracker {
     core: Core,
     events: Option<BoxTopicStream<ReportEvent>>,
@@ -57,8 +57,8 @@ impl ReportTracker {
                 tokio::select! {
                     biased;
                     event = next_event(&mut events) => match event {
-                        Some(ReportEvent::Snapshot { strategy_id, at_ms, section }) => {
-                            snapshots.insert(strategy_id, (at_ms, section));
+                        Some(ReportEvent::Snapshot { source_id, at_ms, section }) => {
+                            snapshots.insert(source_id, (at_ms, section));
                         }
                         None => events = None,
                     },
@@ -201,7 +201,7 @@ mod tests {
 
     fn snapshot(id: &str, at_ms: u64, body: &str) -> ReportEvent {
         ReportEvent::Snapshot {
-            strategy_id: id.to_string(),
+            source_id: id.to_string(),
             at_ms,
             section: ReportSectionOutput { title: id.to_string(), body: body.to_string() },
         }
