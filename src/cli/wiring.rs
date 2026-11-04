@@ -193,7 +193,7 @@ pub async fn build_manual_pipeline(
     };
     let (position_manager, portfolio_manager) = build_portfolio_stack(redis_url, quote_cache)?;
     if let Some(interval) = services.report_interval {
-        spawn_report_tracker(redis_url, portfolio_manager, interval)?;
+        spawn_report_tracker(redis_url, portfolio_manager, interval, Some(&bus))?;
         info!("periodic report enabled, interval_secs={}", interval.as_secs());
     }
     if let Some(funding) = services.funding {
@@ -496,10 +496,15 @@ pub fn bare_manual_strategy() -> ManualStrategy {
 /// 起定期报告任务：`PortfolioSection` + `OrderSection` 两个板块，输出到
 /// `LogChannel`。`report` 子命令和 `monitor`(未加 `--no-portfolio`)装的是完全
 /// 同一套，以前两边各抄了一遍。
+///
+/// `bus` 为 `Some` 时同时订阅 `Topic::report()`，把本进程里各策略发布的状态
+/// 快照一并输出；调用方必须在策略开始发布之前调用本函数。独立的 `report`
+/// 子命令和策略不在同一个进程，传 `None`。
 pub fn spawn_report_tracker(
     redis_url: &str,
     portfolio_manager: Arc<PortfolioManager>,
     interval: Duration,
+    bus: Option<&TopicBus>,
 ) -> anyhow::Result<()> {
     let order_store: Arc<dyn OrderStore> =
         Arc::new(RedisOrderStore::new(redis_url).context("failed to connect RedisOrderStore to redis")?);
@@ -510,8 +515,19 @@ pub fn spawn_report_tracker(
     ];
     let channels: Vec<Arc<dyn crate::report::ReportChannel>> = vec![Arc::new(crate::report::channels::LogChannel)];
 
-    Arc::new(crate::report::ReportTracker::new(sections, channels, interval)).spawn();
+    let mut tracker = crate::report::ReportTracker::new(sections, channels, interval);
+    if let Some(bus) = bus {
+        tracker = tracker.with_bus(bus);
+    }
+    tracker.spawn();
     Ok(())
+}
+
+/// 只输出策略状态快照的定期报告：没有持仓/订单板块，不连 Redis。模拟盘(不下单、
+/// 没有 Redis 里的仓位)用它看策略自己的状态。同样要在策略开始发布前调用。
+pub fn spawn_strategy_report_tracker(bus: &TopicBus, interval: Duration) {
+    let channels: Vec<Arc<dyn crate::report::ReportChannel>> = vec![Arc::new(crate::report::channels::LogChannel)];
+    crate::report::ReportTracker::new(Vec::new(), channels, interval).with_bus(bus).spawn();
 }
 
 /// `monitor`(未加 `--no-portfolio`)和 `accounting` 都要建的币安 U 本位合约资金费

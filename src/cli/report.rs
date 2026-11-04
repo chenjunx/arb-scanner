@@ -31,7 +31,7 @@ pub async fn run(args: ReportArgs) -> anyhow::Result<()> {
     info!("report: connecting to redis at {redis_url}");
     let (_position_manager, portfolio_manager) = wiring::build_portfolio_stack(&redis_url, Arc::new(DashMap::new()))?;
 
-    wiring::spawn_report_tracker(&redis_url, portfolio_manager, Duration::from_secs(interval_secs))?;
+    wiring::spawn_report_tracker(&redis_url, portfolio_manager, Duration::from_secs(interval_secs), None)?;
 
     info!("report: reporting every interval_secs={interval_secs}, press ctrl-c to stop");
     tokio::signal::ctrl_c().await.context("failed to listen for ctrl-c")?;

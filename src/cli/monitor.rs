@@ -289,7 +289,7 @@ pub async fn run(args: MonitorArgs) -> anyhow::Result<()> {
             },
         )?;
 
-        wiring::spawn_report_tracker(&redis_url, portfolio_manager, Duration::from_secs(report_interval_secs))?;
+        wiring::spawn_report_tracker(&redis_url, portfolio_manager, Duration::from_secs(report_interval_secs), Some(&bus))?;
 
         info!(
             "monitor: portfolio tracking enabled funding_interval_secs={funding_interval_secs} funding_initial_lookback_hours={funding_initial_lookback_hours} report_interval_secs={report_interval_secs}"

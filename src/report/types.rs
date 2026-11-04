@@ -1,4 +1,5 @@
 /// 单个 `ReportSection` 渲染出的一节内容，`body` 是已经格式化好的多行文本。
+#[derive(Debug, Clone)]
 pub struct ReportSectionOutput {
     pub title: String,
     pub body: String,

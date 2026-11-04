@@ -11,6 +11,7 @@ use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 use crate::accounting::balance_stream::BalanceUpdate;
 use crate::market_data::orderbook::OrderBookLevels;
 use crate::order_manager::types::{AnyOrderRequest, CancelRequest, OrderEvent};
+use crate::report::ReportEvent;
 use crate::types::{Quote, Symbol, Venue};
 
 const CHANNEL_CAPACITY: usize = 1024;
@@ -34,6 +35,8 @@ pub enum Topic {
     OrderEvent { strategy_id: String },
     /// 余额变动事件：venue 级别，payload=`BalanceUpdate`
     BalanceUpdate { venue: Venue },
+    /// 策略状态快照：策略 -> `ReportTracker`，全局单一 topic，payload=`ReportEvent`
+    Report,
 }
 
 impl fmt::Display for Topic {
@@ -46,6 +49,7 @@ impl fmt::Display for Topic {
             Self::OrderCancel => write!(f, "orders.cancel"),
             Self::OrderEvent { strategy_id } => write!(f, "events.order.{}", strategy_id),
             Self::BalanceUpdate { venue } => write!(f, "balance.{}", venue),
+            Self::Report => write!(f, "report"),
         }
     }
 }
@@ -79,6 +83,10 @@ impl Topic {
 
     pub fn balance_update(venue: Venue) -> Self {
         Self::BalanceUpdate { venue }
+    }
+
+    pub fn report() -> Self {
+        Self::Report
     }
 }
 
@@ -119,6 +127,7 @@ pub struct TopicBus {
     order_cancel_channel: broadcast::Sender<CancelRequest>,
     order_event_channels: DashMap<String, broadcast::Sender<OrderEvent>>,
     balance_update_channels: DashMap<Venue, broadcast::Sender<BalanceUpdate>>,
+    report_channel: broadcast::Sender<ReportEvent>,
 }
 
 impl TopicBus {
@@ -132,6 +141,7 @@ impl TopicBus {
             order_cancel_channel: broadcast::channel(CHANNEL_CAPACITY).0,
             order_event_channels: DashMap::new(),
             balance_update_channels: DashMap::new(),
+            report_channel: broadcast::channel(CHANNEL_CAPACITY).0,
         }
     }
 
@@ -349,5 +359,76 @@ impl BusMessage for BalanceUpdate {
             warn!("TopicBus::subscribe: topic {topic} does not carry BalanceUpdate data");
             Box::pin(futures_util::stream::empty())
         }
+    }
+}
+
+impl BusMessage for ReportEvent {
+    fn publish(bus: &TopicBus, topic: Topic, data: Self) {
+        match topic {
+            Topic::Report => {
+                let _ = bus.report_channel.send(data);
+            }
+            _ => warn!("TopicBus::publish: topic {topic} does not carry ReportEvent data"),
+        }
+    }
+
+    fn subscribe(bus: &TopicBus, topic: Topic) -> BoxTopicStream<Self> {
+        match topic {
+            Topic::Report => {
+                let receiver = bus.report_channel.subscribe();
+                Box::pin(lagged_filter_map(topic, receiver))
+            }
+            _ => {
+                warn!("TopicBus::subscribe: topic {topic} does not carry ReportEvent data");
+                Box::pin(futures_util::stream::empty())
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod report_tests {
+    use futures_util::StreamExt;
+
+    use super::*;
+    use crate::report::ReportSectionOutput;
+
+    fn snapshot(id: &str, body: &str) -> ReportEvent {
+        ReportEvent::Snapshot {
+            strategy_id: id.to_string(),
+            at_ms: 1,
+            section: ReportSectionOutput { title: id.to_string(), body: body.to_string() },
+        }
+    }
+
+    #[tokio::test]
+    async fn report_event_round_trips() {
+        let bus = TopicBus::new();
+        let mut stream = bus.subscribe::<ReportEvent>(Topic::report());
+        bus.publish(Topic::report(), snapshot("s", "body"));
+        let (topic, event) = stream.next().await.unwrap();
+        assert_eq!(topic, Topic::Report);
+        let ReportEvent::Snapshot { strategy_id, section, .. } = event;
+        assert_eq!(strategy_id, "s");
+        assert_eq!(section.body, "body");
+    }
+
+    #[tokio::test]
+    async fn publish_without_subscriber_is_dropped() {
+        let bus = TopicBus::new();
+        bus.publish(Topic::report(), snapshot("s", "lost"));
+        let mut stream = bus.subscribe::<ReportEvent>(Topic::report());
+        bus.publish(Topic::report(), snapshot("s", "kept"));
+        let (_, event) = stream.next().await.unwrap();
+        let ReportEvent::Snapshot { section, .. } = event;
+        assert_eq!(section.body, "kept");
+    }
+
+    #[tokio::test]
+    async fn wrong_topic_is_ignored() {
+        let bus = TopicBus::new();
+        let mut stream = bus.subscribe::<ReportEvent>(Topic::order_submit());
+        bus.publish(Topic::order_submit(), snapshot("s", "x"));
+        assert!(stream.next().await.is_none());
     }
 }

@@ -32,7 +32,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -72,6 +72,8 @@ const WAIT_HORIZON_MS: u64 = HORIZON_HOURS as u64 * HOUR_MS;
 const TABLE_STALE_MS: u64 = 8 * 24 * HOUR_MS;
 /// kill switch 文件多久查一次。
 const KILL_SWITCH_POLL_MS: u64 = 1_000;
+/// 状态快照发布到报告总线的最小间隔；行结束/下单/订单事件时不受限制。
+const REPORT_SNAPSHOT_INTERVAL_MS: u64 = 30_000;
 
 /// 一期已知局限，启动日志和复盘报告都会原样打印。
 pub const KNOWN_LIMITATIONS: &str = "\
@@ -819,6 +821,8 @@ struct RowState {
     /// t0 决策记录，结果记录在它基础上补齐。
     record: Option<OrderRecord>,
     trigger: Option<TriggerInfo>,
+    /// 这一行停止(`Halted`)的原因，只用于状态快照。
+    halt_reason: Option<String>,
 }
 
 impl RowState {
@@ -848,6 +852,14 @@ struct State {
     /// 已下单、还没两腿都成交的合约。共享腿(如多行都在 Gate 做空 ONE)同一时间只让
     /// 一行下单，避免两行的成交混在同一个持仓里分不清。行停止(`Halted`)时不释放。
     busy_legs: HashSet<(Venue, Symbol)>,
+    /// CSV 里没有进入 `rows` 的行(已开仓、持仓对不上、没通过检查等)，只用于状态快照。
+    excluded: Vec<ExcludedRow>,
+}
+
+/// 启动时没有纳入交易的一行。
+struct ExcludedRow {
+    label: String,
+    reason: String,
 }
 
 /// 一次下单动作，在锁外发布。
@@ -883,6 +895,8 @@ pub struct CrossFundingStrategy {
     /// 未对冲敞口超限后置位，所有行不再下单。
     halted: AtomicBool,
     kill_switch: Mutex<KillSwitch>,
+    /// 上次发布状态快照的时间，用来节流。
+    snapshot_last_ms: AtomicU64,
 }
 
 impl CrossFundingStrategy {
@@ -906,6 +920,7 @@ impl CrossFundingStrategy {
             order_book_log: OrderBookLogThrottle::new(ORDER_BOOK_LOG_INTERVAL_MS),
             halted: AtomicBool::new(false),
             kill_switch: Mutex::new(KillSwitch::default()),
+            snapshot_last_ms: AtomicU64::new(0),
         }
     }
 
@@ -1099,6 +1114,7 @@ impl CrossFundingStrategy {
             phase: Phase::AwaitingT0,
             record: None,
             trigger: None,
+            halt_reason: None,
         })
     }
 
@@ -1429,6 +1445,7 @@ impl CrossFundingStrategy {
             return;
         }
         row.phase = Phase::Halted;
+        row.halt_reason = Some(reason.to_string());
         if let Some(record) = self.result_record(row, &format!("halted: {reason}"), now) {
             append_record(&self.params.record_file, &record);
         }
@@ -1526,6 +1543,118 @@ impl CrossFundingStrategy {
     }
 }
 
+impl CrossFundingStrategy {
+    /// 把各行状态渲染成文本快照发布到 `Topic::report()`。`force = false` 时按
+    /// `REPORT_SNAPSHOT_INTERVAL_MS` 节流。不能在持有 `self.state` 锁时调用。
+    fn publish_snapshot(&self, force: bool) {
+        let now = now_ms();
+        if !force && now.saturating_sub(self.snapshot_last_ms.load(Ordering::Relaxed)) < REPORT_SNAPSHOT_INTERVAL_MS {
+            return;
+        }
+        self.snapshot_last_ms.store(now, Ordering::Relaxed);
+        let books = self.latest_order_books.lock().unwrap().clone();
+        let body = {
+            let guard = self.state.lock().unwrap();
+            render_snapshot(
+                &guard.rows,
+                &guard.excluded,
+                &books,
+                now,
+                self.params.quote_max_age_ms,
+                self.halted.load(Ordering::SeqCst),
+                self.mode(),
+            )
+        };
+        self.publish_report_snapshot(body);
+    }
+}
+
+fn phase_text(phase: Phase, now_ms: u64) -> String {
+    match phase {
+        Phase::AwaitingT0 => "等待报价".to_string(),
+        Phase::ImmediatePending => "立即开仓(等盘口)".to_string(),
+        Phase::Waiting { target_bp, deadline_ms } => format!(
+            "等待价差 ≤ {target_bp:.2}bp (剩余 {:.1}h)",
+            deadline_ms.saturating_sub(now_ms) as f64 / HOUR_MS as f64
+        ),
+        Phase::Submitted { at_ms } => format!("已下单 ({}s 前)", now_ms.saturating_sub(at_ms) / 1000),
+        Phase::Done => "已完成".to_string(),
+        Phase::Halted => "已停止".to_string(),
+        Phase::Skipped => "不开仓".to_string(),
+    }
+}
+
+fn render_snapshot(
+    rows: &[RowState],
+    excluded: &[ExcludedRow],
+    books: &HashMap<(Venue, Symbol), OrderBookLevels>,
+    now_ms: u64,
+    max_age_ms: u64,
+    halted: bool,
+    mode: &str,
+) -> String {
+    let count = |f: fn(Phase) -> bool| rows.iter().filter(|r| f(r.phase)).count();
+    let waiting = count(|p| matches!(p, Phase::AwaitingT0 | Phase::ImmediatePending | Phase::Waiting { .. }));
+    let submitted = count(|p| matches!(p, Phase::Submitted { .. }));
+    let done = count(|p| p == Phase::Done);
+    let halted_rows = count(|p| p == Phase::Halted);
+    let skipped = count(|p| p == Phase::Skipped);
+    let unhedged: Decimal = rows.iter().map(RowState::unhedged_usdt).sum();
+
+    let mut out = format!(
+        "mode={mode} 全局停止={} 行数={} | 等待 {waiting} 已下单 {submitted} 完成 {done} 停止 {halted_rows} 不开仓 {skipped} 未纳入 {} | 未对冲敞口 {} USDT",
+        if halted { "是" } else { "否" },
+        rows.len(),
+        excluded.len(),
+        unhedged.round_dp(2).normalize(),
+    );
+    for row in rows {
+        let spreads = match (
+            books.get(&(row.long.venue.clone(), row.long.symbol.clone())),
+            books.get(&(row.short.venue.clone(), row.short.symbol.clone())),
+        ) {
+            (Some(long_book), Some(short_book)) => {
+                let top = order_book_spreads(long_book, short_book, &row.long.spec, &row.short.spec, now_ms, max_age_ms);
+                let exec = order_book_execution(
+                    long_book,
+                    short_book,
+                    row.long.order_qty,
+                    row.short.order_qty,
+                    &row.long.spec,
+                    &row.short.spec,
+                    now_ms,
+                    max_age_ms,
+                );
+                format!(
+                    "盘口价差 {}bp 中间价 {}bp 吃单VWAP {}bp",
+                    fmt_opt(top.map(|s| s.exec_bp)),
+                    fmt_opt(top.map(|s| s.mid_bp)),
+                    fmt_opt(exec.map(|e| e.exec_bp)),
+                )
+            }
+            _ => "无盘口".to_string(),
+        };
+        let leg = |leg: &LegState| match leg.fill() {
+            Some((coins, price)) => format!("{} {} 成交 {} @ {price:.6}", leg.venue, leg.symbol, coins.normalize()),
+            None => format!("{} {} 未成交", leg.venue, leg.symbol),
+        };
+        out.push_str(&format!(
+            "\n{} [{}] {}\n    多: {}\n    空: {}",
+            row.label,
+            phase_text(row.phase, now_ms),
+            spreads,
+            leg(&row.long),
+            leg(&row.short),
+        ));
+        if let Some(reason) = &row.halt_reason {
+            out.push_str(&format!("\n    停止原因: {reason}"));
+        }
+    }
+    for ex in excluded {
+        out.push_str(&format!("\n{} [未纳入] {}", ex.label, ex.reason));
+    }
+    out
+}
 fn fmt_opt(x: Option<f64>) -> String {
     x.map(|x| format!("{x:.4}")).unwrap_or_else(|| "-".to_string())
 }
@@ -1583,13 +1712,16 @@ impl Strategy for CrossFundingStrategy {
         }
 
         let mut prepared = Vec::new();
+        let mut excluded: Vec<ExcludedRow> = Vec::new();
         let (mut opened, mut partial, mut over, mut invalid, mut failed) = (0, 0, 0, 0, 0);
         for (row, status) in self.rows.iter().zip(&statuses) {
+            let mut exclude = |reason: String| excluded.push(ExcludedRow { label: row.label(), reason });
             match status {
                 RowPositionStatus::Flat => {}
                 RowPositionStatus::Opened => {
                     opened += 1;
                     info!("cross_funding {}: 已按目标仓位 {} 币开过仓，跳过", row.label(), row.quantity.normalize());
+                    exclude(format!("{status}，目标 {} 币", row.quantity.normalize()));
                     continue;
                 }
                 RowPositionStatus::Partial { .. } => {
@@ -1599,6 +1731,7 @@ impl Strategy for CrossFundingStrategy {
                         row.label(),
                         row.quantity.normalize()
                     );
+                    exclude(format!("{status}，目标 {} 币，不补差额", row.quantity.normalize()));
                     continue;
                 }
                 RowPositionStatus::Over { .. } => {
@@ -1608,11 +1741,13 @@ impl Strategy for CrossFundingStrategy {
                         row.label(),
                         row.quantity.normalize()
                     );
+                    exclude(format!("{status}，目标 {} 币，不减仓", row.quantity.normalize()));
                     continue;
                 }
                 RowPositionStatus::Invalid(_) => {
                     invalid += 1;
                     warn!("cross_funding {}: {status}，跳过；请人工核对", row.label());
+                    exclude(status.to_string());
                     continue;
                 }
             }
@@ -1622,11 +1757,13 @@ impl Strategy for CrossFundingStrategy {
                     "cross_funding {}: Redis 里没有生效的 k* 表({key})，跳过；先 cross-funding-kstar calibrate 再 approve",
                     row.label()
                 );
+                exclude("Redis 里没有生效的 k* 表".to_string());
                 failed += 1;
                 continue;
             };
             if table.pair != key {
                 error!("cross_funding {}: k* 表属于 {}，和本行 {key} 不一致，跳过", row.label(), table.pair);
+                exclude(format!("k* 表属于 {}，和本行不一致", table.pair));
                 failed += 1;
                 continue;
             }
@@ -1645,6 +1782,7 @@ impl Strategy for CrossFundingStrategy {
                 Err(err) => {
                     failed += 1;
                     warn!("cross_funding {}: 跳过: {err:#}", row.label());
+                    exclude(format!("未通过检查: {err:#}"));
                 }
             }
         }
@@ -1664,14 +1802,18 @@ impl Strategy for CrossFundingStrategy {
         );
         self.kill_switch_active(now);
 
-        let mut state = self.state.lock().unwrap();
-        for (idx, row) in prepared.into_iter().enumerate() {
-            for (role, leg) in [(LegRole::Long, &row.long), (LegRole::Short, &row.short)] {
-                state.book_index.entry((leg.venue.clone(), leg.symbol.clone())).or_default().push((idx, role));
-                subscriber.subscribe_order_book(Topic::order_book(leg.venue.clone(), leg.symbol.clone()));
+        {
+            let mut state = self.state.lock().unwrap();
+            state.excluded = excluded;
+            for (idx, row) in prepared.into_iter().enumerate() {
+                for (role, leg) in [(LegRole::Long, &row.long), (LegRole::Short, &row.short)] {
+                    state.book_index.entry((leg.venue.clone(), leg.symbol.clone())).or_default().push((idx, role));
+                    subscriber.subscribe_order_book(Topic::order_book(leg.venue.clone(), leg.symbol.clone()));
+                }
+                state.rows.push(row);
             }
-            state.rows.push(row);
         }
+        self.publish_snapshot(true);
         Ok(())
     }
 
@@ -1689,9 +1831,9 @@ impl Strategy for CrossFundingStrategy {
         let paused = self.kill_switch_active(now);
         let books = self.latest_order_books.lock().unwrap().clone();
         let mut submits = Vec::new();
-        {
+        let finished = {
             let mut guard = self.state.lock().unwrap();
-            let State { rows, book_index, order_index, busy_legs } = &mut *guard;
+            let State { rows, book_index, order_index, busy_legs, .. } = &mut *guard;
             let mut finished = false;
             for row in rows.iter_mut() {
                 if let Phase::Submitted { at_ms } = row.phase
@@ -1790,8 +1932,10 @@ impl Strategy for CrossFundingStrategy {
             if finished {
                 self.check_unhedged(rows);
             }
-        }
+            finished
+        };
 
+        let force_snapshot = finished || !submits.is_empty();
         for submit in submits {
             info!(
                 "cross_funding: 提交市价单 {} {} {:?} qty={} client_order_id={}",
@@ -1807,6 +1951,7 @@ impl Strategy for CrossFundingStrategy {
                 None,
             );
         }
+        self.publish_snapshot(force_snapshot);
     }
 
     fn on_quote(&self, _topic: &Topic, _quote: &Quote) {}
@@ -1837,6 +1982,7 @@ impl Strategy for CrossFundingStrategy {
             }
             other => debug!("cross_funding: 订单事件 {other:?}"),
         }
+        self.publish_snapshot(true);
     }
 }
 
@@ -2089,6 +2235,7 @@ mod tests {
             phase: Phase::AwaitingT0,
             record: None,
             trigger: None,
+            halt_reason: None,
         };
         let mut state = strategy.state.lock().unwrap();
         state.book_index.insert((long_venue(), btc()), vec![(0, LegRole::Long)]);
@@ -2123,6 +2270,40 @@ mod tests {
 
     fn phase(strategy: &CrossFundingStrategy) -> Phase {
         strategy.state.lock().unwrap().rows[0].phase
+    }
+
+    #[test]
+    fn snapshot_renders_summary_spread_and_halt_reason() {
+        let s = strategy(params("snapshot"), direct(), 1.0);
+        let now = now_ms();
+        let mk = |bid: &str, ask: &str| OrderBookLevels {
+            bids: Arc::new(vec![(d(bid), Decimal::from(100))]),
+            asks: Arc::new(vec![(d(ask), Decimal::from(100))]),
+            ts_ms: now,
+        };
+        let mut books = HashMap::new();
+        books.insert((long_venue(), btc()), mk("99", "100"));
+        books.insert((short_venue(), btc()), mk("101", "102"));
+        let mut guard = s.state.lock().unwrap();
+        guard.rows[0].phase = Phase::Halted;
+        guard.rows[0].halt_reason = Some("成交超时".to_string());
+        guard.excluded.push(ExcludedRow { label: "#3 x".to_string(), reason: "已持仓".to_string() });
+        let text = render_snapshot(&guard.rows, &guard.excluded, &books, now, 5_000, false, "paper");
+        assert!(text.contains("mode=paper"), "{text}");
+        assert!(text.contains("停止 1"), "{text}");
+        assert!(text.contains("未纳入 1"), "{text}");
+        assert!(text.contains("盘口价差 -100.0000bp") || text.contains("盘口价差"), "{text}");
+        assert!(text.contains("停止原因: 成交超时"), "{text}");
+        assert!(text.contains("#3 x [未纳入] 已持仓"), "{text}");
+    }
+
+    #[test]
+    fn snapshot_without_books_says_so() {
+        let s = strategy(params("snapshot_nobook"), direct(), 1.0);
+        let guard = s.state.lock().unwrap();
+        let text = render_snapshot(&guard.rows, &guard.excluded, &HashMap::new(), now_ms(), 5_000, false, "live");
+        assert!(text.contains("无盘口"), "{text}");
+        assert!(text.contains("等待报价"), "{text}");
     }
 
     fn records(strategy: &CrossFundingStrategy) -> Vec<OrderRecord> {

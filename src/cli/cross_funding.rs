@@ -337,6 +337,9 @@ pub async fn run(args: CrossFundingArgs) -> anyhow::Result<()> {
         (Some(pipeline.order_manager), pipeline.stream_handles)
     } else {
         info!("cross_funding: 模拟盘模式，不下单；加 --live 才会真实下单");
+        if args.report_interval_secs > 0 {
+            wiring::spawn_strategy_report_tracker(&bus, Duration::from_secs(args.report_interval_secs));
+        }
         (None, Vec::new())
     };
 
