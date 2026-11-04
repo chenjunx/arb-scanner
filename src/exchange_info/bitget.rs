@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::time::Duration;
 
 use anyhow::Context;
@@ -7,9 +8,11 @@ use serde::Deserialize;
 
 use crate::types::{Symbol, Venue};
 
-use super::ExchangeInfoProvider;
 use super::binance::binance_perp_contract_spec;
-use super::types::{MarketPrecision, PerpContractSpec, QtyPrecision, TradingFee};
+use super::types::{
+    FundingRateRecord, MarketPrecision, PerpContractSpec, PredictedFundingRate, QtyPrecision, TradingFee,
+};
+use super::{ExchangeInfoProvider, FundingRateProvider};
 
 const HOST: &str = "https://api.bitget.com";
 /// Bitget v2 合约接口里 USDT 本位永续的 `productType`。
@@ -90,6 +93,151 @@ impl ExchangeInfoProvider for BitgetExchangeInfoProvider {
     }
 }
 
+/// `/api/v2/mix/market/history-fund-rate` 的 `pageSize` 上限。
+const FUNDING_HISTORY_PAGE_SIZE: usize = 100;
+const DEFAULT_FUND_INTERVAL_HOURS: u32 = 8;
+
+#[async_trait]
+impl FundingRateProvider for BitgetExchangeInfoProvider {
+    fn venue(&self) -> Venue {
+        self.venue.clone()
+    }
+
+    /// `/api/v2/mix/market/history-fund-rate` 按时间倒序、按 `pageNo` 翻页，
+    /// 没有时间范围参数：翻到最老一条越过 `start_time_ms` 或页不满为止，再按
+    /// 毫秒边界过滤。
+    async fn funding_rate_history(
+        &self,
+        symbol: &Symbol,
+        start_time_ms: u64,
+        end_time_ms: Option<u64>,
+    ) -> anyhow::Result<Vec<FundingRateRecord>> {
+        let mut records = Vec::new();
+        let mut page_no = 1usize;
+        loop {
+            let page = self.funding_history_page(symbol, page_no, FUNDING_HISTORY_PAGE_SIZE).await?;
+            let full = page.len() >= FUNDING_HISTORY_PAGE_SIZE;
+            let oldest = page.iter().map(|r| r.funding_time_ms).min();
+            records.extend(page);
+            match oldest {
+                Some(oldest) if full && oldest > start_time_ms => page_no += 1,
+                _ => break,
+            }
+        }
+        records.retain(|r| r.funding_time_ms >= start_time_ms && end_time_ms.is_none_or(|end| r.funding_time_ms <= end));
+        records.sort_by_key(|r| r.funding_time_ms);
+        records.dedup_by_key(|r| r.funding_time_ms);
+        Ok(records)
+    }
+
+    async fn recent_funding_rates(&self, symbol: &Symbol, limit: usize) -> anyhow::Result<Vec<FundingRateRecord>> {
+        self.funding_history_page(symbol, 1, limit.clamp(1, FUNDING_HISTORY_PAGE_SIZE)).await
+    }
+
+    /// `tickers` 一次返回全部合约的当前 `fundingRate`，但没有结算周期和下次结算
+    /// 时间；周期取自 `contracts` 的 `fundInterval`(小时)，下次结算时间按周期对齐
+    /// 到 UTC 整点边界推算(Bitget 结算点是 UTC 0/8/16 时这类对齐时刻)。
+    async fn predicted_funding_rates(&self) -> anyhow::Result<Vec<PredictedFundingRate>> {
+        let query = [("productType", BITGET_USDT_FUTURES.to_string())];
+        let tickers = self.public_get("/api/v2/mix/market/tickers", &query).await?;
+        let contracts = self.public_get("/api/v2/mix/market/contracts", &query).await?;
+        parse_predicted_funding_rates(&tickers, &contracts, now_ms())
+    }
+}
+
+impl BitgetExchangeInfoProvider {
+    async fn funding_history_page(
+        &self,
+        symbol: &Symbol,
+        page_no: usize,
+        page_size: usize,
+    ) -> anyhow::Result<Vec<FundingRateRecord>> {
+        let query = [
+            ("symbol", bitget_symbol(symbol)),
+            ("productType", BITGET_USDT_FUTURES.to_string()),
+            ("pageSize", page_size.to_string()),
+            ("pageNo", page_no.to_string()),
+        ];
+        let text = self.public_get("/api/v2/mix/market/history-fund-rate", &query).await?;
+        parse_funding_rate_history(&text, symbol)
+    }
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or_default()
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FundingHistoryEntry {
+    #[serde(default)]
+    funding_rate: String,
+    #[serde(default)]
+    funding_time: String,
+}
+
+/// 返回按时间升序。
+fn parse_funding_rate_history(text: &str, symbol: &Symbol) -> anyhow::Result<Vec<FundingRateRecord>> {
+    let entries: Vec<FundingHistoryEntry> = parse_bitget_data(text, "history-fund-rate")?;
+    let mut records: Vec<FundingRateRecord> = entries
+        .into_iter()
+        .filter_map(|e| {
+            Some(FundingRateRecord {
+                symbol: symbol.clone(),
+                rate: opt_decimal(&e.funding_rate)?,
+                funding_time_ms: e.funding_time.parse().ok()?,
+            })
+        })
+        .collect();
+    records.sort_by_key(|r| r.funding_time_ms);
+    Ok(records)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TickerEntry {
+    symbol: String,
+    #[serde(default)]
+    funding_rate: String,
+}
+
+fn parse_predicted_funding_rates(
+    tickers_text: &str,
+    contracts_text: &str,
+    now_ms: u64,
+) -> anyhow::Result<Vec<PredictedFundingRate>> {
+    let tickers: Vec<TickerEntry> = parse_bitget_data(tickers_text, "tickers")?;
+    let contracts: Vec<ContractEntry> = parse_bitget_data(contracts_text, "contracts")?;
+    let intervals: HashMap<String, u32> = contracts
+        .into_iter()
+        .filter(|c| c.symbol_status.is_empty() || c.symbol_status == "normal")
+        .filter(|c| c.symbol_type.is_empty() || c.symbol_type == "perpetual")
+        .filter(|c| c.quote_coin.eq_ignore_ascii_case("USDT"))
+        .map(|c| {
+            let hours = c.fund_interval.parse::<u32>().ok().filter(|h| *h > 0).unwrap_or(DEFAULT_FUND_INTERVAL_HOURS);
+            (c.symbol.to_ascii_uppercase(), hours)
+        })
+        .collect();
+    Ok(tickers
+        .into_iter()
+        .filter_map(|t| {
+            let name = t.symbol.to_ascii_uppercase();
+            let hours = *intervals.get(&name)?;
+            let base = name.strip_suffix("USDT").filter(|b| !b.is_empty())?;
+            let interval_ms = u64::from(hours) * 3_600_000;
+            Some(PredictedFundingRate {
+                symbol: Symbol::new(base, "USDT"),
+                rate: opt_decimal(&t.funding_rate)?,
+                next_funding_time_ms: (now_ms / interval_ms + 1) * interval_ms,
+                funding_interval_hours: hours,
+            })
+        })
+        .collect())
+}
+
 /// `BTC/USDT` → `BTCUSDT`。
 pub fn bitget_symbol(symbol: &Symbol) -> String {
     format!("{}{}", symbol.base, symbol.quote).to_ascii_uppercase()
@@ -138,6 +286,8 @@ struct ContractEntry {
     symbol_status: String,
     #[serde(default)]
     symbol_type: String,
+    #[serde(default)]
+    fund_interval: String,
 }
 
 fn decimal_places_step(places: &str) -> Option<Decimal> {
@@ -206,6 +356,41 @@ mod tests {
         assert_eq!(precisions[1].symbol, Symbol::new("1000BONK", "USDT"));
         assert_eq!(precisions[1].market, QtyPrecision { qty_step: d("1"), min_qty: d("10") });
         assert_eq!(precisions[1].price_tick, d("0.000005"));
+    }
+
+    #[test]
+    fn parses_funding_history_ascending() {
+        let text = r#"{"code":"00000","msg":"success","data":[
+            {"symbol":"BTCUSDT","fundingRate":"0.0001","fundingTime":"1789689600000"},
+            {"symbol":"BTCUSDT","fundingRate":"-0.0003","fundingTime":"1789660800000"}
+        ]}"#;
+        let records = parse_funding_rate_history(text, &Symbol::new("BTC", "USDT")).unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!((records[0].funding_time_ms, records[0].rate), (1789660800000, d("-0.0003")));
+        assert_eq!((records[1].funding_time_ms, records[1].rate), (1789689600000, d("0.0001")));
+    }
+
+    #[test]
+    fn parses_predicted_rates_using_contract_interval_and_aligned_next_time() {
+        let tickers = r#"{"code":"00000","msg":"success","data":[
+            {"symbol":"BTCUSDT","fundingRate":"0.0001"},
+            {"symbol":"LPTUSDT","fundingRate":"-0.0005"},
+            {"symbol":"OLDUSDT","fundingRate":"0.0001"}
+        ]}"#;
+        let contracts = r#"{"code":"00000","msg":"success","data":[
+            {"symbol":"BTCUSDT","quoteCoin":"USDT","fundInterval":"8","symbolStatus":"normal","symbolType":"perpetual"},
+            {"symbol":"LPTUSDT","quoteCoin":"USDT","fundInterval":"4","symbolStatus":"normal","symbolType":"perpetual"},
+            {"symbol":"OLDUSDT","quoteCoin":"USDT","fundInterval":"8","symbolStatus":"off","symbolType":"perpetual"}
+        ]}"#;
+        // 1789715993000 = 某日 07:19:53 UTC 附近，下一个 8h 边界 1789718400000，4h 边界同。
+        let rates = parse_predicted_funding_rates(tickers, contracts, 1_789_715_993_000).unwrap();
+        assert_eq!(rates.len(), 2);
+        assert_eq!(rates[0].symbol, Symbol::new("BTC", "USDT"));
+        assert_eq!(rates[0].funding_interval_hours, 8);
+        assert_eq!(rates[0].next_funding_time_ms % (8 * 3_600_000), 0);
+        assert!(rates[0].next_funding_time_ms > 1_789_715_993_000);
+        assert_eq!(rates[1].funding_interval_hours, 4);
+        assert_eq!(rates[1].rate, d("-0.0005"));
     }
 
     #[test]

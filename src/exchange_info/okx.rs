@@ -7,8 +7,10 @@ use serde::Deserialize;
 
 use crate::types::{Symbol, Venue};
 
-use super::ExchangeInfoProvider;
-use super::types::{MarketPrecision, PerpContractSpec, QtyPrecision, TradingFee};
+use super::types::{
+    FundingRateRecord, MarketPrecision, PerpContractSpec, PredictedFundingRate, QtyPrecision, TradingFee,
+};
+use super::{ExchangeInfoProvider, FundingRateProvider};
 
 const HOST: &str = "https://www.okx.com";
 
@@ -81,6 +83,126 @@ impl ExchangeInfoProvider for OkxExchangeInfoProvider {
         let text = self.public_get("/api/v5/public/instruments", &query).await?;
         parse_perp_contract_spec(&text, symbol)
     }
+}
+
+/// `/api/v5/public/funding-rate-history` 单页上限(新文档写 400，旧文档 100，取小的)。
+const FUNDING_HISTORY_PAGE_LIMIT: usize = 100;
+
+#[async_trait]
+impl FundingRateProvider for OkxExchangeInfoProvider {
+    fn venue(&self) -> Venue {
+        self.venue.clone()
+    }
+
+    /// `/api/v5/public/funding-rate-history` 按时间倒序返回，`after` 取"早于该
+    /// 时间戳"的记录，所以用最老一条的 `fundingTime` 往前翻，直到越过
+    /// `start_time_ms` 或翻到空页。OKX 只保留最近约 3 个月的历史。
+    async fn funding_rate_history(
+        &self,
+        symbol: &Symbol,
+        start_time_ms: u64,
+        end_time_ms: Option<u64>,
+    ) -> anyhow::Result<Vec<FundingRateRecord>> {
+        let inst_id = okx_swap_inst_id(symbol);
+        let mut after = end_time_ms.map(|end| end + 1);
+        let mut records = Vec::new();
+        loop {
+            let mut query = vec![("instId", inst_id.clone()), ("limit", FUNDING_HISTORY_PAGE_LIMIT.to_string())];
+            if let Some(after) = after {
+                query.push(("after", after.to_string()));
+            }
+            let text = self.public_get("/api/v5/public/funding-rate-history", &query).await?;
+            let page = parse_funding_rate_history(&text, symbol)?;
+            let Some(oldest) = page.iter().map(|r| r.funding_time_ms).min() else { break };
+            records.extend(page);
+            if oldest <= start_time_ms || after.is_some_and(|a| oldest >= a) {
+                break;
+            }
+            after = Some(oldest);
+        }
+        records.retain(|r| r.funding_time_ms >= start_time_ms && end_time_ms.is_none_or(|end| r.funding_time_ms <= end));
+        records.sort_by_key(|r| r.funding_time_ms);
+        records.dedup_by_key(|r| r.funding_time_ms);
+        Ok(records)
+    }
+
+    async fn recent_funding_rates(&self, symbol: &Symbol, limit: usize) -> anyhow::Result<Vec<FundingRateRecord>> {
+        let query = [
+            ("instId", okx_swap_inst_id(symbol)),
+            ("limit", limit.clamp(1, FUNDING_HISTORY_PAGE_LIMIT).to_string()),
+        ];
+        let text = self.public_get("/api/v5/public/funding-rate-history", &query).await?;
+        parse_funding_rate_history(&text, symbol)
+    }
+
+    /// `instId=ANY` 一次返回全部永续：`fundingRate` 是将在 `fundingTime` 结算的
+    /// 费率，结算周期用 `nextFundingTime - fundingTime` 推出。
+    async fn predicted_funding_rates(&self) -> anyhow::Result<Vec<PredictedFundingRate>> {
+        let text = self.public_get("/api/v5/public/funding-rate", &[("instId", "ANY".to_string())]).await?;
+        parse_predicted_funding_rates(&text)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FundingHistoryEntry {
+    #[serde(default)]
+    funding_rate: String,
+    #[serde(default)]
+    realized_rate: String,
+    funding_time: String,
+}
+
+/// 取 `realizedRate`(实际结算值)；缺失时退回 `fundingRate`(结算前的预测值)。
+/// 返回按时间升序。
+fn parse_funding_rate_history(text: &str, symbol: &Symbol) -> anyhow::Result<Vec<FundingRateRecord>> {
+    let entries: Vec<FundingHistoryEntry> = parse_okx_data(text, "funding-rate-history")?;
+    let mut records: Vec<FundingRateRecord> = entries
+        .into_iter()
+        .filter_map(|e| {
+            Some(FundingRateRecord {
+                symbol: symbol.clone(),
+                rate: opt_decimal(&e.realized_rate).or_else(|| opt_decimal(&e.funding_rate))?,
+                funding_time_ms: e.funding_time.parse().ok()?,
+            })
+        })
+        .collect();
+    records.sort_by_key(|r| r.funding_time_ms);
+    Ok(records)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FundingRateEntry {
+    inst_id: String,
+    #[serde(default)]
+    funding_rate: String,
+    #[serde(default)]
+    funding_time: String,
+    #[serde(default)]
+    next_funding_time: String,
+}
+
+fn parse_predicted_funding_rates(text: &str) -> anyhow::Result<Vec<PredictedFundingRate>> {
+    let entries: Vec<FundingRateEntry> = parse_okx_data(text, "funding-rate")?;
+    Ok(entries
+        .into_iter()
+        .filter_map(|e| {
+            let symbol = parse_okx_swap_inst_id(&e.inst_id).filter(|s| s.quote.as_ref() == "USDT")?;
+            let funding_time_ms: u64 = e.funding_time.parse().ok()?;
+            let next_ms: u64 = e.next_funding_time.parse().ok()?;
+            let interval_hours = (next_ms.checked_sub(funding_time_ms)? as f64 / 3_600_000.0).round() as u32;
+            if interval_hours == 0 {
+                return None;
+            }
+            Some(PredictedFundingRate {
+                symbol,
+                rate: opt_decimal(&e.funding_rate)?,
+                next_funding_time_ms: funding_time_ms,
+                funding_interval_hours: interval_hours,
+            })
+        })
+        .collect())
 }
 
 /// `BTC/USDT` → `BTC-USDT-SWAP`。
@@ -243,6 +365,35 @@ mod tests {
         let spec = parse_perp_contract_spec(INSTRUMENTS, &Symbol::new("BTC", "USDT")).unwrap();
         assert_eq!(spec.qty_unit, d("0.01"));
         assert!(parse_perp_contract_spec(INSTRUMENTS, &Symbol::new("ETH", "USDT")).is_err());
+    }
+
+    #[test]
+    fn parses_funding_history_ascending_preferring_realized_rate() {
+        let text = r#"{"code":"0","msg":"","data":[
+            {"instId":"BTC-USDT-SWAP","fundingRate":"0.0002","realizedRate":"0.0001","fundingTime":"1789689600000"},
+            {"instId":"BTC-USDT-SWAP","fundingRate":"-0.0003","realizedRate":"","fundingTime":"1789660800000"}
+        ]}"#;
+        let records = parse_funding_rate_history(text, &Symbol::new("BTC", "USDT")).unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!((records[0].funding_time_ms, records[0].rate), (1789660800000, d("-0.0003")));
+        assert_eq!((records[1].funding_time_ms, records[1].rate), (1789689600000, d("0.0001")));
+    }
+
+    #[test]
+    fn parses_predicted_rates_deriving_interval_and_filtering() {
+        let text = r#"{"code":"0","msg":"","data":[
+            {"instId":"BTC-USDT-SWAP","fundingRate":"0.0001","fundingTime":"1789718400000","nextFundingRate":"0.0002","nextFundingTime":"1789747200000"},
+            {"instId":"LPT-USDT-SWAP","fundingRate":"-0.0005","fundingTime":"1789718400000","nextFundingRate":"","nextFundingTime":"1789732800000"},
+            {"instId":"BTC-USD-SWAP","fundingRate":"0.0001","fundingTime":"1789718400000","nextFundingRate":"","nextFundingTime":"1789747200000"},
+            {"instId":"BTC-USDT-250627","fundingRate":"","fundingTime":"","nextFundingRate":"","nextFundingTime":""}
+        ]}"#;
+        let rates = parse_predicted_funding_rates(text).unwrap();
+        assert_eq!(rates.len(), 2);
+        assert_eq!(rates[0].symbol, Symbol::new("BTC", "USDT"));
+        assert_eq!(rates[0].rate, d("0.0001"));
+        assert_eq!(rates[0].next_funding_time_ms, 1789718400000);
+        assert_eq!(rates[0].funding_interval_hours, 8);
+        assert_eq!(rates[1].funding_interval_hours, 4);
     }
 
     #[test]
