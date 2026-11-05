@@ -74,6 +74,10 @@ const TABLE_STALE_MS: u64 = 8 * 24 * HOUR_MS;
 const KILL_SWITCH_POLL_MS: u64 = 1_000;
 /// 状态快照发布到报告总线的最小间隔；行结束/下单/订单事件时不受限制。
 const REPORT_SNAPSHOT_INTERVAL_MS: u64 = 30_000;
+/// Target 触发前的持续性确认：可成交价差要连续达标至少这么久……
+const TARGET_CONFIRM_MS: u64 = 1_000;
+/// ……并且期间至少收到这么多帧新的两腿盘口(两个条件同时满足)。
+const TARGET_CONFIRM_TICKS: u32 = 3;
 
 /// 一期已知局限，启动日志和复盘报告都会原样打印。
 pub const KNOWN_LIMITATIONS: &str = "\
@@ -767,6 +771,53 @@ fn waiting_trigger(phase: Phase, exec_bp: f64, now_ms: u64) -> Option<TriggerKin
     }
 }
 
+/// Target 触发的持续性确认窗口：从第一帧达标盘口起算。
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct TargetConfirm {
+    first_ms: u64,
+    ticks: u32,
+    /// 上一次计数的两腿盘口时间戳，同一份快照被另一条腿的推送重复触发时不重复计数。
+    last_book_ts: (u64, u64),
+}
+
+/// Target 触发前的持续性确认，避免被一帧瞬间错位的盘口(比如只有极少量挂单的
+/// 薄档)触发市价单。`target_met` 为这一帧可成交价差是否达标：不达标(或
+/// 盘口深度不足/过期等拿不到价差)就清零重来；连续达标满足 `TARGET_CONFIRM_MS` 且
+/// 收到 `TARGET_CONFIRM_TICKS` 帧新盘口才返回 true，并清掉窗口。触发用的是
+/// 当前这一帧，不是窗口第一帧。
+fn confirm_target(
+    label: &str,
+    slot: &mut Option<TargetConfirm>,
+    target_met: bool,
+    long_ts_ms: u64,
+    short_ts_ms: u64,
+    now_ms: u64,
+) -> bool {
+    if !target_met {
+        if let Some(c) = slot.take() {
+            info!(
+                "cross_funding {label}: 目标价差确认中断，已持续 {}ms / {} 帧，重新计时",
+                now_ms.saturating_sub(c.first_ms),
+                c.ticks
+            );
+        }
+        return false;
+    }
+    let book_ts = (long_ts_ms, short_ts_ms);
+    let c = slot.get_or_insert(TargetConfirm { first_ms: now_ms, ticks: 0, last_book_ts: (0, 0) });
+    if c.ticks == 0 || c.last_book_ts != book_ts {
+        c.ticks += 1;
+        c.last_book_ts = book_ts;
+    }
+    let held_ms = now_ms.saturating_sub(c.first_ms);
+    if c.ticks >= TARGET_CONFIRM_TICKS && held_ms >= TARGET_CONFIRM_MS {
+        info!("cross_funding {label}: 目标价差已连续达标 {held_ms}ms / {} 帧，确认触发", c.ticks);
+        *slot = None;
+        return true;
+    }
+    false
+}
+
 #[derive(Debug, Clone)]
 struct LegState {
     venue: Venue,
@@ -821,6 +872,8 @@ struct RowState {
     /// t0 决策记录，结果记录在它基础上补齐。
     record: Option<OrderRecord>,
     trigger: Option<TriggerInfo>,
+    /// Target 触发的持续性确认窗口，见 `confirm_target`。
+    confirm: Option<TargetConfirm>,
     /// 这一行停止(`Halted`)的原因，只用于状态快照。
     halt_reason: Option<String>,
 }
@@ -1114,6 +1167,7 @@ impl CrossFundingStrategy {
             phase: Phase::AwaitingT0,
             record: None,
             trigger: None,
+            confirm: None,
             halt_reason: None,
         })
     }
@@ -1836,6 +1890,9 @@ impl Strategy for CrossFundingStrategy {
             let State { rows, book_index, order_index, busy_legs, .. } = &mut *guard;
             let mut finished = false;
             for row in rows.iter_mut() {
+                if paused || self.halted.load(Ordering::SeqCst) {
+                    row.confirm = None;
+                }
                 if let Phase::Submitted { at_ms } = row.phase
                     && now.saturating_sub(at_ms) > self.params.fill_timeout_ms
                 {
@@ -1860,6 +1917,7 @@ impl Strategy for CrossFundingStrategy {
                         books.get(&(row.long.venue.clone(), row.long.symbol.clone())),
                         books.get(&(row.short.venue.clone(), row.short.symbol.clone())),
                     ) else {
+                        row.confirm = None;
                         continue;
                     };
                     let Some(top_spreads) = order_book_spreads(
@@ -1870,6 +1928,7 @@ impl Strategy for CrossFundingStrategy {
                         now,
                         self.params.quote_max_age_ms,
                     ) else {
+                        row.confirm = None;
                         continue;
                     };
 
@@ -1890,6 +1949,7 @@ impl Strategy for CrossFundingStrategy {
                         self.params.quote_max_age_ms,
                     ) else {
                         debug!("cross_funding {}: 盘口深度不足，暂不触发", row.label);
+                        confirm_target(&row.label, &mut row.confirm, false, 0, 0, now);
                         continue;
                     };
                     let spreads = LiveSpreads { exec_bp: execution.exec_bp, mid_bp: top_spreads.mid_bp };
@@ -1897,6 +1957,23 @@ impl Strategy for CrossFundingStrategy {
                         Phase::ImmediatePending => Some(TriggerKind::Immediate),
                         phase @ Phase::Waiting { .. } => waiting_trigger(phase, execution.exec_bp, now),
                         _ => None,
+                    };
+                    // Target 要先过持续性确认；Expiry/Immediate 本来就没有价差条件。
+                    let kind = match kind {
+                        Some(TriggerKind::Target) => confirm_target(
+                            &row.label,
+                            &mut row.confirm,
+                            true,
+                            long_book.ts_ms,
+                            short_book.ts_ms,
+                            now,
+                        )
+                        .then_some(TriggerKind::Target),
+                        Some(other) => Some(other),
+                        None => {
+                            confirm_target(&row.label, &mut row.confirm, false, 0, 0, now);
+                            None
+                        }
                     };
                     let Some(kind) = kind else {
                         continue;
@@ -2235,6 +2312,7 @@ mod tests {
             phase: Phase::AwaitingT0,
             record: None,
             trigger: None,
+            confirm: None,
             halt_reason: None,
         };
         let mut state = strategy.state.lock().unwrap();
@@ -2340,7 +2418,9 @@ mod tests {
         // −1bp 还不够
         feed(&s, long_venue(), "99.98", "99.99");
         assert!(matches!(phase(&s), Phase::Waiting { .. }));
-        // 多腿 ask 99.97 → −3bp ≤ −2bp 触发，模拟盘直接成交
+        // 多腿 ask 99.97 → −3bp ≤ −2bp 达标；已有足够久的确认窗口，这一帧触发，模拟盘直接成交
+        s.state.lock().unwrap().rows[0].confirm =
+            Some(TargetConfirm { first_ms: now_ms() - 2 * TARGET_CONFIRM_MS, ticks: TARGET_CONFIRM_TICKS - 1, last_book_ts: (0, 0) });
         feed(&s, long_venue(), "99.96", "99.97");
         assert_eq!(phase(&s), Phase::Done);
 
@@ -2361,6 +2441,60 @@ mod tests {
         assert_close(result.savings_bp.unwrap(), 4.0);
         assert_close(result.long_slippage_bp.unwrap(), 0.0);
         assert_eq!(result.residual_coins, Some(Decimal::ZERO));
+    }
+
+    #[test]
+    fn single_frame_target_does_not_trigger_and_break_resets_confirm() {
+        let s = strategy(params("confirm"), BinAction::Wait { k_star: 2.0, note: None }, 1.0);
+        feed(&s, long_venue(), "100", "100.01");
+        feed(&s, short_venue(), "100", "100.01");
+        assert!(matches!(phase(&s), Phase::Waiting { .. }));
+
+        // −3bp 达标，但只有一帧：不触发，开始计时
+        feed(&s, long_venue(), "99.96", "99.97");
+        assert!(matches!(phase(&s), Phase::Waiting { .. }));
+        assert_eq!(s.state.lock().unwrap().rows[0].confirm.map(|c| c.ticks), Some(1));
+
+        // 价差回到不达标：清零
+        feed(&s, long_venue(), "100", "100.01");
+        assert!(matches!(phase(&s), Phase::Waiting { .. }));
+        assert_eq!(s.state.lock().unwrap().rows[0].confirm, None);
+        assert_eq!(records(&s).len(), 1);
+    }
+
+    #[test]
+    fn confirm_target_needs_both_duration_and_ticks() {
+        let mut slot = None;
+        // 第 1、2 帧：时间不够
+        assert!(!confirm_target("t", &mut slot, true, 1, 1, 10_000));
+        assert!(!confirm_target("t", &mut slot, true, 2, 1, 10_100));
+        // 同一份快照重复推送不计数，时间够了但只有 2 帧
+        assert!(!confirm_target("t", &mut slot, true, 2, 1, 11_500));
+        assert_eq!(slot.map(|c| c.ticks), Some(2));
+        // 第 3 帧：两个条件都满足
+        assert!(confirm_target("t", &mut slot, true, 3, 1, 11_600));
+        assert_eq!(slot, None);
+    }
+
+    #[test]
+    fn confirm_target_ticks_met_but_too_short_does_not_confirm() {
+        let mut slot = None;
+        for (i, now) in [10_000, 10_100, 10_200].into_iter().enumerate() {
+            assert!(!confirm_target("t", &mut slot, true, i as u64 + 1, 1, now));
+        }
+        assert_eq!(slot.map(|c| c.ticks), Some(3));
+        assert!(confirm_target("t", &mut slot, true, 4, 1, 11_000));
+    }
+
+    #[test]
+    fn confirm_target_resets_when_not_met() {
+        let mut slot = None;
+        assert!(!confirm_target("t", &mut slot, true, 1, 1, 10_000));
+        assert!(!confirm_target("t", &mut slot, false, 0, 0, 10_100));
+        assert_eq!(slot, None);
+        // 重新从头计时
+        assert!(!confirm_target("t", &mut slot, true, 2, 1, 12_000));
+        assert_eq!(slot.map(|c| (c.first_ms, c.ticks)), Some((12_000, 1)));
     }
 
     #[test]
