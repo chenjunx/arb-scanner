@@ -33,6 +33,11 @@ pub struct ReconcileOrderArgs {
     #[arg(long)]
     pub order_id: String,
 
+    /// 手工指定交易所订单号(币安后台查到的 orderId)：Redis 里的订单丢了
+    /// exchange_order_id(下单回执没落库)时用；Redis 里已有时以这里为准
+    #[arg(long)]
+    pub exchange_order_id: Option<String>,
+
     /// 使用币安测试网
     #[arg(long)]
     pub testnet: bool,
@@ -43,7 +48,7 @@ pub struct ReconcileOrderArgs {
 }
 
 pub async fn run(args: ReconcileOrderArgs) -> anyhow::Result<()> {
-    let ReconcileOrderArgs { order_id, testnet, confirm } = args;
+    let ReconcileOrderArgs { order_id, exchange_order_id: exchange_order_id_override, testnet, confirm } = args;
     let order_id = OrderId::new(order_id);
 
     let redis_url = wiring::redis_url();
@@ -65,10 +70,9 @@ pub async fn run(args: ReconcileOrderArgs) -> anyhow::Result<()> {
         trade.venue, trade.symbol, order.status, order.filled_qty, order.avg_price, order.exchange_order_id
     );
 
-    let exchange_order_id = order
-        .exchange_order_id
-        .clone()
-        .with_context(|| format!("order {order_id} 没有 exchange_order_id，无法通过 REST 核对"))?;
+    let exchange_order_id = exchange_order_id_override
+        .or_else(|| order.exchange_order_id.clone())
+        .with_context(|| format!("order {order_id} 没有 exchange_order_id，请用 --exchange-order-id 手工指定"))?;
 
     let proxy = net::proxy_from_env();
     let spot_venue = Venue::new("binance_spot");

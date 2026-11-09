@@ -1,6 +1,8 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
+use rust_decimal::Decimal;
+
 use crate::portfolio::PortfolioManager;
 use crate::report::section::ReportSection;
 
@@ -64,6 +66,18 @@ impl ReportSection for PortfolioSection {
                 pnl.net_pnl,
             ));
         }
+
+        let total_realized: Decimal = all.iter().map(|v| v.realized_pnl).sum();
+        let total_unrealized: Decimal = all.iter().filter_map(|v| v.unrealized_pnl).sum();
+        let unpriced = open.iter().filter(|v| v.unrealized_pnl.is_none()).count();
+        let mut total = format!(
+            "整体合计: realized_pnl={total_realized} unrealized_pnl={total_unrealized} net_pnl={}",
+            total_realized + total_unrealized
+        );
+        if unpriced > 0 {
+            total.push_str(&format!(" (有 {unpriced} 个持仓缺行情，未实现盈亏不含这部分)"));
+        }
+        lines.push(total);
         lines.join("\n")
     }
 }
@@ -121,5 +135,6 @@ mod tests {
         let body = section.render();
         assert!(body.contains("仓位明细:\n  (当前无持仓)"), "body was: {body}");
         assert!(body.contains("BTC: realized_pnl=100"), "body was: {body}");
+        assert!(body.contains("整体合计: realized_pnl=100 unrealized_pnl=0 net_pnl=100"), "body was: {body}");
     }
 }
