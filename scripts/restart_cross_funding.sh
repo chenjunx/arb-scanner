@@ -27,8 +27,12 @@ cd "$ROOT_DIR"
 
 CSV="${CSV:-cross_funding_pairs.csv}"
 CONFIG="${CONFIG:-config.toml}"
-LOG_FILE="${LOG_FILE:-logs/cross_funding.log}"
+LOG_FILE="${LOG_FILE:-logs/cross_funding.out}"   # 启动横幅 + panic 等 stderr
 PID_FILE="${PID_FILE:-logs/cross_funding.pid}"
+# 业务日志由程序按日期滚动: logs/cross_funding.YYYY-MM-DD.log，默认只留 3 天
+export ARB_LOG_DIR="${ARB_LOG_DIR:-logs}"
+export ARB_LOG_PREFIX="${ARB_LOG_PREFIX:-cross_funding}"
+export ARB_LOG_KEEP_DAYS="${ARB_LOG_KEEP_DAYS:-3}"
 STOP_TIMEOUT="${STOP_TIMEOUT:-15}"
 export RUST_LOG="${RUST_LOG:-info}"
 
@@ -148,4 +152,4 @@ if ! kill -0 "$NEW_PID" 2>/dev/null; then
 fi
 
 echo "cross-funding 已启动 ($MODE) pid=$NEW_PID"
-echo "日志: tail -f $LOG_FILE"
+echo "日志: tail -f $ARB_LOG_DIR/$ARB_LOG_PREFIX.$(date +%Y-%m-%d).log (panic/stderr: $LOG_FILE)"

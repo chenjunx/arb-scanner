@@ -26,6 +26,7 @@ ring = "0.17"
 tokio-stream = { version = "0.1", features = ["sync"] }
 flate2 = "1"
 crc32fast = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "test-util", "net", "io-util"] }
