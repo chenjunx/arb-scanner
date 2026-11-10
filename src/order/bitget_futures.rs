@@ -21,7 +21,7 @@ use crate::order_manager::stream::{ExchangeOrderUpdate, OrderStreamSource};
 use crate::types::{Symbol, Venue};
 
 use super::OrderProvider;
-use super::types::{MarginMode, MarketOrderRequest, OrderAmount, OrderResult, OrderSide, OrderStatus};
+use super::types::{LimitOrderRequest, MarginMode, MarketOrderRequest, OrderAmount, OrderResult, OrderSide, OrderStatus};
 
 const HOST: &str = "https://api.bitget.com";
 const WS_HOST: &str = "ws.bitget.com";
@@ -188,6 +188,35 @@ impl OrderProvider for BitgetFuturesOrderProvider {
         parse_place_order_response(&text)
     }
 
+    /// `POST /api/v2/mix/order/place-order`，`orderType=limit`，`force=gtc`；
+    /// `post_only` 时 `force=post_only`。
+    async fn place_limit_order_raw(&self, req: &LimitOrderRequest) -> anyhow::Result<OrderResult> {
+        let body = build_limit_order_body(
+            &req.symbol,
+            req.side,
+            req.quantity,
+            req.price,
+            req.post_only,
+            self.margin_mode,
+            req.client_order_id.as_deref(),
+        )?;
+        let text = self.signed_request(reqwest::Method::POST, "/api/v2/mix/order/place-order", &[], Some(body)).await?;
+        parse_place_order_response(&text)
+    }
+
+    /// `POST /api/v2/mix/order/cancel-order`。只表示撤单指令被接受，终态仍以
+    /// 私有订单流为准。
+    async fn cancel_order(&self, symbol: &Symbol, exchange_order_id: &str) -> anyhow::Result<()> {
+        let body = serde_json::json!({
+            "symbol": bitget_symbol(symbol),
+            "productType": BITGET_USDT_FUTURES,
+            "marginCoin": MARGIN_COIN,
+            "orderId": exchange_order_id,
+        });
+        let text = self.signed_request(reqwest::Method::POST, "/api/v2/mix/order/cancel-order", &[], Some(body)).await?;
+        parse_bitget_data::<serde_json::Value>(&text, "cancel order").map(|_| ())
+    }
+
     /// `GET /api/v2/mix/order/detail?symbol=&productType=&orderId=`。
     async fn query_order(&self, symbol: &Symbol, exchange_order_id: &str) -> anyhow::Result<OrderResult> {
         let symbol = bitget_symbol(symbol);
@@ -265,6 +294,25 @@ fn build_market_order_body(
     if let Some(id) = client_order_id.filter(|id| !id.is_empty()) {
         body["clientOid"] = serde_json::Value::String(id.to_string());
     }
+    Ok(body)
+}
+
+fn build_limit_order_body(
+    symbol: &Symbol,
+    side: OrderSide,
+    quantity: Decimal,
+    price: Decimal,
+    post_only: bool,
+    margin_mode: MarginMode,
+    client_order_id: Option<&str>,
+) -> anyhow::Result<serde_json::Value> {
+    if price <= Decimal::ZERO {
+        anyhow::bail!("bitget order price must be positive, got {price}");
+    }
+    let mut body = build_market_order_body(symbol, side, quantity, margin_mode, client_order_id)?;
+    body["orderType"] = serde_json::Value::String("limit".to_string());
+    body["price"] = serde_json::Value::String(price.normalize().to_string());
+    body["force"] = serde_json::Value::String(if post_only { "post_only" } else { "gtc" }.to_string());
     Ok(body)
 }
 
@@ -710,6 +758,19 @@ mod tests {
             path_with_query("/api/v2/mix/order/detail", &[("symbol", "BTCUSDT"), ("orderId", "1")]),
             "/api/v2/mix/order/detail?symbol=BTCUSDT&orderId=1"
         );
+    }
+
+    #[test]
+    fn builds_limit_order_body_with_post_only() {
+        let symbol = Symbol::new("1000BONK", "USDT");
+        let gtc = build_limit_order_body(&symbol, OrderSide::Buy, Decimal::ONE, "0.0250".parse().unwrap(), false, MarginMode::Cross, None).unwrap();
+        assert_eq!(gtc["orderType"], "limit");
+        assert_eq!(gtc["force"], "gtc");
+        assert_eq!(gtc["price"], "0.025");
+        assert_eq!(gtc["size"], "1");
+        let post_only = build_limit_order_body(&symbol, OrderSide::Sell, Decimal::ONE, Decimal::ONE, true, MarginMode::Cross, None).unwrap();
+        assert_eq!(post_only["force"], "post_only");
+        assert!(build_limit_order_body(&symbol, OrderSide::Buy, Decimal::ONE, Decimal::ZERO, false, MarginMode::Cross, None).is_err());
     }
 
     #[test]

@@ -31,7 +31,12 @@ pub enum OrderKind {
     Market,
     LimitIoc { price: Decimal },
     /// GTC (Good-Til-Cancelled) 限价单，需要主动撤单才会终止。
-    Limit { price: Decimal },
+    Limit {
+        price: Decimal,
+        /// 只做 maker；旧记录没有该字段时按 `false` 处理。
+        #[serde(default)]
+        post_only: bool,
+    },
 }
 
 impl Default for OrderKind {
@@ -297,4 +302,15 @@ pub enum RiskCheckResult {
 pub struct OrderResponse {
     pub order_id: OrderId,
     pub result_rx: oneshot::Receiver<Result<Order, String>>,
+}
+
+#[cfg(test)]
+mod order_kind_tests {
+    use super::*;
+
+    #[test]
+    fn limit_without_post_only_field_deserializes_as_false() {
+        let kind: OrderKind = serde_json::from_str(r#"{"Limit":{"price":"50000"}}"#).unwrap();
+        assert!(matches!(kind, OrderKind::Limit { post_only: false, .. }));
+    }
 }

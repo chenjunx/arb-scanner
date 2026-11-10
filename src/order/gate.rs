@@ -110,7 +110,7 @@ impl OrderProvider for GateOrderProvider {
     }
 
     async fn place_limit_order_raw(&self, req: &LimitOrderRequest) -> anyhow::Result<OrderResult> {
-        let body = build_limit_order_body(&req.symbol, req.side, req.quantity, req.price, req.client_order_id.as_deref());
+        let body = build_limit_order_body(&req.symbol, req.side, req.quantity, req.price, req.post_only, req.client_order_id.as_deref());
         let text = self.signed_request(reqwest::Method::POST, "/spot/orders", &[], Some(body)).await?;
         parse_order_response(&text)
     }
@@ -277,6 +277,7 @@ fn build_limit_order_body(
     side: OrderSide,
     quantity: Decimal,
     price: Decimal,
+    post_only: bool,
     client_order_id: Option<&str>,
 ) -> serde_json::Value {
     let mut body = serde_json::json!({
@@ -285,7 +286,7 @@ fn build_limit_order_body(
         "side": map_side(side),
         "amount": quantity.to_string(),
         "price": price.to_string(),
-        "time_in_force": "gtc",
+        "time_in_force": if post_only { "poc" } else { "gtc" },
     });
     if let Some(text) = gate_client_order_id(client_order_id) {
         body["text"] = serde_json::Value::String(text);
@@ -651,6 +652,15 @@ fn parse_gate_order_update(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn limit_order_body_time_in_force_follows_post_only() {
+        let symbol = Symbol::new("BTC", "USDT");
+        let gtc = build_limit_order_body(&symbol, OrderSide::Buy, Decimal::new(1, 2), Decimal::new(100, 0), false, None);
+        assert_eq!(gtc["time_in_force"], "gtc");
+        let poc = build_limit_order_body(&symbol, OrderSide::Buy, Decimal::new(1, 2), Decimal::new(100, 0), true, None);
+        assert_eq!(poc["time_in_force"], "poc");
+    }
 
     #[test]
     fn gate_sign_changes_with_any_field() {

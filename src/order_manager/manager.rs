@@ -549,7 +549,7 @@ mod tests {
         let order_id = OrderId::new("ORD-GTC");
         let om = manager_with_order(trade_order(
             "ORD-GTC",
-            OrderKind::Limit { price: Decimal::new(50000, 0) },
+            OrderKind::Limit { price: Decimal::new(50000, 0), post_only: false },
             "cid-gtc",
         ));
 

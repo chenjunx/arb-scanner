@@ -177,17 +177,7 @@ impl OrderProvider for BinanceFuturesOrderProvider {
     }
 
     async fn place_limit_order_raw(&self, req: &LimitOrderRequest) -> anyhow::Result<OrderResult> {
-        let mut params = vec![
-            ("symbol".to_string(), binance_symbol(&req.symbol)),
-            ("side".to_string(), map_side(req.side).to_string()),
-            ("type".to_string(), "LIMIT".to_string()),
-            ("timeInForce".to_string(), "GTC".to_string()),
-            ("quantity".to_string(), req.quantity.to_string()),
-            ("price".to_string(), req.price.to_string()),
-            // 默认 LIMIT 单只同步返回 ACK(无成交信息)，和市价单一样必须显式
-            // 要求 RESULT 才能在下单响应里同步拿到 avgPrice/executedQty。
-            ("newOrderRespType".to_string(), "RESULT".to_string()),
-        ];
+        let mut params = build_limit_order_params(req);
         if let Some(client_order_id) = &req.client_order_id {
             params.push(("newClientOrderId".to_string(), client_order_id.clone()));
         }
@@ -514,6 +504,21 @@ fn map_side(side: OrderSide) -> &'static str {
     }
 }
 
+/// 普通限价单参数。`post_only` 在合约上用 `timeInForce=GTX`(Good-Till-Crossing)。
+fn build_limit_order_params(req: &LimitOrderRequest) -> Vec<(String, String)> {
+    vec![
+        ("symbol".to_string(), binance_symbol(&req.symbol)),
+        ("side".to_string(), map_side(req.side).to_string()),
+        ("type".to_string(), "LIMIT".to_string()),
+        ("timeInForce".to_string(), if req.post_only { "GTX" } else { "GTC" }.to_string()),
+        ("quantity".to_string(), req.quantity.to_string()),
+        ("price".to_string(), req.price.to_string()),
+        // 默认 LIMIT 单只同步返回 ACK(无成交信息)，和市价单一样必须显式
+        // 要求 RESULT 才能在下单响应里同步拿到 avgPrice/executedQty。
+        ("newOrderRespType".to_string(), "RESULT".to_string()),
+    ]
+}
+
 /// 限价 IOC 单未成交部分被撤销后，终态是 `"EXPIRED"`(不是 `"CANCELED"`)，
 /// 但 `executedQty`/`avgPrice` 仍带真实已成交量——`Expired` 不代表零成交，
 /// 部分成交后剩余被撤销的 IOC 单也是这个终态。
@@ -781,6 +786,22 @@ fn parse_funding_income(text: &str, symbol: &Symbol) -> anyhow::Result<Vec<Fundi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn limit_order_params_use_gtx_for_post_only() {
+        let req = |post_only| LimitOrderRequest {
+            post_only,
+            symbol: Symbol::new("BTC", "USDT"),
+            side: OrderSide::Buy,
+            quantity: Decimal::new(1, 2),
+            price: Decimal::new(100, 0),
+            client_order_id: None,
+            dry_run: false,
+        };
+        let tif = |p: Vec<(String, String)>| p.into_iter().find(|(k, _)| k == "timeInForce").map(|(_, v)| v);
+        assert_eq!(tif(build_limit_order_params(&req(false))).as_deref(), Some("GTC"));
+        assert_eq!(tif(build_limit_order_params(&req(true))).as_deref(), Some("GTX"));
+    }
     use ring::rand::SystemRandom;
     use ring::signature::{KeyPair, UnparsedPublicKey};
 

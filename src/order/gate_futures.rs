@@ -21,7 +21,7 @@ use crate::types::{Symbol, Venue};
 
 use super::OrderProvider;
 use super::contract_size::ContractSizeCache;
-use super::types::{MarketOrderRequest, OrderAmount, OrderResult, OrderSide, OrderStatus};
+use super::types::{LimitOrderRequest, MarketOrderRequest, OrderAmount, OrderResult, OrderSide, OrderStatus};
 
 const HOST: &str = "https://api.gateio.ws";
 const API_PREFIX: &str = "/api/v4";
@@ -146,6 +146,24 @@ impl OrderProvider for GateFuturesOrderProvider {
         self.contract_sizes.convert_result(&req.symbol, parse_order_response(&text)?).await
     }
 
+    /// `POST /futures/usdt/orders`，限价单 = 正常 `price` + `tif: "gtc"`；
+    /// `post_only` 时 `tif: "poc"`。数量换算同市价单，价格不用换。
+    async fn place_limit_order_raw(&self, req: &LimitOrderRequest) -> anyhow::Result<OrderResult> {
+        let contracts = self.contract_sizes.to_contracts(&req.symbol, req.quantity).await?;
+        let body = build_limit_order_body(&req.symbol, req.side, contracts, req.price, req.post_only, req.client_order_id.as_deref())
+            .with_context(|| format!("{} {} 换算成 {contracts} 张", req.quantity, req.symbol.base))?;
+        let text = self.signed_request(reqwest::Method::POST, "/futures/usdt/orders", "", Some(body)).await?;
+        self.contract_sizes.convert_result(&req.symbol, parse_order_response(&text)?).await
+    }
+
+    /// `DELETE /futures/usdt/orders/{id}`。成功时返回被撤订单，失败返回错误体，
+    /// 只表示撤单指令被接受，终态仍以私有订单流为准。
+    async fn cancel_order(&self, _symbol: &Symbol, exchange_order_id: &str) -> anyhow::Result<()> {
+        let path = format!("/futures/usdt/orders/{exchange_order_id}");
+        let text = self.signed_request(reqwest::Method::DELETE, &path, "", None).await?;
+        parse_order_response(&text).map(|_| ())
+    }
+
     /// `GET /futures/usdt/orders/{id}`，合约订单号全局唯一；symbol 只用来把张数换成币数。
     async fn query_order(&self, symbol: &Symbol, exchange_order_id: &str) -> anyhow::Result<OrderResult> {
         let path = format!("/futures/usdt/orders/{exchange_order_id}");
@@ -239,6 +257,23 @@ fn build_market_order_body(
     if let Some(text) = gate_client_order_id(client_order_id) {
         body["text"] = serde_json::Value::String(text);
     }
+    Ok(body)
+}
+
+fn build_limit_order_body(
+    symbol: &Symbol,
+    side: OrderSide,
+    quantity: Decimal,
+    price: Decimal,
+    post_only: bool,
+    client_order_id: Option<&str>,
+) -> anyhow::Result<serde_json::Value> {
+    if price <= Decimal::ZERO {
+        anyhow::bail!("gate futures order price must be positive, got {price}");
+    }
+    let mut body = build_market_order_body(symbol, side, quantity, client_order_id)?;
+    body["price"] = serde_json::Value::String(price.normalize().to_string());
+    body["tif"] = serde_json::Value::String(if post_only { "poc" } else { "gtc" }.to_string());
     Ok(body)
 }
 
@@ -701,6 +736,19 @@ mod tests {
         let sell = build_market_order_body(&symbol, OrderSide::Sell, Decimal::from(3), None).unwrap();
         assert_eq!(sell["size"], -3);
         assert!(sell.get("text").is_none());
+    }
+
+    #[test]
+    fn builds_limit_order_body_with_post_only() {
+        let symbol = Symbol::new("PEPE", "USDT");
+        let gtc = build_limit_order_body(&symbol, OrderSide::Buy, d("3"), d("0.0000120"), false, None).unwrap();
+        assert_eq!(gtc["tif"], "gtc");
+        assert_eq!(gtc["price"], "0.000012");
+        assert_eq!(gtc["size"], 3);
+        let poc = build_limit_order_body(&symbol, OrderSide::Sell, d("3"), d("1"), true, None).unwrap();
+        assert_eq!(poc["tif"], "poc");
+        assert_eq!(poc["size"], -3);
+        assert!(build_limit_order_body(&symbol, OrderSide::Buy, d("3"), d("0"), false, None).is_err());
     }
 
     #[test]

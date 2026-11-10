@@ -58,7 +58,7 @@ impl ExchangeAdapter {
                 };
                 self.provider.place_limit_ioc_order(req).await
             }
-            OrderKind::Limit { price } => {
+            OrderKind::Limit { price, post_only } => {
                 let OrderAmount::Base(quantity) = trade.amount else {
                     anyhow::bail!("Limit order requires OrderAmount::Base, got {:?}", trade.amount);
                 };
@@ -68,6 +68,7 @@ impl ExchangeAdapter {
                     quantity,
                     price: *price,
                     client_order_id: trade.client_order_id.clone(),
+                    post_only: *post_only,
                     dry_run: false,
                 };
                 self.provider.place_limit_order(req).await

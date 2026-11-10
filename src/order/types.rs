@@ -86,6 +86,8 @@ pub struct LimitOrderRequest {
     pub price: Decimal,
     /// 语义同 `MarketOrderRequest::client_order_id`。
     pub client_order_id: Option<String>,
+    /// 只做 maker：订单若会立即吃单，交易所直接拒绝/取消，不成交。
+    pub post_only: bool,
     /// 语义同 `MarketOrderRequest::dry_run`。
     pub dry_run: bool,
 }

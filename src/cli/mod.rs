@@ -12,6 +12,7 @@ pub mod cross_funding_review;
 pub mod engine_command;
 pub mod monitor;
 pub mod open;
+pub mod probe_post_only;
 pub mod reconcile_order;
 pub mod report;
 pub mod rotate;
@@ -78,6 +79,9 @@ pub enum Command {
     /// 复盘开仓等价差的成交记录：实际节省 vs 期望 B，给出继续/排查/停用结论
     #[command(name = "cross-funding-review")]
     CrossFundingReview(cross_funding_review::CrossFundingReviewArgs),
+    /// 临时：对一家交易所下 post-only 限价单并打印返回/查单/撤单结果
+    #[command(name = "probe-post-only")]
+    ProbePostOnly(probe_post_only::ProbePostOnlyArgs),
 }
 
 /// 解析命令行并执行。参数非法时 clap 会自己打印用法并退出进程。
@@ -100,6 +104,7 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         Some(Command::CrossFunding(args)) => cross_funding::run(args).await,
         Some(Command::CrossFundingKStar(args)) => cross_funding_kstar::run(args).await,
         Some(Command::CrossFundingReview(args)) => cross_funding_review::run(args),
+        Some(Command::ProbePostOnly(args)) => probe_post_only::run(args).await,
         None => engine_command::run(cli.config.as_deref().unwrap_or(DEFAULT_CONFIG_PATH)).await,
     }
 }

@@ -125,6 +125,7 @@ impl OrderProvider for KrakenOrderProvider {
             req.side,
             req.quantity,
             req.price,
+            req.post_only,
             req.client_order_id.as_deref(),
         );
         let result = self.ws.add_order(params).await?;
@@ -323,11 +324,13 @@ fn build_limit_ioc_add_order_params(
 
 /// 组装 WS v2 `add_order` 普通限价单(GTC)参数，同样不含 `token`。GTC 是
 /// Kraken `add_order` 的默认行为，不用像 IOC 那样显式传 `time_in_force`。
+/// `post_only=true` 时带 `post_only: true`，订单若会立即吃单则被交易所拒绝。
 fn build_limit_add_order_params(
     pair: &str,
     side: OrderSide,
     quantity: Decimal,
     price: Decimal,
+    post_only: bool,
     client_order_id: Option<&str>,
 ) -> serde_json::Value {
     let mut params = serde_json::json!({
@@ -337,6 +340,9 @@ fn build_limit_add_order_params(
         "limit_price": decimal_to_json_number(price),
         "symbol": pair,
     });
+    if post_only {
+        params["post_only"] = serde_json::Value::Bool(true);
+    }
     if let Some(client_order_id) = client_order_id {
         params["cl_ord_id"] = serde_json::Value::String(client_order_id.to_string());
     }
@@ -987,6 +993,7 @@ mod tests {
             OrderSide::Buy,
             "0.2".parse().unwrap(),
             "30000".parse().unwrap(),
+            false,
             Some("cid-gtc"),
         );
         assert_eq!(params["order_type"], "limit");
@@ -997,6 +1004,14 @@ mod tests {
         assert_eq!(params["limit_price"], 30000.0);
         assert_eq!(params["cl_ord_id"], "cid-gtc");
         // GTC 是 Kraken add_order 的默认行为，不显式传 time_in_force
+        assert!(params.get("time_in_force").is_none());
+        assert!(params.get("post_only").is_none());
+    }
+
+    #[test]
+    fn builds_limit_add_order_params_post_only() {
+        let params = build_limit_add_order_params("BTC/USD", OrderSide::Buy, "0.2".parse().unwrap(), "30000".parse().unwrap(), true, None);
+        assert_eq!(params["post_only"], true);
         assert!(params.get("time_in_force").is_none());
     }
 

@@ -257,6 +257,7 @@ pub trait Strategy: Send + Sync {
 
     /// 提交 GTC 限价单到风控层：与 `submit_limit_ioc_order` 相同的字段/发布
     /// 逻辑，只是 `order_kind` 换成 `Limit`（挂单直到主动撤单或完全成交）。
+    /// `post_only=true` 时订单若会立即吃单，交易所直接拒绝/取消。
     fn submit_limit_order(
         &self,
         venue: Venue,
@@ -264,6 +265,7 @@ pub trait Strategy: Send + Sync {
         side: OrderSide,
         quantity: Decimal,
         price: Decimal,
+        post_only: bool,
         client_order_id: Option<String>,
         group_id: Option<String>,
         metadata: Option<String>,
@@ -275,7 +277,7 @@ pub trait Strategy: Send + Sync {
             symbol,
             side,
             amount: OrderAmount::Base(quantity),
-            order_kind: OrderKind::Limit { price },
+            order_kind: OrderKind::Limit { price, post_only },
             client_order_id: Some(client_order_id),
             group_id,
             metadata,

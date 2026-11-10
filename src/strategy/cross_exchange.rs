@@ -515,7 +515,7 @@ impl CrossExchangeStrategy {
         );
         drop(pending);
 
-        self.submit_limit_order(execution.secondary_trade_venue.clone(), symbol, secondary_side, qty, price, Some(client_order_id), None, None);
+        self.submit_limit_order(execution.secondary_trade_venue.clone(), symbol, secondary_side, qty, price, true, Some(client_order_id), None, None);
     }
 
     /// 副交易所挂单成交后的对冲：在 Binance Spot 下市价单对冲。跟

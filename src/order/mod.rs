@@ -286,6 +286,7 @@ mod tests {
             side: OrderSide::Buy,
             quantity,
             price,
+            post_only: false,
             client_order_id: None,
             dry_run,
         }

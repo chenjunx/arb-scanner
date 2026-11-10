@@ -148,14 +148,7 @@ impl OrderProvider for BinanceOrderProvider {
     }
 
     async fn place_limit_order_raw(&self, req: &LimitOrderRequest) -> anyhow::Result<OrderResult> {
-        let mut params = vec![
-            ("symbol".to_string(), binance_symbol(&req.symbol)),
-            ("side".to_string(), map_side(req.side).to_string()),
-            ("type".to_string(), "LIMIT".to_string()),
-            ("timeInForce".to_string(), "GTC".to_string()),
-            ("quantity".to_string(), req.quantity.to_string()),
-            ("price".to_string(), req.price.to_string()),
-        ];
+        let mut params = build_limit_order_params(req);
         if let Some(client_order_id) = &req.client_order_id {
             params.push(("newClientOrderId".to_string(), client_order_id.clone()));
         }
@@ -293,6 +286,24 @@ fn map_side(side: OrderSide) -> &'static str {
         OrderSide::Buy => "BUY",
         OrderSide::Sell => "SELL",
     }
+}
+
+/// 普通限价单参数。`post_only` 在现货上是独立订单类型 `LIMIT_MAKER`(不带
+/// `timeInForce`)，会立即吃单时被交易所直接拒绝。
+fn build_limit_order_params(req: &LimitOrderRequest) -> Vec<(String, String)> {
+    let mut params = vec![
+        ("symbol".to_string(), binance_symbol(&req.symbol)),
+        ("side".to_string(), map_side(req.side).to_string()),
+    ];
+    if req.post_only {
+        params.push(("type".to_string(), "LIMIT_MAKER".to_string()));
+    } else {
+        params.push(("type".to_string(), "LIMIT".to_string()));
+        params.push(("timeInForce".to_string(), "GTC".to_string()));
+    }
+    params.push(("quantity".to_string(), req.quantity.to_string()));
+    params.push(("price".to_string(), req.price.to_string()));
+    params
 }
 
 /// 限价 IOC 单未成交部分被撤销后，终态是 `"EXPIRED"`(不是 `"CANCELED"`)，
@@ -724,6 +735,29 @@ fn parse_execution_report(text: &str, venue: &Venue, symbol_map: &HashMap<String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn limit_req(post_only: bool) -> LimitOrderRequest {
+        LimitOrderRequest {
+            post_only,
+            symbol: Symbol::new("BTC", "USDT"),
+            side: OrderSide::Buy,
+            quantity: Decimal::new(1, 2),
+            price: Decimal::new(100, 0),
+            client_order_id: None,
+            dry_run: false,
+        }
+    }
+
+    #[test]
+    fn limit_order_params_use_limit_maker_for_post_only() {
+        let get = |p: &[(String, String)], k: &str| p.iter().find(|(key, _)| key == k).map(|(_, v)| v.clone());
+        let gtc = build_limit_order_params(&limit_req(false));
+        assert_eq!(get(&gtc, "type").as_deref(), Some("LIMIT"));
+        assert_eq!(get(&gtc, "timeInForce").as_deref(), Some("GTC"));
+        let maker = build_limit_order_params(&limit_req(true));
+        assert_eq!(get(&maker, "type").as_deref(), Some("LIMIT_MAKER"));
+        assert_eq!(get(&maker, "timeInForce"), None);
+    }
     use ring::rand::SystemRandom;
     use ring::signature::{KeyPair, UnparsedPublicKey};
 
