@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use async_trait::async_trait;
-use futures_util::StreamExt;
+use futures_util::{Sink, SinkExt, Stream, StreamExt};
 use log::{debug, warn};
 use rust_decimal::Decimal;
 use serde::Deserialize;
@@ -29,6 +29,10 @@ const MAINNET_REST_HOST: &str = "https://fapi.binance.com";
 const TESTNET_REST_HOST: &str = "https://testnet.binancefuture.com";
 const MIN_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const PING_INTERVAL: Duration = Duration::from_secs(20);
+const PING_SEND_TIMEOUT: Duration = Duration::from_secs(10);
+const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// 币安 U 本位永续合约行情源：通过 combined stream WebSocket 订阅 bookTicker 和
 /// 20 档深度快照,断线后自动按指数退避重连。支持通过 HTTP CONNECT 代理出网。
@@ -84,11 +88,15 @@ impl BinanceFuturesSource {
 
     /// 建连:先拿到 TCP 流(直连或经代理隧道),再在其上做 TLS + WebSocket 握手。
     async fn connect(&self, url: &str) -> anyhow::Result<WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>> {
-        let tcp = connect_tcp(self.ws_host, self.ws_port, self.proxy.as_deref()).await?;
-        let (ws, _) = tokio_tungstenite::client_async_tls(url, tcp)
-            .await
-            .context("websocket handshake failed")?;
-        Ok(ws)
+        tokio::time::timeout(CONNECT_TIMEOUT, async {
+            let tcp = connect_tcp(self.ws_host, self.ws_port, self.proxy.as_deref()).await?;
+            let (ws, _) = tokio_tungstenite::client_async_tls(url, tcp)
+                .await
+                .context("websocket handshake failed")?;
+            Ok(ws)
+        })
+        .await
+        .with_context(|| format!("websocket connect timed out after {CONNECT_TIMEOUT:?}"))?
     }
 }
 
@@ -119,32 +127,7 @@ impl MarketDataSource for BinanceFuturesSource {
                 debug!("binance futures ws connected for venue={}", self.venue);
                 backoff = MIN_BACKOFF;
 
-                while let Some(msg) = ws.next().await {
-                    let msg = match msg {
-                        Ok(msg) => msg,
-                        Err(err) => {
-                            warn!("binance futures ws error for venue={} err={err}", self.venue);
-                            break;
-                        }
-                    };
-                    let Message::Text(text) = msg else {
-                        continue;
-                    };
-                    let Ok(stream) = serde_json::from_str::<StreamName>(&text) else {
-                        continue;
-                    };
-                    if stream.stream.ends_with("@bookTicker") {
-                        let Some((symbol, quote)) = parse_book_ticker(&text, &symbol_map) else {
-                            continue;
-                        };
-                        bus.publish(Topic::quote(self.venue.clone(), symbol), quote);
-                    } else if stream.stream.ends_with("@depth20@100ms") {
-                        let Some((symbol, book)) = parse_partial_depth(&text, &symbol_map) else {
-                            continue;
-                        };
-                        bus.publish(Topic::order_book(self.venue.clone(), symbol), book);
-                    }
-                }
+                drive_ws_stream(&mut ws, &self.venue, &symbol_map, &bus, PING_INTERVAL, IDLE_TIMEOUT).await;
 
                 warn!(
                     "binance futures ws disconnected for venue={}, reconnecting in {:?}",
@@ -154,6 +137,79 @@ impl MarketDataSource for BinanceFuturesSource {
                 backoff = (backoff * 2).min(MAX_BACKOFF);
             }
         })
+    }
+}
+
+async fn drive_ws_stream<S>(
+    ws: &mut S,
+    venue: &Venue,
+    symbol_map: &HashMap<String, Symbol>,
+    bus: &TopicBus,
+    ping_interval: Duration,
+    idle_timeout: Duration,
+) where
+    S: Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>>
+        + Sink<Message, Error = tokio_tungstenite::tungstenite::Error>
+        + Unpin,
+{
+    let mut ping = tokio::time::interval(ping_interval);
+    ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    ping.tick().await;
+    // 独立的 idle deadline，避免 ping 分支触发时重置超时计时器
+    let idle_sleep = tokio::time::sleep(idle_timeout);
+    tokio::pin!(idle_sleep);
+
+    loop {
+        tokio::select! {
+            _ = ping.tick() => {
+                match tokio::time::timeout(PING_SEND_TIMEOUT, ws.send(Message::Ping(Vec::new()))).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => {
+                        warn!("binance futures ws ping failed for venue={venue} err={err}");
+                        break;
+                    }
+                    Err(_) => {
+                        warn!("binance futures ws ping send timed out for venue={venue}");
+                        break;
+                    }
+                }
+            }
+            _ = &mut idle_sleep => {
+                warn!("binance futures ws idle timeout for venue={venue}, no message in {idle_timeout:?}");
+                break;
+            }
+            msg = ws.next() => {
+                let msg = match msg {
+                    Some(Ok(msg)) => msg,
+                    Some(Err(err)) => {
+                        warn!("binance futures ws error for venue={venue} err={err}");
+                        break;
+                    }
+                    None => break,
+                };
+                if matches!(msg, Message::Close(_)) {
+                    break;
+                }
+                idle_sleep.as_mut().reset(tokio::time::Instant::now() + idle_timeout);
+                let Message::Text(text) = msg else {
+                    continue;
+                };
+                let Ok(stream) = serde_json::from_str::<StreamName>(&text) else {
+                    continue;
+                };
+                if stream.stream.ends_with("@bookTicker") {
+                    let Some((symbol, quote)) = parse_book_ticker(&text, symbol_map) else {
+                        continue;
+                    };
+                    bus.publish(Topic::quote(venue.clone(), symbol), quote);
+                } else if stream.stream.ends_with("@depth20@100ms") {
+                    let Some((symbol, book)) = parse_partial_depth(&text, symbol_map) else {
+                        continue;
+                    };
+                    bus.publish(Topic::order_book(venue.clone(), symbol), book);
+                }
+            }
+        }
     }
 }
 
@@ -521,5 +577,127 @@ mod tests {
             BinanceFuturesSource::new(Venue::new("binance_futures"), vec![Symbol::new("BTC", "USDT")], true, None);
 
         assert!(source.stream_url().starts_with(&format!("wss://{TESTNET_WS_HOST}")));
+    }
+
+    struct FakeWs {
+        rx: tokio::sync::mpsc::UnboundedReceiver<Result<Message, tokio_tungstenite::tungstenite::Error>>,
+        sent_tx: tokio::sync::mpsc::UnboundedSender<Message>,
+    }
+
+    impl Stream for FakeWs {
+        type Item = Result<Message, tokio_tungstenite::tungstenite::Error>;
+
+        fn poll_next(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            self.rx.poll_recv(cx)
+        }
+    }
+
+    impl Sink<Message> for FakeWs {
+        type Error = tokio_tungstenite::tungstenite::Error;
+
+        fn poll_ready(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn start_send(self: std::pin::Pin<&mut Self>, item: Message) -> Result<(), Self::Error> {
+            let _ = self.sent_tx.send(item);
+            Ok(())
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn drive_ws_stream_breaks_on_idle_timeout_despite_pings() {
+        let (_in_tx, in_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (sent_tx, mut sent_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut ws = FakeWs { rx: in_rx, sent_tx };
+        let venue = Venue::new("binance_futures");
+        let map = map_with(Symbol::new("BTC", "USDT"));
+        let bus = TopicBus::new();
+
+        tokio::time::timeout(
+            Duration::from_millis(500),
+            drive_ws_stream(
+                &mut ws,
+                &venue,
+                &map,
+                &bus,
+                Duration::from_millis(20),
+                Duration::from_millis(70),
+            ),
+        )
+        .await
+        .expect("idle timeout should break loop even while pings fire");
+
+        let mut pings = 0;
+        while let Ok(msg) = sent_rx.try_recv() {
+            if matches!(msg, Message::Ping(_)) {
+                pings += 1;
+            }
+        }
+        assert!(pings >= 1, "expected at least one ping before idle timeout");
+    }
+
+    #[tokio::test]
+    async fn drive_ws_stream_stays_alive_when_pong_arrives() {
+        let (in_tx, in_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (sent_tx, mut sent_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut ws = FakeWs { rx: in_rx, sent_tx };
+        let venue = Venue::new("binance_futures");
+        let symbol = Symbol::new("BTC", "USDT");
+        let map = map_with(symbol.clone());
+        let bus = TopicBus::new();
+        let mut sub = bus.subscribe::<Quote>(Topic::quote(venue.clone(), symbol));
+
+        let responder = tokio::spawn(async move {
+            for _ in 0..3 {
+                let msg = sent_rx.recv().await.expect("expected ping");
+                assert!(matches!(msg, Message::Ping(_)));
+                in_tx.send(Ok(Message::Pong(Vec::new()))).unwrap();
+            }
+            let text = r#"{"stream":"btcusdt@bookTicker","data":{"s":"BTCUSDT","b":"100","B":"1","a":"101","A":"2"}}"#;
+            in_tx.send(Ok(Message::Text(text.to_string()))).unwrap();
+            in_tx.send(Ok(Message::Close(None))).unwrap();
+        });
+
+        tokio::time::timeout(
+            Duration::from_millis(500),
+            drive_ws_stream(
+                &mut ws,
+                &venue,
+                &map,
+                &bus,
+                Duration::from_millis(25),
+                Duration::from_millis(60),
+            ),
+        )
+        .await
+        .expect("stream should close cleanly after quote");
+        responder.await.unwrap();
+
+        let (_, quote) = tokio::time::timeout(Duration::from_millis(100), sub.next())
+            .await
+            .expect("timed out waiting for quote")
+            .expect("quote should be published after surviving past idle_timeout");
+        assert_eq!(quote.bid, Decimal::from(100));
     }
 }
