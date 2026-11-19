@@ -23,6 +23,11 @@
 //! 每次 t0 决策和每一行的最终结果都往 `record_file` 追加一行 JSON
 //! ([`OrderRecord`])，供 `cross-funding-review` 复盘。
 //!
+//! 信号和执行分层：本文件(信号层)负责 t0 决策、Waiting/Target 确认、风控、记录和快照，
+//! 触发后"怎么下单、怎么跟踪成交、何时算完成/失败"交给 [`exec`] 里的 `ExecAlgo`(每行
+//! 一个实例，目前只有两腿都市价的 `TakerTaker`)。算法只返回动作，发单仍由策略走
+//! `Strategy::submit_order`。
+//!
 //! 数量/价格单位：CSV 里的 `quantity` 是实际币数；各腿下单量是合约 base 单位
 //! (= 币数 / `PerpContractSpec::price_unit`，只有币安 `1000PEPEUSDT` 这类带前缀
 //! 的合约才不是 1:1，张数换算在 Gate/OKX 下单网关里做)，每币价格 = 报价 /
@@ -60,6 +65,9 @@ use super::spread_wait::{
     latest_state, per_coin_f64, spread_bp,
 };
 use super::{Strategy, StrategySubscriber};
+
+mod exec;
+use exec::{BookPair, ExecAction, ExecAlgo, ExecEstimate, ExecEvent, ExecStatus, ExecStep, TakerTaker, market_vwap};
 
 pub const STRATEGY_NAME: &str = "cross_funding";
 const CSV_HEADER: [&str; 5] = ["long_venue", "long_symbol", "short_venue", "short_symbol", "quantity"];
@@ -547,38 +555,6 @@ pub fn live_spreads(
     (exec_bp.is_finite() && mid_bp.is_finite()).then_some(LiveSpreads { exec_bp, mid_bp })
 }
 
-/// 按市价单方向扫盘口，返回覆盖完整下单量后的每币 VWAP。盘口数量以交易所原生单位
-/// 表示，先用合约面值换成内部合约 base 单位。
-fn market_vwap(levels: &[(Decimal, Decimal)], order_qty: Decimal, spec: &PerpContractSpec) -> Option<Decimal> {
-    let contract_size = spec.contract_size();
-    if order_qty <= Decimal::ZERO || contract_size <= Decimal::ZERO {
-        return None;
-    }
-
-    let mut remaining = order_qty;
-    let mut notional = Decimal::ZERO;
-    for (price, native_qty) in levels {
-        if *price <= Decimal::ZERO || *native_qty <= Decimal::ZERO {
-            continue;
-        }
-        let level_qty = *native_qty * contract_size;
-        let filled_qty = level_qty.min(remaining);
-        notional += per_coin(*price, spec) * filled_qty;
-        remaining -= filled_qty;
-        if remaining.is_zero() {
-            return Some(notional / order_qty);
-        }
-    }
-    None
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct BookExecution {
-    long_vwap_per_coin: Decimal,
-    short_vwap_per_coin: Decimal,
-    exec_bp: f64,
-}
-
 fn order_book_spreads(
     long_book: &OrderBookLevels,
     short_book: &OrderBookLevels,
@@ -604,25 +580,6 @@ fn order_book_spreads(
         per_coin_f64(mid(short_bid, short_ask), short_spec.price_unit),
     );
     (exec_bp.is_finite() && mid_bp.is_finite()).then_some(LiveSpreads { exec_bp, mid_bp })
-}
-
-fn order_book_execution(
-    long_book: &OrderBookLevels,
-    short_book: &OrderBookLevels,
-    long_qty: Decimal,
-    short_qty: Decimal,
-    long_spec: &PerpContractSpec,
-    short_spec: &PerpContractSpec,
-    now_ms: u64,
-    max_age_ms: u64,
-) -> Option<BookExecution> {
-    if now_ms.saturating_sub(long_book.ts_ms) > max_age_ms || now_ms.saturating_sub(short_book.ts_ms) > max_age_ms {
-        return None;
-    }
-    let long_vwap = market_vwap(&long_book.asks, long_qty, long_spec)?;
-    let short_vwap = market_vwap(&short_book.bids, short_qty, short_spec)?;
-    let exec_bp = spread_bp(long_vwap.to_f64()?, short_vwap.to_f64()?);
-    exec_bp.is_finite().then_some(BookExecution { long_vwap_per_coin: long_vwap, short_vwap_per_coin: short_vwap, exec_bp })
 }
 
 /// 成交价相对参考价的滑点(bp)，正数表示成交得更差：买单成交价高于参考价、
@@ -715,7 +672,7 @@ pub struct OrderRecord {
     pub savings_bp: Option<f64>,
     /// 触发到这一行结束的耗时。
     pub fill_latency_ms: Option<u64>,
-    /// 一期两腿都是市价单，固定 `taker`。
+    /// 成交方式，由执行算法决定(两腿市价为 `taker`)。
     pub liquidity: String,
 }
 
@@ -749,7 +706,8 @@ enum Phase {
     ImmediatePending,
     /// 等可成交价差 ≤ `target_bp`，最晚到 `deadline_ms`。
     Waiting { target_bp: f64, deadline_ms: u64 },
-    Submitted { at_ms: u64 },
+    /// 已触发，执行算法在跟踪成交。
+    Executing { at_ms: u64 },
     Done,
     Halted,
     /// t0 决策为不开仓。
@@ -876,14 +834,21 @@ struct RowState {
     confirm: Option<TargetConfirm>,
     /// 这一行停止(`Halted`)的原因，只用于状态快照。
     halt_reason: Option<String>,
+    /// 开仓执行算法，触发后由它决定下什么单、怎么跟踪成交。
+    exec: Box<dyn ExecAlgo>,
 }
 
 impl RowState {
-    fn leg_mut(&mut self, role: LegRole) -> &mut LegState {
+    fn leg(&self, role: LegRole) -> &LegState {
         match role {
-            LegRole::Long => &mut self.long,
-            LegRole::Short => &mut self.short,
+            LegRole::Long => &self.long,
+            LegRole::Short => &self.short,
         }
+    }
+
+    /// 估算执行成本(执行算法的口径)，两腿盘口都新鲜且深度足够才有。
+    fn estimate(&self, books: &BookPair<'_>) -> Option<ExecEstimate> {
+        self.exec.estimate(books, &self.long, &self.short)
     }
 
     /// 未对冲敞口(USDT)：|多腿成交币数 − 空腿成交币数| × 每币价格。
@@ -1169,6 +1134,7 @@ impl CrossFundingStrategy {
             trigger: None,
             confirm: None,
             halt_reason: None,
+            exec: Box::new(TakerTaker::new(self.params.fill_timeout_ms)),
         })
     }
 
@@ -1325,7 +1291,7 @@ impl CrossFundingStrategy {
             actual_bp: None,
             savings_bp: None,
             fill_latency_ms: None,
-            liquidity: "taker".to_string(),
+            liquidity: row.exec.liquidity().to_string(),
         }
     }
 
@@ -1370,7 +1336,7 @@ impl CrossFundingStrategy {
         row: &mut RowState,
         kind: TriggerKind,
         spreads: LiveSpreads,
-        execution: BookExecution,
+        execution: ExecEstimate,
         long_book: &OrderBookLevels,
         short_book: &OrderBookLevels,
         long_best_ask: Decimal,
@@ -1387,17 +1353,17 @@ impl CrossFundingStrategy {
             _ => "-".to_string(),
         };
         info!(
-            "cross_funding {}: 触发({kind:?}) 扫单价差={:.4}bp 目标={target} 基准={:.4}bp，多腿 ask={} VWAP={} 空腿 bid={} VWAP={}",
+            "cross_funding {}: 触发({kind:?}) 扫单价差={:.4}bp 目标={target} 基准={:.4}bp，多腿 ask={} 预估成交价={} 空腿 bid={} 预估成交价={}",
             row.label,
             spreads.exec_bp,
             row.record.as_ref().map(|r| r.baseline_bp).unwrap_or(f64::NAN),
             long_best_ask,
-            execution.long_vwap_per_coin * row.long.spec.price_unit,
+            execution.long_px_per_coin * row.long.spec.price_unit,
             short_best_bid,
-            execution.short_vwap_per_coin * row.short.spec.price_unit,
+            execution.short_px_per_coin * row.short.spec.price_unit,
         );
 
-        let notional = row.coins * execution.long_vwap_per_coin;
+        let notional = row.coins * execution.long_px_per_coin;
         if notional > self.params.max_notional_usdt {
             error!(
                 "cross_funding {}: 触发时名义金额 ≈{} USDT 超过上限 max_notional_usdt={}，不下单，这一行停止",
@@ -1409,49 +1375,95 @@ impl CrossFundingStrategy {
             return true;
         }
 
-        if !self.params.live {
-            row.long.filled = Some((row.long.order_qty, execution.long_vwap_per_coin * row.long.spec.price_unit));
-            row.short.filled = Some((row.short.order_qty, execution.short_vwap_per_coin * row.short.spec.price_unit));
+        if self.params.live {
+            info!(
+                "cross_funding {}: 下单前盘口 long={} {} local_age={}ms {} | short={} {} local_age={}ms {}",
+                row.label,
+                row.long.venue,
+                row.long.symbol,
+                now.saturating_sub(long_book.ts_ms),
+                describe_order_book(long_book, None, long_book.bids.len().max(long_book.asks.len())),
+                row.short.venue,
+                row.short.symbol,
+                now.saturating_sub(short_book.ts_ms),
+                describe_order_book(short_book, None, short_book.bids.len().max(short_book.asks.len())),
+            );
+        } else {
             info!("cross_funding {}: [模拟盘] 按盘口 VWAP 模拟成交，不下单", row.label);
-            self.complete(row, now);
-            return true;
         }
 
-        info!(
-            "cross_funding {}: 下单前盘口 long={} {} local_age={}ms {} | short={} {} local_age={}ms {}",
-            row.label,
-            row.long.venue,
-            row.long.symbol,
-            now.saturating_sub(long_book.ts_ms),
-            describe_order_book(long_book, None, long_book.bids.len().max(long_book.asks.len())),
-            row.short.venue,
-            row.short.symbol,
-            now.saturating_sub(short_book.ts_ms),
-            describe_order_book(short_book, None, short_book.bids.len().max(short_book.asks.len())),
-        );
+        let step = row.exec.start(&mut row.long, &mut row.short, now);
+        self.apply_step(idx, row, step, now, Some((long_book, short_book)), order_index, submits)
+    }
 
-        let long_id = new_client_order_id();
-        let mut short_id = new_client_order_id();
-        while short_id == long_id {
-            short_id = new_client_order_id();
+    /// 处理执行算法返回的一步：实盘把动作排进 `submits`(锁外再发)，模拟盘按盘口把
+    /// 市价单模拟成成交事件喂回算法，直到算法不再产生新的模拟成交。返回这一行是否
+    /// 已经结束(`Done`/`Halted`)。
+    #[allow(clippy::too_many_arguments)]
+    fn apply_step(
+        &self,
+        idx: usize,
+        row: &mut RowState,
+        mut step: ExecStep,
+        now: u64,
+        sim_books: Option<(&OrderBookLevels, &OrderBookLevels)>,
+        order_index: &mut HashMap<String, (usize, LegRole)>,
+        submits: &mut Vec<PendingSubmit>,
+    ) -> bool {
+        loop {
+            let mut simulated = Vec::new();
+            let group_id = format!("cf-row{}-{}", row.line, row.trigger.map(|t| t.at_ms).unwrap_or(now));
+            for action in std::mem::take(&mut step.actions) {
+                match action {
+                    ExecAction::Market { leg, side, qty, client_order_id } => {
+                        if self.params.live {
+                            let state = row.leg(leg);
+                            submits.push(PendingSubmit {
+                                venue: state.venue.clone(),
+                                symbol: state.symbol.clone(),
+                                side,
+                                qty,
+                                client_order_id: client_order_id.clone(),
+                                group_id: group_id.clone(),
+                            });
+                            order_index.insert(client_order_id, (idx, leg));
+                        } else if let Some(event) = sim_books.and_then(|books| simulate_market_fill(row.leg(leg), leg, side, qty, books)) {
+                            simulated.push(event);
+                        } else {
+                            error!("cross_funding {}: 模拟盘无法模拟 {leg:?} 腿市价单成交(盘口深度不足)", row.label);
+                            step.status = ExecStatus::Failed("模拟盘盘口深度不足".to_string());
+                        }
+                    }
+                }
+            }
+            match std::mem::replace(&mut step.status, ExecStatus::Running) {
+                ExecStatus::Running if simulated.is_empty() => {
+                    row.phase = Phase::Executing { at_ms: row.trigger.map(|t| t.at_ms).unwrap_or(now) };
+                    return false;
+                }
+                ExecStatus::Running => {
+                    let mut next = ExecStep::idle();
+                    for event in simulated {
+                        let s = row.exec.on_event(&mut row.long, &mut row.short, event, now);
+                        next.actions.extend(s.actions);
+                        next.status = s.status;
+                        if next.status != ExecStatus::Running {
+                            break;
+                        }
+                    }
+                    step = next;
+                }
+                ExecStatus::Done => {
+                    self.complete(row, now);
+                    return true;
+                }
+                ExecStatus::Failed(reason) => {
+                    error!("cross_funding {}: 开仓执行失败: {reason}。这一行停止交易，请人工处理", row.label);
+                    self.halt(row, &reason, now);
+                    return true;
+                }
+            }
         }
-        let group_id = format!("cf-row{}-{now}", row.line);
-        row.long.client_order_id = Some(long_id.clone());
-        row.short.client_order_id = Some(short_id.clone());
-        row.phase = Phase::Submitted { at_ms: now };
-        for (leg, side, id) in [(&row.long, OrderSide::Buy, long_id.clone()), (&row.short, OrderSide::Sell, short_id.clone())] {
-            submits.push(PendingSubmit {
-                venue: leg.venue.clone(),
-                symbol: leg.symbol.clone(),
-                side,
-                qty: leg.order_qty,
-                client_order_id: id,
-                group_id: group_id.clone(),
-            });
-        }
-        order_index.insert(long_id, (idx, LegRole::Long));
-        order_index.insert(short_id, (idx, LegRole::Short));
-        false
     }
 
     /// 两腿都已成交：写结果、检查滑点，这一行结束。
@@ -1532,68 +1544,90 @@ impl CrossFundingStrategy {
     }
 
     /// 处理一条腿的终态失败(拒单/撤单/过期)：先查 OrderManager 里的权威状态，
-    /// 确实已全部成交就按成交处理，否则记下已成交部分并停掉这一行。
-    fn handle_leg_failure(&self, order_id: &OrderId, client_order_id: &str, kind: &str, reason: &str) {
+    /// 确实已全部成交就按成交处理，否则把已成交部分和失败原因交给执行算法。
+    fn leg_failure(&self, order_id: &OrderId, client_order_id: &str, kind: &str, reason: &str) -> Vec<PendingSubmit> {
         let authoritative = self.order_manager.as_ref().and_then(|om| om.get_order(order_id));
         if let Some(order) = &authoritative
             && order.status == OrderStatus::Filled
         {
             warn!("cross_funding: 订单 {client_order_id} 收到 {kind}({reason})，但权威状态已是 Filled，按成交处理");
-            self.record_fill(client_order_id, order.filled_qty, order.avg_price.unwrap_or(Decimal::ZERO));
-            return;
+            let (filled_qty, avg_price) = (order.filled_qty, order.avg_price.unwrap_or(Decimal::ZERO));
+            return self.handle_exec_event(client_order_id, |leg| ExecEvent::Filled { leg, filled_qty, avg_price });
         }
-        let now = now_ms();
-        let mut guard = self.state.lock().unwrap();
-        let State { rows, order_index, .. } = &mut *guard;
-        let Some(&(idx, role)) = order_index.get(client_order_id) else {
-            return;
-        };
-        let row = &mut rows[idx];
-        if let Some(order) = &authoritative
-            && order.filled_qty > Decimal::ZERO
-        {
-            row.leg_mut(role).filled = Some((order.filled_qty, order.avg_price.unwrap_or(Decimal::ZERO)));
-        }
+        let partial = authoritative
+            .as_ref()
+            .filter(|o| o.filled_qty > Decimal::ZERO)
+            .map(|o| (o.filled_qty, o.avg_price.unwrap_or(Decimal::ZERO)));
         let status = authoritative
             .as_ref()
             .map(|o| format!("status={:?} filled_qty={}", o.status, o.filled_qty))
             .unwrap_or_else(|| "订单记录不存在".to_string());
-        error!(
-            "cross_funding {}: {:?} 腿订单 {client_order_id} {kind}: {reason}；权威状态 {status}。这一行停止交易，请人工处理",
-            row.label, role
-        );
-        self.halt(row, &format!("{role:?} 腿{kind}: {reason}"), now);
-        self.check_unhedged(rows);
+        warn!("cross_funding: 订单 {client_order_id} {kind}: {reason}；权威状态 {status}");
+        self.handle_exec_event(client_order_id, |leg| ExecEvent::Failed {
+            leg,
+            kind: kind.to_string(),
+            reason: reason.to_string(),
+            partial,
+        })
     }
 
-    fn record_fill(&self, client_order_id: &str, filled_qty: Decimal, avg_price: Decimal) {
+    /// 把一个订单事件交给这一行的执行算法并处理它返回的一步。`make_event` 拿到这个订单
+    /// 属于哪条腿后生成事件。返回要在锁外发出的新订单。
+    fn handle_exec_event(&self, client_order_id: &str, make_event: impl FnOnce(LegRole) -> ExecEvent) -> Vec<PendingSubmit> {
         let now = now_ms();
+        let mut submits = Vec::new();
         let mut guard = self.state.lock().unwrap();
         let State { rows, order_index, busy_legs, .. } = &mut *guard;
         let Some(&(idx, role)) = order_index.get(client_order_id) else {
-            return;
+            return submits;
         };
+        let event = make_event(role);
         let row = &mut rows[idx];
-        row.leg_mut(role).filled = Some((filled_qty, avg_price));
-        info!(
-            "cross_funding {}: {:?} 腿 {client_order_id} 成交 qty={} avg_price={}",
-            row.label,
-            role,
-            filled_qty.normalize(),
-            avg_price.normalize()
-        );
+        if let ExecEvent::Filled { filled_qty, avg_price, .. } = &event {
+            info!(
+                "cross_funding {}: {:?} 腿 {client_order_id} 成交 qty={} avg_price={}",
+                row.label,
+                role,
+                filled_qty.normalize(),
+                avg_price.normalize()
+            );
+        }
+        let filled = matches!(event, ExecEvent::Filled { .. });
+        let step = row.exec.on_event(&mut row.long, &mut row.short, event, now);
         match row.phase {
-            Phase::Submitted { .. } if row.long.filled.is_some() && row.short.filled.is_some() => {
-                self.complete(row, now);
-                busy_legs.remove(&(row.long.venue.clone(), row.long.symbol.clone()));
-                busy_legs.remove(&(row.short.venue.clone(), row.short.symbol.clone()));
+            Phase::Executing { .. } => {
+                self.apply_step(idx, row, step, now, None, order_index, &mut submits);
+                if row.phase == Phase::Done {
+                    busy_legs.remove(&(row.long.venue.clone(), row.long.symbol.clone()));
+                    busy_legs.remove(&(row.short.venue.clone(), row.short.symbol.clone()));
+                }
             }
-            Phase::Halted => {
+            Phase::Halted if filled => {
                 warn!("cross_funding {}: 这一行已停止，{:?} 腿仍然成交了，请人工核对两边持仓", row.label, role)
             }
             _ => {}
         }
         self.check_unhedged(rows);
+        submits
+    }
+
+    /// 在锁外发出执行算法产生的订单。
+    fn publish_submits(&self, submits: Vec<PendingSubmit>) {
+        for submit in submits {
+            info!(
+                "cross_funding: 提交市价单 {} {} {:?} qty={} client_order_id={}",
+                submit.venue, submit.symbol, submit.side, submit.qty, submit.client_order_id
+            );
+            self.submit_order(
+                submit.venue,
+                submit.symbol,
+                submit.side,
+                OrderAmount::Base(submit.qty),
+                Some(submit.client_order_id),
+                Some(submit.group_id),
+                None,
+            );
+        }
     }
 }
 
@@ -1631,7 +1665,7 @@ fn phase_text(phase: Phase, now_ms: u64) -> String {
             "等待价差 ≤ {target_bp:.2}bp (剩余 {:.1}h)",
             deadline_ms.saturating_sub(now_ms) as f64 / HOUR_MS as f64
         ),
-        Phase::Submitted { at_ms } => format!("已下单 ({}s 前)", now_ms.saturating_sub(at_ms) / 1000),
+        Phase::Executing { at_ms } => format!("已下单 ({}s 前)", now_ms.saturating_sub(at_ms) / 1000),
         Phase::Done => "已完成".to_string(),
         Phase::Halted => "已停止".to_string(),
         Phase::Skipped => "不开仓".to_string(),
@@ -1649,7 +1683,7 @@ fn render_snapshot(
 ) -> String {
     let count = |f: fn(Phase) -> bool| rows.iter().filter(|r| f(r.phase)).count();
     let waiting = count(|p| matches!(p, Phase::AwaitingT0 | Phase::ImmediatePending | Phase::Waiting { .. }));
-    let submitted = count(|p| matches!(p, Phase::Submitted { .. }));
+    let submitted = count(|p| matches!(p, Phase::Executing { .. }));
     let done = count(|p| p == Phase::Done);
     let halted_rows = count(|p| p == Phase::Halted);
     let skipped = count(|p| p == Phase::Skipped);
@@ -1669,16 +1703,7 @@ fn render_snapshot(
         ) {
             (Some(long_book), Some(short_book)) => {
                 let top = order_book_spreads(long_book, short_book, &row.long.spec, &row.short.spec, now_ms, max_age_ms);
-                let exec = order_book_execution(
-                    long_book,
-                    short_book,
-                    row.long.order_qty,
-                    row.short.order_qty,
-                    &row.long.spec,
-                    &row.short.spec,
-                    now_ms,
-                    max_age_ms,
-                );
+                let exec = row.estimate(&BookPair { long: long_book, short: short_book, now_ms, max_age_ms });
                 format!(
                     "盘口价差 {}bp 中间价 {}bp 吃单VWAP {}bp",
                     fmt_opt(top.map(|s| s.exec_bp)),
@@ -1721,11 +1746,24 @@ fn fmt_bin(bin: Option<(f64, f64)>) -> String {
     bin.map(|(lo, hi)| format!("[{lo},{hi})")).unwrap_or_else(|| "-".to_string())
 }
 
-fn new_client_order_id() -> String {
-    // 刻意不用 `Strategy::generate_client_order_id`(带完整策略名)：Gate `text`
-    // 前缀后最多 28 字节、OKX `clOrdId` 只能是 1~32 位字母数字，短的纯字母数字
-    // id 才能在各所原样回传、按 client_order_id 关联。
-    format!("cf{}{:05}", now_ms(), rand::random::<u32>() % 100_000)
+/// 模拟盘：把一张市价单按当前盘口全量 VWAP 成交，盘口深度不够返回 None。
+fn simulate_market_fill(
+    leg: &LegState,
+    role: LegRole,
+    side: OrderSide,
+    qty: Decimal,
+    (long_book, short_book): (&OrderBookLevels, &OrderBookLevels),
+) -> Option<ExecEvent> {
+    let book = match role {
+        LegRole::Long => long_book,
+        LegRole::Short => short_book,
+    };
+    let levels = match side {
+        OrderSide::Buy => &book.asks,
+        OrderSide::Sell => &book.bids,
+    };
+    let vwap_per_coin = market_vwap(levels, qty, &leg.spec)?;
+    Some(ExecEvent::Filled { leg: role, filled_qty: qty, avg_price: vwap_per_coin * leg.spec.price_unit })
 }
 
 #[async_trait]
@@ -1844,16 +1882,20 @@ impl Strategy for CrossFundingStrategy {
             "已开仓 {opened} 行，部分持仓 {partial} 行，超过目标 {over} 行，持仓无法归属 {invalid} 行，无持仓但未通过检查 {failed} 行"
         );
         if prepared.is_empty() {
-            anyhow::bail!("cross_funding: CSV 里 {} 行没有可交易的行({summary})", self.rows.len());
+            warn!(
+                "cross_funding: CSV 里 {} 行没有可交易的行({summary})，继续常驻(仅维护行情/资金费/报告)",
+                self.rows.len()
+            );
+        } else {
+            info!(
+                "cross_funding: {}/{} 行通过检查({summary})，模式={}，记录写到 {}，kill switch 文件 {}",
+                prepared.len(),
+                self.rows.len(),
+                self.mode(),
+                self.params.record_file.display(),
+                self.params.kill_switch_file.display()
+            );
         }
-        info!(
-            "cross_funding: {}/{} 行通过检查({summary})，模式={}，记录写到 {}，kill switch 文件 {}",
-            prepared.len(),
-            self.rows.len(),
-            self.mode(),
-            self.params.record_file.display(),
-            self.params.kill_switch_file.display()
-        );
         self.kill_switch_active(now);
 
         {
@@ -1889,22 +1931,19 @@ impl Strategy for CrossFundingStrategy {
             let mut guard = self.state.lock().unwrap();
             let State { rows, book_index, order_index, busy_legs, .. } = &mut *guard;
             let mut finished = false;
-            for row in rows.iter_mut() {
+            for (idx, row) in rows.iter_mut().enumerate() {
                 if paused || self.halted.load(Ordering::SeqCst) {
                     row.confirm = None;
                 }
-                if let Phase::Submitted { at_ms } = row.phase
-                    && now.saturating_sub(at_ms) > self.params.fill_timeout_ms
-                {
-                    error!(
-                        "cross_funding {}: 下单 {}ms 后两腿仍未全部成交(多腿 {:?} 空腿 {:?})，这一行停止交易，请人工处理",
-                        row.label,
-                        now - at_ms,
-                        row.long.filled,
-                        row.short.filled
-                    );
-                    self.halt(row, "成交超时", now);
-                    finished = true;
+                if matches!(row.phase, Phase::Executing { .. }) {
+                    let step = row.exec.on_tick(&mut row.long, &mut row.short, now);
+                    if step.status != ExecStatus::Running || !step.actions.is_empty() {
+                        finished |= self.apply_step(idx, row, step, now, None, order_index, &mut submits);
+                        if row.phase == Phase::Done {
+                            busy_legs.remove(&(row.long.venue.clone(), row.long.symbol.clone()));
+                            busy_legs.remove(&(row.short.venue.clone(), row.short.symbol.clone()));
+                        }
+                    }
                 }
             }
 
@@ -1938,16 +1977,12 @@ impl Strategy for CrossFundingStrategy {
                     if !matches!(row.phase, Phase::ImmediatePending | Phase::Waiting { .. }) {
                         continue;
                     }
-                    let Some(execution) = order_book_execution(
-                        long_book,
-                        short_book,
-                        row.long.order_qty,
-                        row.short.order_qty,
-                        &row.long.spec,
-                        &row.short.spec,
-                        now,
-                        self.params.quote_max_age_ms,
-                    ) else {
+                    let Some(execution) = row.estimate(&BookPair {
+                        long: long_book,
+                        short: short_book,
+                        now_ms: now,
+                        max_age_ms: self.params.quote_max_age_ms,
+                    }) else {
                         debug!("cross_funding {}: 盘口深度不足，暂不触发", row.label);
                         confirm_target(&row.label, &mut row.confirm, false, 0, 0, now);
                         continue;
@@ -2000,7 +2035,7 @@ impl Strategy for CrossFundingStrategy {
                         order_index,
                         &mut submits,
                     );
-                    if matches!(row.phase, Phase::Submitted { .. }) {
+                    if matches!(row.phase, Phase::Executing { .. }) {
                         busy_legs.insert(long_key);
                         busy_legs.insert(short_key);
                     }
@@ -2013,21 +2048,7 @@ impl Strategy for CrossFundingStrategy {
         };
 
         let force_snapshot = finished || !submits.is_empty();
-        for submit in submits {
-            info!(
-                "cross_funding: 提交市价单 {} {} {:?} qty={} client_order_id={}",
-                submit.venue, submit.symbol, submit.side, submit.qty, submit.client_order_id
-            );
-            self.submit_order(
-                submit.venue,
-                submit.symbol,
-                submit.side,
-                OrderAmount::Base(submit.qty),
-                Some(submit.client_order_id),
-                Some(submit.group_id),
-                None,
-            );
-        }
+        self.publish_submits(submits);
         self.publish_snapshot(force_snapshot);
     }
 
@@ -2040,25 +2061,30 @@ impl Strategy for CrossFundingStrategy {
         if !self.state.lock().unwrap().order_index.contains_key(client_order_id) {
             return;
         }
-        match event {
-            OrderEvent::Filled { filled_qty, avg_price, .. } => self.record_fill(client_order_id, *filled_qty, *avg_price),
+        let submits = match event {
+            OrderEvent::Filled { filled_qty, avg_price, .. } => {
+                let (filled_qty, avg_price) = (*filled_qty, *avg_price);
+                self.handle_exec_event(client_order_id, |leg| ExecEvent::Filled { leg, filled_qty, avg_price })
+            }
             OrderEvent::RejectedByRisk { order_id, reason, .. } => {
-                self.handle_leg_failure(order_id, client_order_id, "被风控拒绝", reason)
+                self.leg_failure(order_id, client_order_id, "被风控拒绝", reason)
             }
             OrderEvent::RejectedByExchange { order_id, reason, .. } => {
-                self.handle_leg_failure(order_id, client_order_id, "被交易所拒绝/失效", reason)
+                self.leg_failure(order_id, client_order_id, "被交易所拒绝/失效", reason)
             }
-            OrderEvent::Cancelled { order_id, filled_qty, .. } => self.handle_leg_failure(
-                order_id,
-                client_order_id,
-                "被撤销",
-                &format!("filled_qty={filled_qty}"),
-            ),
+            OrderEvent::Cancelled { order_id, filled_qty, .. } => {
+                self.leg_failure(order_id, client_order_id, "被撤销", &format!("filled_qty={filled_qty}"))
+            }
             OrderEvent::PartiallyFilled { filled_qty, avg_price, .. } => {
-                info!("cross_funding: 订单 {client_order_id} 部分成交 qty={filled_qty} avg_price={avg_price}")
+                info!("cross_funding: 订单 {client_order_id} 部分成交 qty={filled_qty} avg_price={avg_price}");
+                Vec::new()
             }
-            other => debug!("cross_funding: 订单事件 {other:?}"),
-        }
+            other => {
+                debug!("cross_funding: 订单事件 {other:?}");
+                Vec::new()
+            }
+        };
+        self.publish_submits(submits);
         self.publish_snapshot(true);
     }
 }
@@ -2213,11 +2239,25 @@ mod tests {
     }
 
     #[test]
-    fn client_order_id_fits_gate_text_limit() {
-        let id = new_client_order_id();
-        assert!(id.starts_with("cf"));
-        assert!(id.chars().all(|c| c.is_ascii_alphanumeric()), "{id}");
-        assert!(id.len() <= 28, "{id}");
+    fn simulated_market_fill_uses_vwap_and_needs_depth() {
+        let leg = LegState {
+            venue: long_venue(),
+            symbol: btc(),
+            spec: spec(1, 1),
+            order_qty: Decimal::ONE,
+            client_order_id: None,
+            filled: None,
+        };
+        let book = OrderBookLevels {
+            bids: Arc::new(vec![(d("99"), d("1"))]),
+            asks: Arc::new(vec![(d("100"), d("0.5")), (d("102"), d("0.5"))]),
+            ts_ms: now_ms(),
+        };
+        let buy = simulate_market_fill(&leg, LegRole::Long, OrderSide::Buy, Decimal::ONE, (&book, &book));
+        assert_eq!(buy, Some(ExecEvent::Filled { leg: LegRole::Long, filled_qty: Decimal::ONE, avg_price: d("101") }));
+        let sell = simulate_market_fill(&leg, LegRole::Short, OrderSide::Sell, Decimal::ONE, (&book, &book));
+        assert_eq!(sell, Some(ExecEvent::Filled { leg: LegRole::Short, filled_qty: Decimal::ONE, avg_price: d("99") }));
+        assert_eq!(simulate_market_fill(&leg, LegRole::Short, OrderSide::Sell, d("2"), (&book, &book)), None);
     }
 
     // ---- 状态机：直接往策略里塞一行，喂报价/订单事件 ----
@@ -2314,6 +2354,7 @@ mod tests {
             trigger: None,
             confirm: None,
             halt_reason: None,
+            exec: Box::new(TakerTaker::new(strategy.params.fill_timeout_ms)),
         };
         let mut state = strategy.state.lock().unwrap();
         state.book_index.insert((long_venue(), btc()), vec![(0, LegRole::Long)]);
@@ -2608,7 +2649,7 @@ mod tests {
         let s = strategy(p, direct(), 1.0);
         feed(&s, long_venue(), "100", "100.01");
         feed(&s, short_venue(), "100", "100.01");
-        assert!(matches!(phase(&s), Phase::Submitted { .. }));
+        assert!(matches!(phase(&s), Phase::Executing { .. }));
         let (long_id, short_id) = {
             let state = s.state.lock().unwrap();
             (state.rows[0].long.client_order_id.clone().unwrap(), state.rows[0].short.client_order_id.clone().unwrap())
@@ -2619,7 +2660,7 @@ mod tests {
             filled_qty: Decimal::ONE,
             avg_price: d("100.02"),
         });
-        assert!(matches!(phase(&s), Phase::Submitted { .. }));
+        assert!(matches!(phase(&s), Phase::Executing { .. }));
         assert!(!s.halted.load(Ordering::SeqCst));
         s.on_order_event(&OrderEvent::RejectedByExchange {
             order_id: OrderId::new("o2"),
@@ -2685,7 +2726,7 @@ mod tests {
         feed(&s, third.clone(), "100", "100.01");
         feed(&s, short_venue(), "100", "100.01");
         let (first, second) = phases(&s);
-        assert!(matches!(first, Phase::Submitted { .. }), "{first:?}");
+        assert!(matches!(first, Phase::Executing { .. }), "{first:?}");
         assert_eq!(second, Phase::ImmediatePending);
 
         let ids = {
@@ -2704,7 +2745,7 @@ mod tests {
         assert!(s.state.lock().unwrap().busy_legs.is_empty());
         feed(&s, short_venue(), "100", "100.01");
         let (_, second) = phases(&s);
-        assert!(matches!(second, Phase::Submitted { .. }), "{second:?}");
+        assert!(matches!(second, Phase::Executing { .. }), "{second:?}");
         let _ = records(&s);
     }
 
@@ -2839,5 +2880,38 @@ mod tests {
         // 同一合约在不同行方向相反
         let rows_c = rows("binance,BTCUSDT,okx,BTC-USDT-SWAP,1\nokx,BTC-USDT-SWAP,gate,BTC_USDT,1\n");
         assert!(classify_rows(&rows_c, &pos).iter().all(|s| matches!(s, RowPositionStatus::Invalid(r) if r.contains("既做多又做空"))));
+    }
+
+    #[tokio::test]
+    async fn init_succeeds_and_stays_resident_when_no_rows_tradable() {
+        use std::time::Duration;
+        use futures_util::StreamExt;
+        use crate::report::ReportEvent;
+
+        let bus = Arc::new(TopicBus::new());
+        let mut reports = bus.subscribe::<ReportEvent>(Topic::report());
+        let strategy = CrossFundingStrategy::new(
+            bus.clone(),
+            rows("binance,BTCUSDT,okx,BTC-USDT-SWAP,1\n"),
+            HashMap::new(),
+            HashMap::new(),
+            params("empty_prepared"),
+            None,
+        );
+        let mut subscriber = StrategySubscriber::new(bus);
+
+        strategy.init(&mut subscriber).await.expect("init should stay resident when no rows are tradable");
+
+        assert!(subscriber.topics().is_empty());
+        let guard = strategy.state.lock().unwrap();
+        assert!(guard.rows.is_empty());
+        assert_eq!(guard.excluded.len(), 1);
+        drop(guard);
+
+        let (_, event) = tokio::time::timeout(Duration::from_millis(100), reports.next())
+            .await
+            .expect("should publish snapshot")
+            .expect("report stream open");
+        assert!(matches!(event, ReportEvent::Snapshot { .. }));
     }
 }
